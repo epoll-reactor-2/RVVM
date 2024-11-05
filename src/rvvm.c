@@ -702,32 +702,28 @@ static inline bool rvvm_mmio_overlap_check(rvvm_addr_t addr1, size_t size1, rvvm
     return addr1 < (addr2 + size2) && addr2 < (addr1 + size1);
 }
 
-// Returns addr if zone is free
-static rvvm_addr_t rvvm_mmio_zone_check(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
-{
-    if (rvvm_mmio_overlap_check(addr, size, machine->mem.begin, machine->mem.size)) {
-        addr = (machine->mem.begin + machine->mem.size + 0xFFF) & ~0xFFFULL;
-    }
-
-    vector_foreach(machine->mmio_devs, i) {
-        rvvm_mmio_dev_t* dev = vector_at(machine->mmio_devs, i);
-        if (rvvm_mmio_overlap_check(addr, size, dev->addr, dev->size)) {
-            addr = (dev->addr + dev->size + 0xFFF) & ~0xFFFULL;
-        }
-    }
-
-    return addr;
-}
-
-// Regions of size 0 are ignored (those are non-IO placeholders)
 PUBLIC rvvm_addr_t rvvm_mmio_zone_auto(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
 {
+    // Regions of size 0 are ignored (those are non-IO placeholders)
     if (size) {
-        rvvm_addr_t tmp = addr;
-        do {
-            addr = tmp;
-            tmp = rvvm_mmio_zone_check(machine, addr, size);
-        } while (tmp != addr);
+        bool free_zone = false;
+        while (!free_zone) {
+            free_zone = true;
+            if (rvvm_mmio_overlap_check(addr, size, machine->mem.begin, machine->mem.size)) {
+                addr = (machine->mem.begin + machine->mem.size + 0xFFF) & ~0xFFFULL;
+                free_zone = false;
+                continue;
+            }
+
+            vector_foreach(machine->mmio_devs, i) {
+                rvvm_mmio_dev_t* dev = vector_at(machine->mmio_devs, i);
+                if (rvvm_mmio_overlap_check(addr, size, dev->addr, dev->size)) {
+                    addr = (dev->addr + dev->size + 0xFFF) & ~0xFFFULL;
+                    free_zone = false;
+                    continue;
+                }
+            }
+        }
     }
     return addr;
 }
