@@ -335,10 +335,11 @@ override CFLAGS_USE_SDL = $(shell pkg-config $(SDL_PKGCONF) --cflags-only-I $(NU
 override CFLAGS_USE_X11 = $(shell pkg-config x11 xext --cflags-only-I $(NULL_STDERR))
 override CFLAGS_USE_DEBUG := -DDEBUG -g -fno-omit-frame-pointer
 override CFLAGS_USE_DEBUG_FULL := -DDEBUG -Og -ggdb -fno-omit-frame-pointer
+override CFLAGS_USE_LIB := -fPIC
 
 # Enable building the lib on lib or install target
-ifneq (,$(findstring lib, $(MAKECMDGOALS))$(findstring install, $(MAKECMDGOALS)))
-override CFLAGS_USE_LIB := -fPIC
+ifeq (,$(findstring lib, $(MAKECMDGOALS))$(findstring install, $(MAKECMDGOALS)))
+override USE_LIB := 0
 endif
 
 # Useflag LDFLAGS
