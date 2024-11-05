@@ -44,9 +44,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 typedef struct blk_io_rvfile rvfile_t;
 
-rvfile_t* rvopen(const char* filepath, uint8_t filemode); // Returns NULL on failure
+// Returns NULL on failure
+rvfile_t* rvopen(const char* filepath, uint8_t filemode);
 void      rvclose(rvfile_t* file);
 
+// Get file size (Not synced across processes)
 uint64_t  rvfilesize(rvfile_t* file);
 
 // If offset == RVFILE_CURPOS, uses current file position as offset
@@ -58,10 +60,16 @@ size_t    rvwrite(rvfile_t* file, const void* src, size_t size, uint64_t offset)
 bool      rvseek(rvfile_t* file, int64_t offset, uint8_t startpos);
 uint64_t  rvtell(rvfile_t* file);
 
+// Trim (punch a hole) in file, leaving zeroes and releasing space on the host
 bool      rvtrim(rvfile_t* file, uint64_t offset, uint64_t size);
-bool      rvfsync(rvfile_t* file);
+
+// Set/grow file size
 bool      rvtruncate(rvfile_t* file, uint64_t length);
 bool      rvfallocate(rvfile_t* file, uint64_t length);
+
+// Sync buffers to disk, or issue a write barrier (Depending on platform).
+// NOTE: If this fails, do NOT perform further actions and GTFO!
+bool      rvfsync(rvfile_t* file);
 
 // Get native POSIX file descriptor, returns -1 on failure
 int rvfile_get_posix_fd(rvfile_t* file);

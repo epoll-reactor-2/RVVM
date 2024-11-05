@@ -63,7 +63,7 @@ static bool try_lock_fd(int fd)
     return fcntl(fd, F_SETLK, &flk) == 0 || (errno != EACCES && errno != EAGAIN);
 }
 
-#elif defined(_WIN32) && !defined(USE_STDIO)
+#elif defined(_WIN32) && !defined(UNDER_CE) && !defined(USE_STDIO)
 // Win32 implementation using CreateFile, OVERLAPPED, ReadFile...
 #include <windows.h>
 #define WIN32_FILE_IMPL
@@ -81,7 +81,7 @@ typedef struct {
 #include <stdio.h>
 
 #ifdef _WIN32
-// For rvfile_get_win32_handle()
+// For rvfile_get_win32_handle(), GetModuleFileNameW()
 #include <windows.h>
 #include <io.h>
 #endif
@@ -200,6 +200,27 @@ rvfile_t* rvopen(const char* filepath, uint8_t filemode)
     return file;
 #else
     const char* open_mode = "rb";
+#if defined(_WIN32) && defined(UNDER_CE)
+    // Windows CE doesn't support relative file paths nor current working directory
+    // Workaround by appending executable directory before each relative path
+    char path[256] = {0};
+    if (filepath[0] != '\\') {
+        wchar_t wpath[256] = {0};
+        GetModuleFileNameW(NULL, wpath, STATIC_ARRAY_SIZE(wpath));
+        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path), NULL, NULL);
+        size_t len = rvvm_strlen(path);
+        while (len && path[len - 1] != '\\') {
+            len--;
+        }
+        rvvm_strlcpy(path + len, filepath, sizeof(path) - len);
+        for (char* ptr = path; ptr[0]; ptr++) {
+            if (ptr[0] == '/') {
+                ptr[0] = '\\';
+            }
+        }
+        filepath = path;
+    }
+#endif
     if (filemode & RVFILE_RW) {
         open_mode = "rb+";
         if ((filemode & RVFILE_TRUNC) || (filemode & RVFILE_CREAT)) {
@@ -406,7 +427,11 @@ uint64_t rvtell(rvfile_t* file)
 bool rvfsync(rvfile_t* file)
 {
     if (!file) return false;
-#if defined(POSIX_FILE_IMPL)
+#if defined(POSIX_FILE_IMPL) && defined(__linux__)
+    return fdatasync(file->fd) == 0;
+#elif defined(POSIX_FILE_IMPL) && defined(__APPLE__) && defined(F_BARRIERFSYNC)
+    return fcntl(file->fd, F_BARRIERFSYNC) == 0;
+#elif defined(POSIX_FILE_IMPL)
     return fsync(file->fd) == 0;
 #elif defined(WIN32_FILE_IMPL)
     return FlushFileBuffers(file->handle);
