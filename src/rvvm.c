@@ -697,17 +697,22 @@ PUBLIC void rvvm_free_machine(rvvm_machine_t* machine)
     free(machine);
 }
 
+static inline bool rvvm_mmio_overlap_check(rvvm_addr_t addr1, size_t size1, rvvm_addr_t addr2, size_t size2)
+{
+    return addr1 < (addr2 + size2) && addr2 < (addr1 + size1);
+}
+
 // Returns addr if zone is free
 static rvvm_addr_t rvvm_mmio_zone_check(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
 {
-    if (addr >= machine->mem.begin && (addr + size) <= (machine->mem.begin + machine->mem.size)) {
-        addr = machine->mem.begin + machine->mem.size;
+    if (rvvm_mmio_overlap_check(addr, size, machine->mem.begin, machine->mem.size)) {
+        addr = (machine->mem.begin + machine->mem.size + 0xFFF) & ~0xFFFULL;
     }
 
     vector_foreach(machine->mmio_devs, i) {
         rvvm_mmio_dev_t* dev = vector_at(machine->mmio_devs, i);
-        if (addr >= dev->addr && (addr + size) <= (dev->addr + dev->size)) {
-            addr = dev->addr + dev->size;
+        if (rvvm_mmio_overlap_check(addr, size, dev->addr, dev->size)) {
+            addr = (dev->addr + dev->size + 0xFFF) & ~0xFFFULL;
         }
     }
 
