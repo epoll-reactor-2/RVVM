@@ -162,7 +162,7 @@ static rvvm_addr_t rvvm_pass_dtb(rvvm_machine_t* machine)
         size_t dtb_off = rvvm_dtb_addr(machine, dtb_size);
         if (dtb_size < machine->mem.size) {
             rvread(machine->dtb_file, machine->mem.data + dtb_off, machine->mem.size - dtb_off, 0);
-            rvvm_info("Loaded DTB at 0x%08"PRIxXLEN", size %u", machine->mem.begin + dtb_off, dtb_size);
+            rvvm_info("Loaded DTB at 0x%08"PRIxXLEN", size %u", (phys_addr_t)(machine->mem.begin + dtb_off), dtb_size);
             return machine->mem.begin + dtb_off;
         }
     } else {
@@ -833,6 +833,7 @@ PUBLIC rvvm_machine_t* rvvm_create_userland(bool rv64)
     machine->rv64 = rv64;
     // I don't know what time CSR frequency userspace expects...
     rvtimer_init(&machine->timer, 1000000);
+
 #ifdef USE_JIT
     rvvm_set_opt(machine, RVVM_OPT_JIT, true);
     rvvm_set_opt(machine, RVVM_OPT_JIT_HARVARD, true);
@@ -845,10 +846,20 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
 {
     rvvm_hart_t* thread = riscv_hart_init(machine);
     riscv_hart_prepare(thread);
+    // Allow time CSR access from U-mode
+    thread->csr.counteren[PRIVILEGE_MACHINE] = CSR_COUNTEREN_MASK;
+    thread->csr.counteren[PRIVILEGE_SUPERVISOR] = CSR_COUNTEREN_MASK;
+
+    // Allow Zkr seed CSR access from U-mode
+    thread->csr.mseccfg = CSR_MSECCFG_MASK;
+
+    // Allow Zicboz/Zicbom access from U-mode
+    thread->csr.envcfg[PRIVILEGE_MACHINE] = CSR_MENVCFG_MASK;
+    thread->csr.envcfg[PRIVILEGE_SUPERVISOR] = CSR_SENVCFG_MASK;
 #ifdef USE_FPU
     // Initialize FPU by writing to status CSR
     maxlen_t mstatus = (FS_INITIAL << 13);
-    riscv_csr_op(thread, 0x300, &mstatus, CSR_SETBITS);
+    riscv_csr_op(thread, CSR_MSTATUS, &mstatus, CSR_SETBITS);
 #endif
 #ifdef USE_JIT
     // Enable pointer optimization
