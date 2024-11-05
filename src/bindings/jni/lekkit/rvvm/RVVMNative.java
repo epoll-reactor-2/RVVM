@@ -15,7 +15,7 @@ public class RVVMNative {
     public static boolean loaded = false;
 
     private static void checkABI() {
-        if (check_abi(7)) {
+        if (check_abi(8)) {
             loaded = true;
         } else {
             System.out.println("ERROR: Invalid librvvm ABI version! Please update your JNI bindings!");
