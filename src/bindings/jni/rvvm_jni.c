@@ -21,16 +21,19 @@
 
 PUSH_OPTIMIZATION_SIZE
 
-JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_get_1abi_1version(JNIEnv* env, jclass class)
+JNIEXPORT jboolean JNICALL Java_lekkit_rvvm_RVVMNative_check_1abi(JNIEnv* env, jclass class, jint abi)
 {
     UNUSED(env); UNUSED(class);
-    return RVVM_ABI_VERSION;
+    return rvvm_check_abi(abi);
 }
 
-JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_create_1machine(JNIEnv* env, jclass class, jlong mem_base, jlong mem_size, jint smp, jboolean rv64)
+JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_create_1machine(JNIEnv* env, jclass class, jlong mem_size, jint smp, jstring isa)
 {
-    UNUSED(env); UNUSED(class);
-    return (size_t)rvvm_create_machine(mem_base, mem_size, smp, rv64);
+    const char* u8_isa = (*env)->GetStringUTFChars(env, isa, NULL);
+    UNUSED(class);
+    jlong ret = (size_t)rvvm_create_machine(mem_size, smp, u8_isa);
+    (*env)->ReleaseStringUTFChars(env, isa, u8_isa);
+    return ret;
 }
 
 JNIEXPORT jobject JNICALL Java_lekkit_rvvm_RVVMNative_get_1dma_1buf(JNIEnv* env, jclass class, jlong machine, jlong addr, jlong size)
