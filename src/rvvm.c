@@ -60,7 +60,7 @@ static void rvvm_init_fdt(rvvm_machine_t* machine)
     struct fdt_node* cpus = fdt_node_create("cpus");
     fdt_node_add_prop_u32(cpus, "#address-cells", 1);
     fdt_node_add_prop_u32(cpus, "#size-cells", 0);
-    fdt_node_add_prop_u32(cpus, "timebase-frequency", 10000000);
+    fdt_node_add_prop_u32(cpus, "timebase-frequency", rvvm_get_opt(machine, RVVM_OPT_TIME_FREQ));
 
     struct fdt_node* cpu_map = fdt_node_create("cpu-map");
     struct fdt_node* cluster = fdt_node_create("cluster0");
@@ -206,7 +206,7 @@ static void rvvm_reset_machine_state(rvvm_machine_t* machine)
     }
     rvvm_addr_t dtb_addr = rvvm_pass_dtb(machine);
     // Reset CPUs
-    rvtimer_init(&machine->timer, 10000000); // 10 MHz timer
+    rvtimer_init(&machine->timer, rvvm_get_opt(machine, RVVM_OPT_TIME_FREQ));
     vector_foreach(machine->harts, i) {
         rvvm_hart_t* vm = vector_at(machine->harts, i);
         // a0 register & mhartid csr contain hart ID
@@ -318,6 +318,15 @@ static void rvvm_reconfigure_eventloop(void)
     spin_unlock(&eventloop_lock);
 }
 
+PUBLIC bool rvvm_check_abi(int abi)
+{
+    if (RVVM_ABI_VERSION < 0) {
+        rvvm_warn("This is a staging librvvm build with unstable ABI/API");
+        return true;
+    }
+    return abi == RVVM_ABI_VERSION;
+}
+
 PUBLIC bool rvvm_mmio_none(rvvm_mmio_dev_t* dev, void* dest, size_t offset, uint8_t size)
 {
     UNUSED(dev);
@@ -326,11 +335,19 @@ PUBLIC bool rvvm_mmio_none(rvvm_mmio_dev_t* dev, void* dest, size_t offset, uint
     return true;
 }
 
-PUBLIC rvvm_machine_t* rvvm_create_machine(rvvm_addr_t mem_base, size_t mem_size, size_t hart_count, bool rv64)
+PUBLIC rvvm_machine_t* rvvm_create_machine(size_t mem_size, size_t hart_count, const char* isa)
 {
     stacktrace_init();
+    // TODO: Proper full ISA string parsing
+    if (!isa) isa = "rv64";
+    bool rv64 = rvvm_strfind(isa, "rv64") == isa;
+    bool rv32 = rvvm_strfind(isa, "rv32") == isa;
+    if (!rv64 && !rv32) {
+        rvvm_error("Invalid CPU ISA string: %s", isa);
+        return NULL;
+    }
 #ifndef USE_RV32
-    if (!rv64) {
+    if (rv32) {
         rvvm_error("RV32 is disabled in this RVVM build");
         return NULL;
     }
@@ -341,28 +358,29 @@ PUBLIC rvvm_machine_t* rvvm_create_machine(rvvm_addr_t mem_base, size_t mem_size
         return NULL;
     }
 #endif
-    if (hart_count == 0) {
-        rvvm_error("Creating machine with no harts at all... What are you even??");
-        return NULL;
-    }
-    if (hart_count > 1024) {
+    if (hart_count == 0 || hart_count > 1024) {
         rvvm_error("Invalid machine core count");
         return NULL;
     }
-    if (!rv64 && mem_size > (1U << 30)) {
-        // Workaround for SBI/Linux hangs on incorrect machine config
+    if (rv32 && mem_size > (1U << 30)) {
+        // Workaround for SBI/Linux hangs on too much ram
         rvvm_warn("Creating RV32 machine with >1G of RAM is likely to break, fixing");
         mem_size = 1U << 30;
     }
 
     rvvm_machine_t* machine = safe_new_obj(rvvm_machine_t);
     machine->rv64 = rv64;
-    if (!riscv_init_ram(&machine->mem, mem_base, mem_size)) {
+    if (!riscv_init_ram(&machine->mem, RVVM_DEFAULT_MEMBASE, mem_size)) {
         free(machine);
         return NULL;
     }
 
     // Default options
+    rvvm_set_opt(machine, RVVM_OPT_MAX_CPU_CENT, 100);
+    rvvm_set_opt(machine, RVVM_OPT_MEM_BASE, RVVM_DEFAULT_MEMBASE);
+    rvvm_set_opt(machine, RVVM_OPT_RESET_PC, RVVM_DEFAULT_MEMBASE);
+    rvvm_set_opt(machine, RVVM_OPT_TIME_FREQ, 10000000);
+
 #ifdef USE_JIT
     rvvm_set_opt(machine, RVVM_OPT_JIT, !rvvm_has_arg("nojit"));
     rvvm_set_opt(machine, RVVM_OPT_JIT_HARVARD, rvvm_has_arg("rvjit_harvard"));
@@ -376,8 +394,6 @@ PUBLIC rvvm_machine_t* rvvm_create_machine(rvvm_addr_t mem_base, size_t mem_size
         rvvm_set_opt(machine, RVVM_OPT_JIT_CACHE, jit_cache);
     }
 #endif
-    rvvm_set_opt(machine, RVVM_OPT_MAX_CPU_CENT, 100);
-    rvvm_set_opt(machine, RVVM_OPT_RESET_PC, mem_base);
 
     for (size_t i=0; i<hart_count; ++i) {
         vector_push_back(machine->harts, riscv_hart_init(machine));
@@ -511,7 +527,7 @@ PUBLIC void rvvm_append_cmdline(rvvm_machine_t* machine, const char* str)
 
 PUBLIC rvvm_addr_t rvvm_get_opt(rvvm_machine_t* machine, uint32_t opt)
 {
-    if (opt < RVVM_MAX_OPTS) {
+    if (opt < RVVM_OPTS_ARR_SIZE) {
         return atomic_load_uint64_ex(&machine->opts[opt], ATOMIC_RELAXED);
     }
     switch (opt) {
@@ -524,9 +540,16 @@ PUBLIC rvvm_addr_t rvvm_get_opt(rvvm_machine_t* machine, uint32_t opt)
 
 PUBLIC bool rvvm_set_opt(rvvm_machine_t* machine, uint32_t opt, rvvm_addr_t val)
 {
-    if (opt >= RVVM_MAX_OPTS) return false;
-    atomic_store_uint64_ex(&machine->opts[opt], val, ATOMIC_RELAXED);
-    return true;
+    if (opt < RVVM_OPTS_ARR_SIZE) {
+        atomic_store_uint64_ex(&machine->opts[opt], val, ATOMIC_RELAXED);
+        return true;
+    }
+    switch (opt) {
+        case RVVM_OPT_MEM_BASE:
+            machine->mem.begin = val;
+            return true;
+    }
+    return false;
 }
 
 static bool file_reopen_check_size(rvfile_t** dest, const char* path, size_t size)
@@ -822,17 +845,28 @@ PUBLIC void rvvm_run_eventloop(void)
 // Userland emulation API (WIP)
 //
 
-PUBLIC rvvm_machine_t* rvvm_create_userland(bool rv64)
+PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 {
+    // TODO: Proper full ISA string parsing
+    if (!isa) isa = "rv64";
+    bool rv64 = rvvm_strfind(isa, "rv64") == isa;
+    bool rv32 = rvvm_strfind(isa, "rv32") == isa;
+    if (!rv64 && !rv32) {
+        rvvm_error("Invalid CPU ISA string: %s", isa);
+        return NULL;
+    }
+
     rvvm_machine_t* machine = safe_new_obj(rvvm_machine_t);
+
     // Bypass entire process memory except the NULL page
     // RVVM expects mem.data to be non-NULL, let's leave that for now
     machine->mem.begin = 0x1000;
     machine->mem.size = (phys_addr_t)-0x1000ULL;
     machine->mem.data = (void*)0x1000;
     machine->rv64 = rv64;
-    // I don't know what time CSR frequency userspace expects...
-    rvtimer_init(&machine->timer, 1000000);
+
+    // Set nanosecond machine timer precision by default
+    rvvm_set_opt(machine, RVVM_OPT_TIME_FREQ, 1000000000ULL);
 
 #ifdef USE_JIT
     rvvm_set_opt(machine, RVVM_OPT_JIT, true);
@@ -867,6 +901,10 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
 #endif
     riscv_switch_priv(thread, PRIVILEGE_USER);
     spin_lock(&global_lock);
+    if (!vector_size(machine->harts)) {
+        // This is the main thread, initialize the timer
+        rvtimer_init(&machine->timer, rvvm_get_opt(machine, RVVM_OPT_TIME_FREQ));
+    }
     vector_push_back(machine->harts, thread);
     spin_unlock(&global_lock);
     return thread;

@@ -51,23 +51,14 @@ RVVM_EXTERN_C_BEGIN
 #define RVVM_VERSION "0.7-git"
 #endif
 
-//! Increments on each API/ABI breakage
-#define RVVM_ABI_VERSION 7
+//! Increments on each API/ABI breakage, equal to -1 in unstable staging builds
+#define RVVM_ABI_VERSION 8
+
+//! \brief  Check librvvm ABI compatibility via rvvm_check_abi(RVVM_ABI_VERSION)
+//! \return True if librvvm supports the header ABI
+PUBLIC bool rvvm_check_abi(int abi);
 
 /*
- * TODO: CPU ISA definitions/flags (Elaborately discuss this before changing the API)
- * I.e. create machines withtout FPU/Vectors, possibly non-RISCV hardware?
- *
-
- //! Use riscv32gcb CPU
-#define RVVM_ISA_RISCV32_AUTO 0x80000000U
-
-//! Use riscv64gcb CPU
-#define RVVM_ISA_RISCV64_AUTO 0x80000001U
-
- *
- * TODO: Make RVVM_OPT_MEM_BASE settable and remove mem_base argument from rvvm_create_machine(), default to 0x80000000
- *
  * TODO: Rename this header into librvvm.h after API freeze for 1.0?
  */
 
@@ -84,34 +75,33 @@ typedef uint64_t rvvm_addr_t;
 typedef struct rvvm_machine_t rvvm_machine_t;
 
 // Machine options (Settable)
-#define RVVM_OPT_NONE           0
-#define RVVM_OPT_JIT            1 //!< Enable JIT
-#define RVVM_OPT_JIT_CACHE      2 //!< Amount of per-core JIT cache (In bytes)
-#define RVVM_OPT_JIT_HARVARD    3 //!< No dirty code tracking, explicit ifence, slower
-#define RVVM_OPT_VERBOSITY      4 //!< Verbosity level of internal logic
-#define RVVM_OPT_HW_IMITATE     5 //!< Imitate traits or identity of physical hardware
-#define RVVM_OPT_MAX_CPU_CENT   6 //!< Maximum CPU load % per guest/host CPUs
-#define RVVM_OPT_RESET_PC       7 //!< Physical jump address at reset, defaults to mem_base
-#define RVVM_OPT_DTB_ADDR       8 //!< Pass DTB address if non-zero, omits FDT generation
-
-// Internal use ONLY!
-#define RVVM_MAX_OPTS           9
+#define RVVM_OPT_NONE         0x0
+#define RVVM_OPT_RESET_PC     0x1 //!< Physical jump address at reset, defaults to 0x80000000
+#define RVVM_OPT_DTB_ADDR     0x2 //!< Pass DTB address if non-zero, omits FDT generation
+#define RVVM_OPT_TIME_FREQ    0x3 //!< Machine timer frequency, 10Mhz by default
+#define RVVM_OPT_HW_IMITATE   0x4 //!< Imitate traits or identity of physical hardware
+#define RVVM_OPT_MAX_CPU_CENT 0x5 //!< Maximum CPU load % per guest/host CPUs
+#define RVVM_OPT_JIT          0x6 //!< Enable JIT
+#define RVVM_OPT_JIT_CACHE    0x7 //!< Amount of per-core JIT cache (In bytes)
+#define RVVM_OPT_JIT_HARVARD  0x8 //!< No dirty code tracking, explicit ifence, slower
 
 // Machine options (Special function or read-only)
-#define RVVM_OPT_MEM_BASE       0x80000001U //!< Physical RAM base address
-#define RVVM_OPT_MEM_SIZE       0x80000002U //!< Physical RAM size
-#define RVVM_OPT_HART_COUNT     0x80000003U //!< Amount of harts
+#define RVVM_OPT_MEM_BASE   0x80000001U //!< Physical RAM base address, defaults to 0x80000000
+#define RVVM_OPT_MEM_SIZE   0x80000002U //!< Physical RAM size
+#define RVVM_OPT_HART_COUNT 0x80000003U //!< Amount of harts
+
+// Internal use ONLY!
+#define RVVM_OPTS_ARR_SIZE 0x9
 
 //! Default memory base address
-#define RVVM_DEFAULT_MEMBASE 0x80000000
+#define RVVM_DEFAULT_MEMBASE 0x80000000U
 
 //! \brief Creates a new virtual machine
-//! \param mem_base   Memory base address, usually RVVM_DEFAULT_MEMBASE
 //! \param mem_size   Amount of memory (in bytes), should be page-aligned
-//! \param hart_count Amount of HARTs (cores)
-//! \param rv64       Enables 64-bit RISC-V, otherwise 32-bit machine is created
+//! \param hart_count Amount of HARTs (cores), should be >=1
+//! \param isa        String describing the CPU instruction set, or NULL to pick rv64
 //! \return Valid machine handle, or NULL on failure
-PUBLIC rvvm_machine_t* rvvm_create_machine(rvvm_addr_t mem_base, size_t mem_size, size_t hart_count, bool rv64);
+PUBLIC rvvm_machine_t* rvvm_create_machine(size_t mem_size, size_t hart_count, const char* isa);
 
 //! \brief Set a new kernel cmdline for a manually loaded kernel
 PUBLIC void rvvm_set_cmdline(rvvm_machine_t* machine, const char* str);
@@ -305,7 +295,7 @@ typedef struct rvvm_hart_t rvvm_hart_t;
 #define RVVM_REGID_TVAL  1026
 
 //! \brief Create a userland process context
-PUBLIC rvvm_machine_t* rvvm_create_userland(bool rv64);
+PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa);
 
 //! \brief Flush instruction cache for a specified memory range
 PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size);
