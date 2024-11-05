@@ -206,9 +206,9 @@ static int rvvm_cli_main(int argc, const char** argv)
 
     // Default params: 1 core, 256M ram, riscv64, 640x480 screen
     const char* bootrom = NULL;
+    const char* isa = "rv64";
     size_t mem = 256 << 20;
     size_t smp = 1;
-    bool   rv64 = true;
     tap_dev_t* tap = NULL;
 
     // Set up global argparser
@@ -223,7 +223,7 @@ static int rvvm_cli_main(int argc, const char** argv)
     if (rvvm_getarg_size("mem")) mem = rvvm_getarg_size("mem");
     if (rvvm_getarg_int("s"))    smp = rvvm_getarg_int("s");
     if (rvvm_getarg_int("smp"))  smp = rvvm_getarg_int("smp");
-    rv64 = !rvvm_has_arg("rv32");
+    if (rvvm_has_arg("rv32"))    isa = "rv32";
 
     for (int i=1; i<argc; i+=arg_size) {
         arg_size = get_arg(argv + i, &arg_name, &arg_val);
@@ -237,7 +237,7 @@ static int rvvm_cli_main(int argc, const char** argv)
     }
 
     // Create & configure machine
-    rvvm_machine_t* machine = rvvm_create_machine(RVVM_DEFAULT_MEMBASE, mem, smp, rv64);
+    rvvm_machine_t* machine = rvvm_create_machine(mem, smp, isa);
     if (machine == NULL) {
         rvvm_error("Failed to create VM");
         return -1;
