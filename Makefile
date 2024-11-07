@@ -195,10 +195,14 @@ endif
 ifneq (,$(findstring main, $(shell $(CC) $(CFLAGS) $(LDFLAGS) -ldl 2>&1)))
 override LDFLAGS += -ldl
 endif
+
+# Linking to libatomic on x86_64 is redundant and may cause issues
+ifeq (,$(findstring -,$(CC_TRIPLET))$(filter-out x86_64,$(ARCH)))
 ifneq (,$(findstring main, $(shell $(CC) $(CFLAGS) $(LDFLAGS) -latomic 2>&1)))
 override LDFLAGS += -latomic
 else
 override CFLAGS += -DNO_LIBATOMIC
+endif
 endif
 
 # Set some addiional options based on POSIX flavor
