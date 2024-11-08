@@ -101,7 +101,6 @@ static void term_rawmode(void)
 typedef struct {
     chardev_t chardev;
     spinlock_t lock;
-    spinlock_t io_lock;
     uint32_t flags;
     int rfd, wfd;
     ringbuf_t rx, tx;
@@ -184,41 +183,34 @@ static void term_process_input(chardev_term_t* term, char* buffer, size_t size)
 static void term_update(chardev_t* dev)
 {
     chardev_term_t* term = dev->data;
-    uint32_t flags = 0;
-    char buffer[256] = {0};
-    size_t rx_size = 0, tx_size = 0;
 
-    spin_lock(&term->io_lock);
-    spin_lock(&term->lock);
-    rx_size = EVAL_MIN(ringbuf_space(&term->rx), sizeof(buffer));
-    tx_size = ringbuf_peek(&term->tx, buffer, sizeof(buffer));
-    spin_unlock(&term->lock);
+    if (spin_try_lock(&term->lock)) {
+        char buffer[256] = {0};
+        size_t rx_size = EVAL_MIN(ringbuf_space(&term->rx), sizeof(buffer));
+        size_t tx_size = ringbuf_peek(&term->tx, buffer, sizeof(buffer));
 
-    term_push_io(term, buffer, &rx_size, &tx_size);
-    term_process_input(term, buffer, rx_size);
+        term_push_io(term, buffer, &rx_size, &tx_size);
+        term_process_input(term, buffer, rx_size);
 
-    spin_lock(&term->lock);
-    ringbuf_write(&term->rx, buffer, rx_size);
-    ringbuf_skip(&term->tx, tx_size);
-    flags = term_update_flags(term);
-    spin_unlock(&term->lock);
-    spin_unlock(&term->io_lock);
+        ringbuf_write(&term->rx, buffer, rx_size);
+        ringbuf_skip(&term->tx, tx_size);
+        uint32_t flags = term_update_flags(term);
+        spin_unlock(&term->lock);
 
-    if (flags) chardev_notify(&term->chardev, flags);
+        if (flags) chardev_notify(&term->chardev, flags);
+    }
 }
 
 static size_t term_read(chardev_t* dev, void* buf, size_t nbytes)
 {
     chardev_term_t* term = dev->data;
-    size_t ret = 0;
     spin_lock(&term->lock);
-    ret = ringbuf_read(&term->rx, buf, nbytes);
-    if (!ringbuf_avail(&term->rx) && spin_try_lock(&term->io_lock)) {
+    size_t ret = ringbuf_read(&term->rx, buf, nbytes);
+    if (!ringbuf_avail(&term->rx)) {
         char buffer[256] = {0};
         size_t rx_size = sizeof(buffer);
         term_push_io(term, buffer, &rx_size, NULL);
         ringbuf_write(&term->rx, buffer, rx_size);
-        spin_unlock(&term->io_lock);
     }
     term_update_flags(term);
     spin_unlock(&term->lock);
@@ -228,15 +220,13 @@ static size_t term_read(chardev_t* dev, void* buf, size_t nbytes)
 static size_t term_write(chardev_t* dev, const void* buf, size_t nbytes)
 {
     chardev_term_t* term = dev->data;
-    size_t ret = 0;
     spin_lock(&term->lock);
-    ret = ringbuf_write(&term->tx, buf, nbytes);
-    if (!ringbuf_space(&term->tx) && spin_try_lock(&term->io_lock)) {
+    size_t ret = ringbuf_write(&term->tx, buf, nbytes);
+    if (!ringbuf_space(&term->tx)) {
         char buffer[257] = {0};
-        size_t tx_size = ringbuf_peek(&term->tx, buffer, 256);
+        size_t tx_size = ringbuf_peek(&term->tx, buffer, sizeof(buffer) - 1);
         term_push_io(term, buffer, NULL, &tx_size);
         ringbuf_skip(&term->tx, tx_size);
-        spin_unlock(&term->io_lock);
     }
     term_update_flags(term);
     spin_unlock(&term->lock);
