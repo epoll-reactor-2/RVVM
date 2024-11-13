@@ -165,12 +165,13 @@ static forceinline uint32_t atomic_load_uint32_ex(const void* addr, int memorder
 static forceinline bool atomic_cas_uint32_ex(void* addr, uint32_t exp, uint32_t val, bool weak, int succ, int fail)
 {
     UNUSED(weak); UNUSED(succ); UNUSED(fail);
-#if defined(__riscv_a) && defined(GNU_EXTS)
+#if defined(__riscv_a) && defined(GNU_EXTS) && !GCC_CHECK_VER(14, 1) && !CLANG_CHECK_VER(9, 0)
     // Workaround RISC-V atomic CAS miscompilation on GCC <14.1
+    // See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=104831
     uint32_t ret = 1, tmp = 0;
     __asm__ __volatile__ (
         "lrsc_cas_loop%=: \n\t"
-        "lr.w.aq %1, (%4) \n\t"
+        "lr.w.aqrl %1, (%4) \n\t"
         "bne %1, %2, lrsc_cas_exit%= \n\t"
         "sc.w.rl %0, %3, (%4) \n\t"
         "bnez %0, lrsc_cas_loop%= \n\t"
@@ -406,12 +407,13 @@ static forceinline uint64_t atomic_load_uint64_ex(const void* addr, int memorder
 static forceinline bool atomic_cas_uint64_ex(void* addr, uint64_t exp, uint64_t val, bool weak, int succ, int fail)
 {
     UNUSED(weak); UNUSED(succ); UNUSED(fail);
-#if defined(__riscv_a) && __riscv_xlen >= 64 && defined(GNU_EXTS)
+#if defined(__riscv_a) && __riscv_xlen == 64 && defined(GNU_EXTS) && !GCC_CHECK_VER(14, 1) && !CLANG_CHECK_VER(9, 0)
     // Workaround RISC-V atomic CAS miscompilation on GCC <14.1
+    // See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=104831
     uint64_t ret = 1, tmp = 0;
     __asm__ __volatile__ (
         "lrsc_cas_loop%=: \n\t"
-        "lr.d.aq %1, (%4) \n\t"
+        "lr.d.aqrl %1, (%4) \n\t"
         "bne %1, %2, lrsc_cas_exit%= \n\t"
         "sc.d.rl %0, %3, (%4) \n\t"
         "bnez %0, lrsc_cas_loop%= \n\t"
