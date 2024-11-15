@@ -7,8 +7,8 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#ifndef ATOMICS_H
-#define ATOMICS_H
+#ifndef LEKKIT_ATOMICS_H
+#define LEKKIT_ATOMICS_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -118,7 +118,7 @@ static pthread_mutex_t global_atomic_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 #ifndef HOST_LITTLE_ENDIAN
-// Use portable conversions instead of host atomics for explicit little endian
+// Use portable endian conversions for explicit little endian atomics
 #include "mem_ops.h"
 #endif
 
@@ -127,10 +127,13 @@ static forceinline void atomic_fence_ex(int memorder)
     UNUSED(memorder);
 #if defined(C11_ATOMICS_IMPL) || defined(GNU_ATOMICS_IMPL)
     atomic_thread_fence(memorder);
+#elif defined(_WIN32)
+    MemoryBarrier();
 #elif defined(SYNC_ATOMICS_IMPL)
     __sync_synchronize();
-#elif _WIN32
-    MemoryBarrier();
+#else
+    pthread_mutex_lock(&global_atomic_lock);
+    pthread_mutex_unlock(&global_atomic_lock);
 #endif
 }
 
@@ -215,7 +218,7 @@ static forceinline uint32_t atomic_swap_uint32_ex(void* addr, uint32_t val, int 
     uint32_t tmp = 0;
     do {
         tmp = atomic_load_uint32_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint32_ex(addr, tmp, val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint32_ex(addr, tmp, val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -246,7 +249,7 @@ static forceinline uint32_t atomic_add_uint32_ex(void* addr, uint32_t val, int m
     uint32_t tmp = 0;
     do {
         tmp = atomic_load_uint32_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint32_ex(addr, tmp, tmp + val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint32_ex(addr, tmp, tmp + val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -266,7 +269,7 @@ static forceinline uint32_t atomic_sub_uint32_ex(void* addr, uint32_t val, int m
     uint32_t tmp = 0;
     do {
         tmp = atomic_load_uint32_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint32_ex(addr, tmp, tmp - val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint32_ex(addr, tmp, tmp - val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -306,7 +309,7 @@ static forceinline uint32_t atomic_xor_uint32_ex(void* addr, uint32_t val, int m
     uint32_t tmp = 0;
     do {
         tmp = atomic_load_uint32_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint32_ex(addr, tmp, tmp ^ val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint32_ex(addr, tmp, tmp ^ val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -326,7 +329,7 @@ static forceinline uint32_t atomic_or_uint32_ex(void* addr, uint32_t val, int me
     uint32_t tmp = 0;
     do {
         tmp = atomic_load_uint32_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint32_ex(addr, tmp, tmp | val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint32_ex(addr, tmp, tmp | val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -457,7 +460,7 @@ static forceinline uint64_t atomic_swap_uint64_ex(void* addr, uint64_t val, int 
     uint64_t tmp = 0;
     do {
         tmp = atomic_load_uint64_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint64_ex(addr, tmp, val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint64_ex(addr, tmp, val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -488,7 +491,7 @@ static forceinline uint64_t atomic_add_uint64_ex(void* addr, uint64_t val, int m
     uint64_t tmp = 0;
     do {
         tmp = atomic_load_uint64_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint64_ex(addr, tmp, tmp + val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint64_ex(addr, tmp, tmp + val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -508,7 +511,7 @@ static forceinline uint64_t atomic_sub_uint64_ex(void* addr, uint64_t val, int m
     uint64_t tmp = 0;
     do {
         tmp = atomic_load_uint64_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint64_ex(addr, tmp, tmp - val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint64_ex(addr, tmp, tmp - val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -528,7 +531,7 @@ static forceinline uint64_t atomic_and_uint64_ex(void* addr, uint64_t val, int m
     uint64_t tmp = 0;
     do {
         tmp = atomic_load_uint64_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint64_ex(addr, tmp, tmp & val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint64_ex(addr, tmp, tmp & val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -548,7 +551,7 @@ static forceinline uint64_t atomic_xor_uint64_ex(void* addr, uint64_t val, int m
     uint64_t tmp = 0;
     do {
         tmp = atomic_load_uint64_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint64_ex(addr, tmp, tmp ^ val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint64_ex(addr, tmp, tmp ^ val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -568,7 +571,7 @@ static forceinline uint64_t atomic_or_uint64_ex(void* addr, uint64_t val, int me
     uint64_t tmp = 0;
     do {
         tmp = atomic_load_uint64_ex(addr, ATOMIC_ACQUIRE);
-    } while (!atomic_cas_uint64_ex(addr, tmp, tmp | val, false, ATOMIC_ACQ_REL, ATOMIC_ACQ_REL));
+    } while (!atomic_cas_uint64_ex(addr, tmp, tmp | val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
 }
@@ -621,6 +624,90 @@ static forceinline uint64_t atomic_xor_uint64(void* addr, uint64_t val)
 static forceinline uint64_t atomic_or_uint64(void* addr, uint64_t val)
 {
     return atomic_or_uint64_ex(addr, val, ATOMIC_ACQ_REL);
+}
+
+/*
+ * Pointer atomic operations (For RCU, lock-free linked lists, etc)
+ */
+
+static forceinline void* atomic_load_pointer_ex(const void* addr, int memorder)
+{
+#if defined(C11_ATOMICS_IMPL)
+    return atomic_load_explicit((void* _Atomic *)addr, memorder);
+#elif defined(GNU_ATOMICS_IMPL) && defined(GNU_ATOMICS_INTRINS)
+    return __atomic_load_n((void**)addr, memorder);
+#elif defined(HOST_64BIT)
+    return (void*)atomic_load_uint64_ex(addr, memorder);
+#elif defined(HOST_32BIT)
+    return (void*)atomic_load_uint32_ex(addr, memorder);
+#else
+    #error Unknown CPU bitness and no C11/GNU atomics!
+#endif
+}
+
+static forceinline bool atomic_cas_pointer_ex(void* addr, void* exp, void* val, bool weak, int succ, int fail)
+{
+#if defined(C11_ATOMICS_IMPL) && (!defined(__riscv_a) || __riscv_xlen > 64)
+    if (weak) {
+        return atomic_compare_exchange_weak_explicit((void* _Atomic *)addr, &exp, val, succ, fail);
+    } else {
+        return atomic_compare_exchange_strong_explicit((void* _Atomic *)addr, &exp, val, succ, fail);
+    }
+#elif defined(GNU_ATOMICS_IMPL) && defined(GNU_ATOMICS_INTRINS) && (!defined(__riscv_a) || __riscv_xlen > 64)
+    return __atomic_compare_exchange_n((void**)addr, &exp, val, weak, succ, fail);
+#elif defined(HOST_64BIT)
+    return atomic_cas_uint64_ex(addr, (uint64_t)exp, (uint64_t)val, weak, succ, fail);
+#elif defined(HOST_32BIT)
+    return atomic_cas_uint32_ex(addr, (uint32_t)exp, (uint32_t)val, weak, succ, fail);
+#else
+    #error Unknown CPU bitness and no C11/GNU atomics!
+#endif
+}
+
+static forceinline void* atomic_swap_pointer_ex(void* addr, void* val, int memorder)
+{
+#if defined(C11_ATOMICS_IMPL)
+    return atomic_exchange_explicit((void* _Atomic *)addr, val, memorder);
+#elif defined(GNU_ATOMICS_IMPL) && defined(GNU_ATOMICS_INTRINS)
+    return __atomic_exchange_n((void**)addr, val, memorder);
+#elif defined(HOST_64BIT)
+    return (void*)atomic_swap_uint64_ex(addr, (uint64_t)val, memorder);
+#elif defined(HOST_32BIT)
+    return (void*)atomic_swap_uint32_ex(addr, (uint32_t)val, memorder);
+#else
+    #error Unknown CPU bitness and no C11/GNU atomics!
+#endif
+}
+
+static forceinline void atomic_store_pointer_ex(void* addr, void* val, int memorder)
+{
+#if defined(C11_ATOMICS_IMPL)
+    atomic_store_explicit((void* _Atomic *)addr, val, memorder);
+#elif defined(GNU_ATOMICS_IMPL) && defined(GNU_ATOMICS_INTRINS)
+    __atomic_store_n((void**)addr, val, memorder);
+#else
+    atomic_swap_pointer_ex(addr, val, memorder);
+#endif
+}
+
+static forceinline void* atomic_load_pointer(const void* addr)
+{
+    return atomic_load_pointer_ex(addr, ATOMIC_CONSUME);
+}
+
+static forceinline bool atomic_cas_pointer(void* addr, void* exp, void* val)
+{
+    return atomic_cas_pointer_ex(addr, exp, val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE);
+}
+
+static forceinline void* atomic_swap_pointer(void* addr, void* val)
+{
+    return atomic_swap_pointer_ex(addr, val, ATOMIC_ACQ_REL);
+}
+
+static forceinline void atomic_store_pointer(void* addr, void* val)
+{
+    return atomic_store_pointer_ex(addr, val, ATOMIC_RELEASE);
 }
 
 /*
