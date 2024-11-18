@@ -13,21 +13,18 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "rvtimer.h"
 #include "utils.h"
 
-// Maximum allowed lock time, warns and recovers the lock upon expiration
-#define SPINLOCK_MAX_MS 5000
+// Maximum allowed bounded locking time, reports a deadlock upon expiration
+#define SPINLOCK_MAX_MS 10000
 
 // Attemts to claim the lock before blocking in the kernel
-#define SPINLOCK_RETRIES 60
+#define SPINLOCK_RETRIES 40
 
 static cond_var_t* global_cond = NULL;
 
 static void spin_deinit(void)
 {
-    cond_var_t* cond = global_cond;
+    condvar_free(global_cond);
     global_cond = NULL;
-    // Make sure no use-after-free happens on running threads
-    atomic_fence();
-    condvar_free(cond);
 }
 
 static void spin_global_init(void)
@@ -38,7 +35,7 @@ static void spin_global_init(void)
     });
 }
 
-static void spin_lock_debug_report(spinlock_t* lock)
+NOINLINE static void spin_lock_debug_report(spinlock_t* lock, bool crash)
 {
 #ifdef USE_SPINLOCK_DEBUG
     rvvm_warn("The lock was previously held at %s", lock->location);
@@ -49,58 +46,148 @@ static void spin_lock_debug_report(spinlock_t* lock)
     rvvm_warn("Version: RVVM v"RVVM_VERSION);
 #endif
     stacktrace_print();
+    if (crash) {
+        rvvm_fatal("Locking issue detected!");
+    }
 }
 
-slow_path void spin_lock_wait(spinlock_t* lock, const char* location)
+static inline bool spin_flag_has_writer(uint32_t flag)
+{
+    return !!(flag & 0x1U);
+}
+
+static inline bool spin_flag_has_readers(uint32_t flag)
+{
+    return !!(flag & ~0x80000001U);
+}
+
+static inline bool spin_flag_has_waiters(uint32_t flag)
+{
+    return !!(flag & 0x80000000U);
+}
+
+static inline bool spin_flag_writer_welcome(uint32_t flag)
+{
+    return !flag;
+}
+
+static inline bool spin_flag_readers_welcome(uint32_t flag)
+{
+    return !(flag & 0x80000001U);
+}
+
+static inline bool spin_lock_possibly_available(uint32_t flag, bool writer)
+{
+    if (writer) {
+        return spin_flag_writer_welcome(flag);
+    } else {
+        return spin_flag_readers_welcome(flag);
+    }
+}
+
+static inline bool spin_try_claim_internal(spinlock_t* lock, const char* location, bool writer)
+{
+    if (writer) {
+        return spin_try_lock_internal(lock, location);
+    } else {
+        return spin_try_read_lock(lock);
+    }
+}
+
+slow_path static void spin_lock_wait_internal(spinlock_t* lock, const char* location, bool writer)
 {
     for (size_t i = 0; i < SPINLOCK_RETRIES; ++i) {
         // Read lock flag until there's any chance to grab it
         // Improves performance due to cacheline bouncing elimination
-        if (atomic_load_uint32_ex(&lock->flag, ATOMIC_ACQUIRE) == 0) {
-            if (spin_try_lock_real(lock, location)) {
+        uint32_t flag = atomic_load_uint32_ex(&lock->flag, ATOMIC_RELAXED);
+        if (spin_lock_possibly_available(flag, writer)) {
+            if (spin_try_claim_internal(lock, location, writer)) {
+                // Succesfully claimed the lock
                 return;
             }
+            // Contention is going on, fallback to kernel wait
             break;
         }
+#if defined(GNU_EXTS) && defined(__x86_64__)
+        __asm__ volatile ("pause");
+#elif defined(GNU_EXTS) && defined(__aarch64__)
+        __asm__ volatile ("isb sy");
+#endif
     }
 
     spin_global_init();
 
-    rvtimer_t timer = {0};
-    rvtimer_init(&timer, 1000);
-    do {
-        uint32_t flag = atomic_load_uint32_ex(&lock->flag, ATOMIC_ACQUIRE);
-        if (flag == 0 && spin_try_lock_real(lock, location)) {
-            // Succesfully grabbed the lock
-            return;
+    rvtimer_t deadlock_timer = {0};
+    bool reset_deadlock_timer = true;
+    while (true) {
+        uint32_t flag = atomic_load_uint32_ex(&lock->flag, ATOMIC_RELAXED);
+        if (spin_lock_possibly_available(flag, writer)) {
+            if (spin_try_claim_internal(lock, location, writer)) {
+                // Succesfully claimed the lock
+                return;
+            }
+            // Contention is going on, retry
+            reset_deadlock_timer = true;
+        } else {
+            // Indicate that we're waiting on this lock
+            if (spin_flag_has_waiters(flag) || atomic_cas_uint32(&lock->flag, flag, flag | 0x80000000U)) {
+                // Wait till wakeup from lock owner
+                if (condvar_wait(global_cond, 10) || !spin_flag_has_waiters(flag)) {
+                    // Reset deadlock timer upon noticing any forward progress
+                    reset_deadlock_timer = true;
+                }
+            }
         }
-        // Someone else grabbed the lock, indicate that we are still waiting
-        if (flag != 2 && !atomic_cas_uint32(&lock->flag, 1, 2)) {
-            // Failed to indicate lock as waiting, retry grabbing
-            continue;
+        if (reset_deadlock_timer) {
+            rvtimer_init(&deadlock_timer, 1000);
+            reset_deadlock_timer = false;
         }
-        // Wait upon wakeup from lock owner
-        bool woken = condvar_wait(global_cond, 10);
-        if (woken || flag != 2) {
-            // Reset deadlock timer upon noticing any forward progress
-            rvtimer_init(&timer, 1000);
+        if (location && rvtimer_get(&deadlock_timer) > SPINLOCK_MAX_MS) {
+            rvvm_warn("Possible %sdeadlock at %s", writer ? "" : "reader ", location);
+            spin_lock_debug_report(lock, false);
+            reset_deadlock_timer = true;
         }
-    } while (location == NULL || rvtimer_get(&timer) < SPINLOCK_MAX_MS);
+    }
+}
 
-    rvvm_warn("Possible deadlock at %s", location);
+slow_path void spin_lock_wait(spinlock_t* lock, const char* location)
+{
+    spin_lock_wait_internal(lock, location, true);
+}
 
-    spin_lock_debug_report(lock);
 
-    rvvm_warn("Attempting to recover execution...\n * * * * * * *\n");
+slow_path void spin_read_lock_wait(spinlock_t* lock, const char* location)
+{
+    spin_lock_wait_internal(lock, location, false);
 }
 
 slow_path void spin_lock_wake(spinlock_t* lock, uint32_t prev)
 {
-    if (prev > 1) {
+    if (spin_flag_has_readers(prev)) {
+        rvvm_warn("Mismatched unlock of a reader lock!");
+        spin_lock_debug_report(lock, true);
+    } else if (!spin_flag_has_writer(prev)) {
+        rvvm_warn("Unlock of a non-locked writer lock!");
+        spin_lock_debug_report(lock, true);
+    } else if (spin_flag_has_waiters(prev)) {
+        // Wake all readers or waiter
         spin_global_init();
         condvar_wake_all(global_cond);
-    } else {
-        rvvm_warn("Unlock of a non-locked lock!");
-        spin_lock_debug_report(lock);
+    }
+}
+
+slow_path void spin_read_lock_wake(spinlock_t* lock, uint32_t prev)
+{
+    if (spin_flag_has_writer(prev)) {
+        rvvm_warn("Mismatched unlock of a writer lock!");
+        spin_lock_debug_report(lock, true);
+    } else if (!spin_flag_has_readers(prev)) {
+        rvvm_warn("Unlock of a non-locked reader lock!");
+        spin_lock_debug_report(lock, true);
+    } else if (spin_flag_has_waiters(prev)) {
+        // Wake writer
+        atomic_and_uint32(&lock->flag, ~0x80000000U);
+        spin_global_init();
+        condvar_wake_all(global_cond);
     }
 }
