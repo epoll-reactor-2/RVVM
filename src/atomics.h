@@ -122,10 +122,56 @@ static pthread_mutex_t global_atomic_lock = PTHREAD_MUTEX_INITIALIZER;
 #include "mem_ops.h"
 #endif
 
+// Prevents compiler instruction reordering, special case use only!
+static forceinline void atomic_compiler_barrier(void)
+{
+#if defined(C11_ATOMICS_IMPL)
+    atomic_signal_fence(memory_order_seq_cst);
+#elif defined(GNU_EXTS)
+    __asm__ volatile ("" : : : "memory");
+#elif defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_AMD64))
+    _ReadWriteBarrier();
+#endif
+}
+
+/*
+ * There are four types of memory reordering, done by compilers and CPUs:
+ * - LoadLoad:   Loads are reordered after loads
+ * - LoadStore:  Loads are reordered after stores
+ * - StoreStore: Stores are reordered after stores
+ * - StoreLoad:  Stores are reordered after loads, happens even on x86
+ *
+ * C11 memory ordering cheat sheet (LekKit, 2024):
+ * - ACQUIRE fence prevents LoadLoad.
+ *   An acquire load completes before any subsequent loads.
+ *
+ * - RELEASE fence prevents LoadStore and StoreStore.
+ *   A release store completes after any previous loads and stores.
+ *
+ * - ACQ_REL fence prevents LoadLoad, LoadStore and StoreStore.
+ *   An acq_rel RMW atomic completes after any previous loads and stores, and
+ *   before any subsequent loads.
+ *
+ * - SEQ_CST fence prevents any reordering, including StoreLoad.
+ *   This provides full sequential consistency, which is usually unnecessary,
+ *   unless implementing RCU or similar non-locking primitives.
+ *
+ * It should be noted that memory reordering has nothing to do with coherency,
+ * and does not affect loads/stores to the same memory location.
+ * Relaxed operations on a single atomic variable are going to be ordered
+ * correctly regardless, as opposed to complex shared data structures.
+ */
+
 static forceinline void atomic_fence_ex(int memorder)
 {
     UNUSED(memorder);
-#if defined(C11_ATOMICS_IMPL) || defined(GNU_ATOMICS_IMPL)
+#if !defined(__SANITIZE_THREAD__) && defined(GNU_EXTS) && defined(__x86_64__)
+    atomic_compiler_barrier();
+    if (memorder == ATOMIC_SEQ_CST) {
+        // Clang and older GCC use a sub-optimal `mfence` instruction for SEQ_CST fences
+        __asm__ volatile ("lock orq $0, (%%rsp)" : : : "memory");
+    }
+#elif defined(C11_ATOMICS_IMPL) || defined(GNU_ATOMICS_IMPL)
     atomic_thread_fence(memorder);
 #elif defined(_WIN32)
     MemoryBarrier();
@@ -692,7 +738,16 @@ static forceinline void atomic_store_pointer_ex(void* addr, void* val, int memor
 
 static forceinline void* atomic_load_pointer(const void* addr)
 {
+#if defined(__SANITIZE_THREAD__) || defined(__alpha__) || defined(__alpha) || defined(_M_ALPHA)
+    // Consume ordering only matters for DEC Alpha, yet it carries redundant pessimizations
+    // on most compilers for other CPUs. Also, make ThreadSanitizer happy.
     return atomic_load_pointer_ex(addr, ATOMIC_CONSUME);
+#else
+    // A compiler barrier is enough here for a standard-compliant consume ordering.
+    void* ret = atomic_load_pointer_ex(addr, ATOMIC_RELAXED);
+    atomic_compiler_barrier();
+    return ret;
+#endif
 }
 
 static forceinline bool atomic_cas_pointer(void* addr, void* exp, void* val)
@@ -707,7 +762,7 @@ static forceinline void* atomic_swap_pointer(void* addr, void* val)
 
 static forceinline void atomic_store_pointer(void* addr, void* val)
 {
-    return atomic_store_pointer_ex(addr, val, ATOMIC_RELEASE);
+    atomic_store_pointer_ex(addr, val, ATOMIC_RELEASE);
 }
 
 /*
