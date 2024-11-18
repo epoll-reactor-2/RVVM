@@ -25,11 +25,18 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define VMA_THP    0x20 // Transparent hugepages
 #define VMA_KSM    0x40 // Kernel same-page merging
 
+/*
+ * Misc memory helpers
+ */
+
 // Get host page size
 size_t vma_page_size(void);
 
 // Create anonymous memory-backed FD (POSIX only!)
-int vma_anon_memfd(size_t size);
+int    vma_anon_memfd(size_t size);
+
+// Broadcast a global memory barrier on all running threads. May fail on some host systems.
+bool   vma_broadcast_membarrier(void);
 
 /*
  * VMA allocations & file mapping

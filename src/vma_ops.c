@@ -14,7 +14,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include "vma_ops.h"
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #define VMA_WIN32_IMPL
 #include <windows.h>
 
@@ -55,24 +55,30 @@ static inline DWORD vma_native_view_prot(uint32_t flags)
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+
 #ifdef __linux__
 // For memfd_create()
 #include <sys/syscall.h>
 #include <signal.h>
 #endif
+
 #ifdef __serenity__
 // For anon_create()
 #include <serenity.h>
 #endif
+
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS
 #endif
+
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
 #endif
+
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
+
 #define MAP_VMA_ANON (MAP_PRIVATE | MAP_ANON)
 
 #if defined(MAP_JIT) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 101400
@@ -150,7 +156,7 @@ int vma_anon_memfd(size_t size)
 #if defined(VMA_MMAP_IMPL)
 #if defined(__NR_memfd_create)
     // If we are running on older kernel, should return -ENOSYS
-    signal(SIGSYS, SIG_IGN);
+    DO_ONCE(signal(SIGSYS, SIG_IGN));
     memfd = syscall(__NR_memfd_create, "vma_anon", 1);
 #elif defined(__FreeBSD__)
     memfd = shm_open(SHM_ANON, O_RDWR | O_CLOEXEC, 0);
@@ -218,6 +224,43 @@ int vma_anon_memfd(size_t size)
     rvvm_warn("Anonymous memfd is not supported!");
 #endif
     return memfd;
+}
+
+bool vma_broadcast_membarrier(void)
+{
+#if defined(VMA_MMAP_IMPL) && defined(__linux__) && defined(__NR_membarrier)
+    static bool has_expedited_membarrier = false;
+    // Register intent to use private expedited membarrier
+    DO_ONCE({
+        signal(SIGSYS, SIG_IGN);
+        has_expedited_membarrier = (syscall(__NR_membarrier, 0x10, 0) == 0);
+    });
+    if (has_expedited_membarrier) {
+        // Perform private expedited membarrier
+        if (syscall(__NR_membarrier, 0x8, 0) == 0) {
+            return true;
+        }
+        has_expedited_membarrier = false;
+    }
+#endif
+#if (defined(VMA_MMAP_IMPL) || defined(VMA_WIN32_IMPL)) && !defined(__aarch64__) && !defined(_M_ARM64)
+    // Most OS kernels perform an IPI for mprotect(READ), though on ARM64 this is not guaranteed due to tlbi
+    size_t page_size = vma_page_size();
+    void* ipi_page = vma_alloc(NULL, page_size, VMA_RDWR);
+    if (ipi_page) {
+        memset(ipi_page, 0, 4);
+        bool ret = vma_protect(ipi_page, page_size, VMA_READ);
+        vma_free(ipi_page, page_size);
+        return ret;
+    }
+#endif
+    /*
+     * TODO:
+     * Windows Vista+ has FlushProcessWriteBuffers(), but it's currently stubbed in Wine and therefore broken
+     * MacOS on M1 has thread_get_register_pointer_values(), which apparently issues a barrier on the thread
+     * Signal implementation may get the library user in trouble on signal collision
+     */
+    return false;
 }
 
 /*
@@ -451,18 +494,18 @@ bool vma_protect(void* addr, size_t size, uint32_t flags)
 
 bool vma_sync(void* addr, size_t size, bool lazy)
 {
-    size_t ptr_diff = ((size_t)addr) & (vma_page_size() - 1);
-    addr = align_ptr_down(addr, vma_page_size());
-    size = align_size_up(size + ptr_diff, vma_page_size());
-    UNUSED(lazy);
+    if (!lazy) {
+        size_t ptr_diff = ((size_t)addr) & (vma_page_size() - 1);
+        addr = align_ptr_down(addr, vma_page_size());
+        size = align_size_up(size + ptr_diff, vma_page_size());
 
 #if defined(VMA_WIN32_IMPL)
-    return FlushViewOfFile(addr, size);
+        return FlushViewOfFile(addr, size);
 #elif defined(VMA_MMAP_IMPL) && defined(MS_ASYNC) && defined(MS_SYNC)
-    return msync(addr, size, lazy ? MS_ASYNC : MS_SYNC) == 0;
-#else
-    return false;
+        return msync(addr, size, lazy ? MS_ASYNC : MS_SYNC) == 0;
 #endif
+    }
+    return true;
 }
 
 bool vma_clean(void* addr, size_t size, bool lazy)
