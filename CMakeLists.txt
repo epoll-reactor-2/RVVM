@@ -4,6 +4,9 @@
 cmake_minimum_required(VERSION 3.9)
 
 set(RVVM_VERSION 0.7)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 11)
+
 project(RVVM VERSION ${RVVM_VERSION}
 	DESCRIPTION "RISC-V Virtual Machine"
 	HOMEPAGE_URL "https://github.com/LekKit/RVVM"
@@ -88,7 +91,7 @@ if (${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR})
 endif()
 
 # Set build type
-if (NOT CMAKE_BUILD_TYPE AND NOT EXISTS ${CMAKE_BINARY_DIR}/CMakeCache.txt)
+if (NOT CMAKE_BUILD_TYPE OR NOT EXISTS ${CMAKE_BINARY_DIR}/CMakeCache.txt)
 	message(STATUS "${COLLOR_YELLOW}Setting build type to Release as none was specified${COLOR_RESET}")
 	set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
 	set(CMAKE_CONFIGURATION_TYPES "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
@@ -111,10 +114,22 @@ add_library(rvvm_common INTERFACE)
 target_include_directories(rvvm_common INTERFACE "${RVVM_SRC_DIR}")
 target_compile_definitions(rvvm_common INTERFACE "RVVM_VERSION=\"${RVVM_VERSION}\"")
 
+# Check and enable LTO
+include(CheckIPOSupported)
+check_ipo_supported(RESULT lto_supported OUTPUT lto_error)
+
+if (lto_supported)
+	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+else()
+	message(STATUS "${COLLOR_YELLOW}LTO is not supported by this toolchain: ${lto_error}")
+endif()
+
 if (MSVC)
 	# Suppress warnings: casts between int sizes, unsigned minus, cast after shift
 	target_compile_definitions(rvvm_common INTERFACE _CRT_SECURE_NO_WARNINGS)
 	target_compile_options(rvvm_common INTERFACE /wd4267 /wd4244 /wd4146 /wd4334)
+	# Use C11 atomics
+	target_compile_options(rvvm_common INTERFACE /experimental:c11atomics)
 	# Use static runtime
 	set(buildflags CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELEASE CMAKE_C_FLAGS_RELWITHDEBINFO
 			CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELWITHDEBINFO)
@@ -125,26 +140,19 @@ if (MSVC)
 	endforeach()
 endif()
 
-# Enable parallel LTO
-if (CMAKE_C_COMPILER_ID MATCHES "Clang")
-	target_compile_options(rvvm_common INTERFACE -flto=thin)
-elseif (CMAKE_C_COMPILER_ID MATCHES "GNU")
-	target_compile_options(rvvm_common INTERFACE -flto=auto)
-endif()
-
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+	# Use -O2 optimization level
+	set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
 	# Disable unsafe FPU optimizations, hide internal symbols
 	target_compile_options(rvvm_common INTERFACE -frounding-math -fvisibility=hidden -fno-math-errno)
 	# Warning options (Strict safety/portability, stack/object size limits)
-	# -Wbad-function-cast, -Wcast-align, -Wdouble-promotion need fixes in codebase
+	# TODO: -Wbad-function-cast, -Wcast-align, -Wdouble-promotion need fixes in codebase
 	target_compile_options(rvvm_common INTERFACE -Wall -Wextra -Wshadow -Wvla -Wpointer-arith -Walloca -Wduplicated-cond)
 	target_compile_options(rvvm_common INTERFACE -Wtrampolines -Wlarger-than=1048576 -Wframe-larger-than=32768 -Wdouble-promotion -Werror=return-type)
-	if (NOT CMAKE_BUILD_TYPE MATCHES "Debug")
-		# Optimization options
-		target_compile_options(rvvm_common INTERFACE -O2 -DNDEBUG)
-	endif()
-	if (CMAKE_C_COMPILER_ID MATCHES "Clang")
-		# Shut off bogus warnings on Clang
+	# Shut off bogus warnings
+	if (CMAKE_C_COMPILER_ID MATCHES "GNU")
+		target_compile_options(rvvm_common INTERFACE -Wno-missing-braces -Wno-missing-field-initializers)
+	elseif (CMAKE_C_COMPILER_ID MATCHES "Clang")
 		target_compile_options(rvvm_common INTERFACE -Wno-unknown-warning-option -Wno-unsupported-floating-point-opt -Wno-ignored-optimization-argument)
 		target_compile_options(rvvm_common INTERFACE -Wno-missing-braces -Wno-missing-field-initializers -Wno-ignored-pragmas -Wno-atomic-alignment)
 	endif()
