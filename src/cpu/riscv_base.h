@@ -855,15 +855,19 @@ static forceinline void riscv_emulate_i_opc_branch(rvvm_hart_t* vm, const uint32
 
 static forceinline void riscv_emulate_i_jalr(rvvm_hart_t* vm, const uint32_t insn)
 {
-    const regid_t rds = bit_cut(insn, 7, 5);
-    const regid_t rs1 = bit_cut(insn, 15, 5);
-    const sxlen_t offset = sign_extend(bit_cut(insn, 20, 12), 12);
-    const xlen_t pc = riscv_read_reg(vm, REGISTER_PC);
-    const xlen_t jmp_addr = riscv_read_reg(vm, rs1);
-
-    rvjit_trace_jalr(rds, rs1, offset, 4);
-    riscv_write_reg(vm, rds, pc + 4);
-    riscv_write_reg(vm, REGISTER_PC, ((jmp_addr + offset)&(~(xlen_t)1)) - 4);
+    const uint32_t funct3 = bit_cut(insn, 12, 3);
+    if (likely(!funct3)) {
+        const regid_t rds = bit_cut(insn, 7, 5);
+        const regid_t rs1 = bit_cut(insn, 15, 5);
+        const sxlen_t offset = sign_extend(bit_cut(insn, 20, 12), 12);
+        const xlen_t pc = riscv_read_reg(vm, REGISTER_PC);
+        const xlen_t jmp_addr = riscv_read_reg(vm, rs1);
+        rvjit_trace_jalr(rds, rs1, offset, 4);
+        riscv_write_reg(vm, rds, pc + 4);
+        riscv_write_reg(vm, REGISTER_PC, ((jmp_addr + offset)&(~(xlen_t)1)) - 4);
+        return;
+    }
+    riscv_illegal_insn(vm, insn);
 }
 
 static forceinline void riscv_emulate_i_jal(rvvm_hart_t* vm, const uint32_t insn)
