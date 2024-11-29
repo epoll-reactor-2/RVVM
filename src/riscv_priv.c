@@ -174,28 +174,36 @@ slow_path void riscv_emulate_opc_system(rvvm_hart_t* vm, const uint32_t insn)
 slow_path void riscv_emulate_opc_misc_mem(rvvm_hart_t* vm, const uint32_t insn)
 {
     const uint32_t funct3 = bit_cut(insn, 12, 3);
+    const regid_t rds = bit_cut(insn, 7, 5);
+    const regid_t rs1 = bit_cut(insn, 15, 5);
     switch (funct3) {
         case 0x0:
-            if (insn == RISCV_INSN_PAUSE) {
-                // pause hint, yield the vCPU thread
-                sleep_ms(0);
-            } else {
-                // fence
-                atomic_fence();
+            if (likely(!rds && !rs1)) {
+                if (insn == RISCV_INSN_PAUSE) {
+                    // pause hint, yield the vCPU thread
+                    sleep_ms(0);
+                } else {
+                    // fence
+                    atomic_fence();
+                }
+                return;
             }
-            return;
+            break;
         case 0x1: // fence.i
+            if (likely(!rds && !rs1)) {
 #ifdef USE_JIT
-            if (rvvm_get_opt(vm->machine, RVVM_OPT_JIT_HARVARD)) {
-                riscv_jit_flush_cache(vm);
-            } else {
-                // This eliminates possible dangling dirty blocks in JTLB
-                riscv_jit_tlb_flush(vm);
-            }
+                if (rvvm_get_opt(vm->machine, RVVM_OPT_JIT_HARVARD)) {
+                    riscv_jit_flush_cache(vm);
+                } else {
+                    // This eliminates possible dangling dirty blocks in JTLB
+                    riscv_jit_tlb_flush(vm);
+                }
 #endif
-            return;
+                return;
+            }
+            break;
         case 0x2:
-            if (likely(!bit_cut(insn, 7, 5))) {
+            if (likely(!rds)) {
                 switch (insn >> 20) {
                     case 0x0: // cbo.inval
                         if (riscv_csr_cbi_enabled(vm)) {
@@ -214,7 +222,6 @@ slow_path void riscv_emulate_opc_misc_mem(rvvm_hart_t* vm, const uint32_t insn)
                         break;
                     case 0x4: // cbo.zero
                         if (riscv_csr_cbz_enabled(vm)) {
-                            const regid_t rs1 = bit_cut(insn, 15, 5);
                             const virt_addr_t addr = vm->registers[rs1] & ~63ULL;
                             void* ptr = riscv_vma_translate_w(vm, addr, NULL, 64);
                             if (ptr) memset(ptr, 0, 64);
