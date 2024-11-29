@@ -174,35 +174,32 @@ slow_path void riscv_emulate_opc_system(rvvm_hart_t* vm, const uint32_t insn)
 slow_path void riscv_emulate_opc_misc_mem(rvvm_hart_t* vm, const uint32_t insn)
 {
     const uint32_t funct3 = bit_cut(insn, 12, 3);
-    const regid_t rds = bit_cut(insn, 7, 5);
-    const regid_t rs1 = bit_cut(insn, 15, 5);
     switch (funct3) {
-        case 0x0:
-            if (likely(!rds && !rs1)) {
-                if (insn == RISCV_INSN_PAUSE) {
-                    // pause hint, yield the vCPU thread
-                    sleep_ms(0);
-                } else {
-                    // fence
-                    atomic_fence();
-                }
-                return;
+        case 0x0: // fence
+            if (unlikely(insn == RISCV_INSN_PAUSE)) {
+                // Pause hint, yield the vCPU thread
+                sleep_ms(0);
+            } else if (unlikely((insn & 0x05000000) && (insn & 0x00A00000))) {
+                // StoreLoad fence needed (SEQ_CST)
+                atomic_fence_ex(ATOMIC_SEQ_CST);
+            } else {
+                // LoadLoad, LoadStore, StoreStore fence (ACQ_REL)
+                atomic_fence_ex(ATOMIC_ACQ_REL);
             }
-            break;
+            return;
         case 0x1: // fence.i
-            if (likely(!rds && !rs1)) {
 #ifdef USE_JIT
-                if (rvvm_get_opt(vm->machine, RVVM_OPT_JIT_HARVARD)) {
-                    riscv_jit_flush_cache(vm);
-                } else {
-                    // This eliminates possible dangling dirty blocks in JTLB
-                    riscv_jit_tlb_flush(vm);
-                }
-#endif
-                return;
+            if (rvvm_get_opt(vm->machine, RVVM_OPT_JIT_HARVARD)) {
+                riscv_jit_flush_cache(vm);
+            } else {
+                // This eliminates possible dangling dirty blocks in JTLB
+                riscv_jit_tlb_flush(vm);
             }
-            break;
-        case 0x2:
+#endif
+            return;
+        case 0x2: {
+            const regid_t rds = bit_cut(insn, 7, 5);
+            const regid_t rs1 = bit_cut(insn, 15, 5);
             if (likely(!rds)) {
                 switch (insn >> 20) {
                     case 0x0: // cbo.inval
@@ -231,6 +228,7 @@ slow_path void riscv_emulate_opc_misc_mem(rvvm_hart_t* vm, const uint32_t insn)
                 }
             }
             break;
+        }
     }
     riscv_illegal_insn(vm, insn);
 }
