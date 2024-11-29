@@ -318,13 +318,15 @@ static forceinline void riscv_emulate_f_opc_load(rvvm_hart_t* vm, const uint32_t
     const regid_t rs1 = bit_cut(insn, 15, 5);
     const sxlen_t offset = sign_extend(bit_cut(insn, 20, 12), 12);
     const xlen_t  addr = riscv_read_reg(vm, rs1) + offset;
-    if (likely(fpu_is_enabled(vm))) switch (funct3) {
-        case 0x2: // flw
-            riscv_load_float(vm, addr, rds);
-            return;
-        case 0x3: // fld
-            riscv_load_double(vm, addr, rds);
-            return;
+    if (likely(fpu_is_enabled(vm))) {
+        switch (funct3) {
+            case 0x2: // flw
+                riscv_load_float(vm, addr, rds);
+                return;
+            case 0x3: // fld
+                riscv_load_double(vm, addr, rds);
+                return;
+        }
     }
     riscv_illegal_insn(vm, insn);
 }
@@ -336,25 +338,41 @@ static forceinline void riscv_emulate_f_opc_store(rvvm_hart_t* vm, const uint32_
     const regid_t rs2 = bit_cut(insn, 20, 5);
     const sxlen_t offset = sign_extend(bit_cut(insn, 7, 5) | (bit_cut(insn, 25, 7) << 5), 12);
     const xlen_t addr = riscv_read_reg(vm, rs1) + offset;
-    if (likely(fpu_is_enabled(vm))) switch (funct3) {
-        case 0x2: // fsw
-            riscv_store_float(vm, addr, rs2);
-            return;
-        case 0x3: // fsd
-            riscv_store_double(vm, addr, rs2);
-            return;
+    if (likely(fpu_is_enabled(vm))) {
+        switch (funct3) {
+            case 0x2: // fsw
+                riscv_store_float(vm, addr, rs2);
+                return;
+            case 0x3: // fsd
+                riscv_store_double(vm, addr, rs2);
+                return;
+        }
     }
     riscv_illegal_insn(vm, insn);
+}
+
+// Rounding mode values of 5 & 6 are illegal
+static forceinline bool riscv_fpu_rm_invalid(uint8_t rm)
+{
+    rm = 6 - rm;
+    return rm <= 1;
 }
 
 static forceinline void riscv_emulate_f_fmadd(rvvm_hart_t* vm, const uint32_t insn)
 {
     const regid_t rds = bit_cut(insn, 7, 5);
+    const uint8_t rm  = bit_cut(insn, 12, 3);
     const regid_t rs1 = bit_cut(insn, 15, 5);
     const regid_t rs2 = bit_cut(insn, 20, 5);
     const uint32_t funct2 = bit_cut(insn, 25, 2);
     const regid_t rs3 = insn >> 27;
-    if (likely(fpu_is_enabled(vm))) switch (funct2) {
+
+    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+        riscv_illegal_insn(vm, insn);
+        return;
+    }
+
+    switch (funct2) {
         case 0x0: // fmadd.s
             fpu_write_s(vm, rds, fpu_fmaf(fpu_read_s(vm, rs1), fpu_read_s(vm, rs2), fpu_read_s(vm, rs3)));
             return;
@@ -368,11 +386,18 @@ static forceinline void riscv_emulate_f_fmadd(rvvm_hart_t* vm, const uint32_t in
 static forceinline void riscv_emulate_f_fmsub(rvvm_hart_t* vm, const uint32_t insn)
 {
     const regid_t rds = bit_cut(insn, 7, 5);
+    const uint8_t rm  = bit_cut(insn, 12, 3);
     const regid_t rs1 = bit_cut(insn, 15, 5);
     const regid_t rs2 = bit_cut(insn, 20, 5);
     const uint32_t funct2 = bit_cut(insn, 25, 2);
     const regid_t rs3 = insn >> 27;
-    if (likely(fpu_is_enabled(vm))) switch (funct2) {
+
+    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+        riscv_illegal_insn(vm, insn);
+        return;
+    }
+
+    switch (funct2) {
         case 0x0: // fmsub.s
             fpu_write_s(vm, rds, fpu_fmaf(fpu_read_s(vm, rs1), fpu_read_s(vm, rs2), -fpu_read_s(vm, rs3)));
             return;
@@ -386,11 +411,18 @@ static forceinline void riscv_emulate_f_fmsub(rvvm_hart_t* vm, const uint32_t in
 static forceinline void riscv_emulate_f_fnmsub(rvvm_hart_t* vm, const uint32_t insn)
 {
     const regid_t rds = bit_cut(insn, 7, 5);
+    const uint8_t rm  = bit_cut(insn, 12, 3);
     const regid_t rs1 = bit_cut(insn, 15, 5);
     const regid_t rs2 = bit_cut(insn, 20, 5);
     const uint32_t funct2 = bit_cut(insn, 25, 2);
     const regid_t rs3 = insn >> 27;
-    if (likely(fpu_is_enabled(vm))) switch (funct2) {
+
+    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+        riscv_illegal_insn(vm, insn);
+        return;
+    }
+
+    switch (funct2) {
         case 0x0: // fnmsub.s
             fpu_write_s(vm, rds, -fpu_fmaf(fpu_read_s(vm, rs1), fpu_read_s(vm, rs2), -fpu_read_s(vm, rs3)));
             return;
@@ -404,11 +436,18 @@ static forceinline void riscv_emulate_f_fnmsub(rvvm_hart_t* vm, const uint32_t i
 static forceinline void riscv_emulate_f_fnmadd(rvvm_hart_t* vm, const uint32_t insn)
 {
     const regid_t rds = bit_cut(insn, 7, 5);
+    const uint8_t rm  = bit_cut(insn, 12, 3);
     const regid_t rs1 = bit_cut(insn, 15, 5);
     const regid_t rs2 = bit_cut(insn, 20, 5);
     const uint32_t funct2 = bit_cut(insn, 25, 2);
     const regid_t rs3 = insn >> 27;
-    if (likely(fpu_is_enabled(vm))) switch (funct2) {
+
+    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+        riscv_illegal_insn(vm, insn);
+        return;
+    }
+
+    switch (funct2) {
         case 0x0: // fnmadd.s
             fpu_write_s(vm, rds, -fpu_fmaf(fpu_read_s(vm, rs1), fpu_read_s(vm, rs2), fpu_read_s(vm, rs3)));
             return;
@@ -426,7 +465,13 @@ static forceinline void riscv_emulate_f_opc_op(rvvm_hart_t* vm, const uint32_t i
     const regid_t rs1 = bit_cut(insn, 15, 5);
     const regid_t rs2 = bit_cut(insn, 20, 5);
     const uint32_t funct7 = insn >> 25;
-    if (likely(fpu_is_enabled(vm))) switch (funct7) {
+
+    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+        riscv_illegal_insn(vm, insn);
+        return;
+    }
+
+    switch (funct7) {
         case RISCV_FADD_S:
             fpu_write_s(vm, rds, fpu_read_s(vm, rs1) + fpu_read_s(vm, rs2));
             return;
