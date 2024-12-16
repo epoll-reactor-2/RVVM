@@ -62,7 +62,7 @@ void* vma_remap(void* addr, size_t old_size, size_t new_size, uint32_t flags);
 bool  vma_protect(void* addr, size_t size, uint32_t flags);
 
 // Synchronise writes to shared file mapping
-bool  vma_sync(void* addr, size_t size, bool lazy);
+bool  vma_sync(void* addr, size_t size);
 
 // Hint to free (zero-fill) underlying memory, VMA is still intact
 bool  vma_clean(void* addr, size_t size, bool lazy);

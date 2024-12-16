@@ -479,33 +479,30 @@ bool vma_protect(void* addr, size_t size, uint32_t flags)
     size_t ptr_diff = ((size_t)addr) & (vma_page_size() - 1);
     addr = align_ptr_down(addr, vma_page_size());
     size = align_size_up(size + ptr_diff, vma_page_size());
-
+    if (!addr || !size) return false;
 #if defined(VMA_WIN32_IMPL)
-    DWORD old;
+    DWORD old = 0;
     return VirtualProtect(addr, size, vma_native_prot(flags), &old);
 #elif defined(VMA_MMAP_IMPL)
     return mprotect(addr, size, vma_native_prot(flags)) == 0;
 #else
-    UNUSED(addr);
-    UNUSED(size);
     return flags == VMA_RDWR;
 #endif
 }
 
-bool vma_sync(void* addr, size_t size, bool lazy)
+bool vma_sync(void* addr, size_t size)
 {
-    if (!lazy) {
-        size_t ptr_diff = ((size_t)addr) & (vma_page_size() - 1);
-        addr = align_ptr_down(addr, vma_page_size());
-        size = align_size_up(size + ptr_diff, vma_page_size());
-
+    size_t ptr_diff = ((size_t)addr) & (vma_page_size() - 1);
+    addr = align_ptr_down(addr, vma_page_size());
+    size = align_size_up(size + ptr_diff, vma_page_size());
+    if (!addr || !size) return false;
 #if defined(VMA_WIN32_IMPL)
-        return FlushViewOfFile(addr, size);
-#elif defined(VMA_MMAP_IMPL) && defined(MS_ASYNC) && defined(MS_SYNC)
-        return msync(addr, size, lazy ? MS_ASYNC : MS_SYNC) == 0;
-#endif
-    }
+    return FlushViewOfFile(addr, size);
+#elif defined(VMA_MMAP_IMPL) && defined(MS_SYNC)
+    return msync(addr, size, MS_SYNC) == 0;
+#else
     return true;
+#endif
 }
 
 bool vma_clean(void* addr, size_t size, bool lazy)
@@ -513,7 +510,7 @@ bool vma_clean(void* addr, size_t size, bool lazy)
     size_t ptr_diff = ((size_t)addr) & (vma_page_size() - 1);
     addr = align_ptr_down(addr, vma_page_size());
     size = align_size_up(size + ptr_diff, vma_page_size());
-
+    if (!addr || !size) return false;
 #if defined(VMA_WIN32_IMPL)
     if (lazy) {
         return VirtualAlloc(addr, size, MEM_RESET, PAGE_NOACCESS);
@@ -538,7 +535,7 @@ bool vma_clean(void* addr, size_t size, bool lazy)
 #endif
 #endif
 
-    return addr && size && lazy;
+    return lazy;
 }
 
 bool vma_pageout(void* addr, size_t size, bool lazy)
@@ -546,7 +543,7 @@ bool vma_pageout(void* addr, size_t size, bool lazy)
     size_t ptr_diff = ((size_t)addr) & (vma_page_size() - 1);
     addr = align_ptr_down(addr, vma_page_size());
     size = align_size_up(size + ptr_diff, vma_page_size());
-
+    if (!addr || !size) return false;
     if (!lazy) {
 #if defined(VMA_WIN32_IMPL) && !defined(UNDER_CE)
         return VirtualUnlock(addr, size) || GetLastError() == ERROR_NOT_LOCKED;
@@ -570,7 +567,6 @@ bool vma_free(void* addr, size_t size)
     addr = align_ptr_down(addr, vma_granularity());
     size = align_size_up(size + ptr_diff, vma_page_size());
     if (!addr || !size) return false;
-
 #if defined(VMA_WIN32_IMPL)
     MEMORY_BASIC_INFORMATION mbi = {0};
     if (!VirtualQuery(addr, &mbi, sizeof(mbi))) {
