@@ -25,7 +25,7 @@ void riscv_run_till_event(rvvm_hart_t* vm)
 
 slow_path void riscv_illegal_insn(rvvm_hart_t* vm, const uint32_t insn)
 {
-    riscv_trap(vm, TRAP_ILL_INSTR, insn);
+    riscv_trap(vm, RISCV_TRAP_ILL_INSN, insn);
 }
 
 void riscv_jit_flush_cache(rvvm_hart_t* vm)
@@ -56,9 +56,9 @@ void riscv_jit_mark_dirty_mem(rvvm_machine_t* machine, rvvm_addr_t addr, size_t 
  * interpret-trace-compile and trace-execute states
  */
 
-static inline void riscv_jit_tlb_put(rvvm_hart_t* vm, virt_addr_t vaddr, rvjit_func_t block)
+static inline void riscv_jit_tlb_put(rvvm_hart_t* vm, rvvm_addr_t vaddr, rvjit_func_t block)
 {
-    virt_addr_t entry = (vaddr >> 1) & TLB_MASK;
+    rvvm_addr_t entry = (vaddr >> 1) & RVVM_TLB_MASK;
     vm->jtlb[entry].pc = vaddr;
     vm->jtlb[entry].block = block;
 }
@@ -66,8 +66,8 @@ static inline void riscv_jit_tlb_put(rvvm_hart_t* vm, virt_addr_t vaddr, rvjit_f
 static bool riscv_jit_lookup(rvvm_hart_t* vm)
 {
     // Translate virtual PC into physical, JIT operates on phys_pc
-    virt_addr_t virt_pc = vm->registers[REGISTER_PC];
-    phys_addr_t phys_pc = 0;
+    rvvm_addr_t virt_pc = vm->registers[RISCV_REG_PC];
+    rvvm_addr_t phys_pc = 0;
     // Lookup in the hashmap, cache virt_pc->block in JTLB
     if (riscv_virt_translate_e(vm, virt_pc, &phys_pc)) {
         rvjit_func_t block = rvjit_block_lookup(&vm->jit, phys_pc);
@@ -88,19 +88,17 @@ static bool riscv_jit_lookup(rvvm_hart_t* vm)
         riscv_jit_tlb_flush(vm);
 
         vm->jit_compiling = true;
-        vm->block_ends = false;
+        vm->jit_block_ends = false;
     }
     return false;
 }
 
-#ifndef RVJIT_NATIVE_LINKER
-
-static inline bool riscv_jtlb_lookup(rvvm_hart_t* vm)
+static forceinline bool riscv_jtlb_lookup(rvvm_hart_t* vm)
 {
     // Try to find & execute a block
-    virt_addr_t pc = vm->registers[REGISTER_PC];
-    virt_addr_t entry = (pc >> 1) & (TLB_SIZE - 1);
-    virt_addr_t tpc = vm->jtlb[entry].pc;
+    rvvm_addr_t pc = vm->registers[RISCV_REG_PC];
+    rvvm_addr_t entry = (pc >> 1) & RVVM_TLB_MASK;
+    rvvm_addr_t tpc = vm->jtlb[entry].pc;
     if (likely(pc == tpc)) {
         vm->jtlb[entry].block(vm);
         return true;
@@ -109,25 +107,20 @@ static inline bool riscv_jtlb_lookup(rvvm_hart_t* vm)
     }
 }
 
-#endif
-
 slow_path bool riscv_jit_tlb_lookup(rvvm_hart_t* vm)
 {
-    if (unlikely(!vm->jit_enabled)) return false;
-
-    virt_addr_t pc = vm->registers[REGISTER_PC];
-    virt_addr_t entry = (pc >> 1) & (TLB_SIZE - 1);
-    virt_addr_t tpc = vm->jtlb[entry].pc;
-    if (likely(pc == tpc)) {
-        vm->jtlb[entry].block(vm);
+    if (likely(vm->jit_enabled)) {
+        if (likely(riscv_jtlb_lookup(vm))) {
 #ifndef RVJIT_NATIVE_LINKER
-        // Try to execute more blocks if they aren't linked
-        for (size_t i=0; i<10 && riscv_jtlb_lookup(vm); ++i);
+            // Try to execute more blocks if they aren't linked
+            for (size_t i=0; i<10 && riscv_jtlb_lookup(vm); ++i);
 #endif
-        return true;
-    } else {
-        return riscv_jit_lookup(vm);
+            return true;
+        } else {
+            return riscv_jit_lookup(vm);
+        }
     }
+    return false;
 }
 
 slow_path void riscv_jit_finalize(rvvm_hart_t* vm)

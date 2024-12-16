@@ -31,7 +31,7 @@ void riscv64_run_interpreter(rvvm_hart_t* vm);
 void riscv_jit_flush_cache(rvvm_hart_t* vm);
 
 // Discard the currently JITed block
-static inline void riscv_jit_discard(rvvm_hart_t* vm)
+static forceinline void riscv_jit_discard(rvvm_hart_t* vm)
 {
 #ifdef USE_JIT
     vm->jit_compiling = false;
@@ -41,10 +41,10 @@ static inline void riscv_jit_discard(rvvm_hart_t* vm)
 }
 
 // Finish the currently JITed block
-static inline void riscv_jit_compile(rvvm_hart_t* vm)
+static forceinline void riscv_jit_compile(rvvm_hart_t* vm)
 {
 #ifdef USE_JIT
-    vm->block_ends = true;
+    vm->jit_block_ends = true;
 #else
     UNUSED(vm);
 #endif
@@ -54,7 +54,7 @@ static inline void riscv_jit_compile(rvvm_hart_t* vm)
 #ifdef USE_JIT
 void riscv_jit_mark_dirty_mem(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size);
 #else
-static inline void riscv_jit_mark_dirty_mem(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size) {
+static forceinline void riscv_jit_mark_dirty_mem(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size) {
     UNUSED(machine);
     UNUSED(addr);
     UNUSED(size);
