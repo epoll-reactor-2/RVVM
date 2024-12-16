@@ -25,13 +25,13 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RVVM_RVJIT_TRACE(intrinsic, insn_size) \
 do { \
     if (!vm->jit_compiling && riscv_jit_tlb_lookup(vm)) { \
-        vm->registers[REGISTER_PC] -= insn_size; \
+        vm->registers[RISCV_REG_PC] -= insn_size; \
         return; \
     } \
     if (unlikely(vm->jit_compiling)) { \
         intrinsic; \
         vm->jit.pc_off += insn_size; \
-        vm->block_ends = false; \
+        vm->jit_block_ends = false; \
     } \
 } while (0)
 
@@ -45,17 +45,17 @@ do { \
  */
 #define RVVM_RVJIT_TRACE_LDST(intrinsic, insn_size) \
 do { \
-    virt_addr_t pc = vm->registers[REGISTER_PC]; \
-    if (!vm->jit_compiling && vm->ldst_trace && riscv_jit_tlb_lookup(vm)) { \
-        vm->ldst_trace = pc != vm->registers[REGISTER_PC]; \
-        vm->registers[REGISTER_PC] -= insn_size; \
+    rvvm_addr_t pc = vm->registers[RISCV_REG_PC]; \
+    if (!vm->jit_compiling && !vm->jit_skip_exec && riscv_jit_tlb_lookup(vm)) { \
+        vm->jit_skip_exec = pc == vm->registers[RISCV_REG_PC]; \
+        vm->registers[RISCV_REG_PC] -= insn_size; \
         return; \
     } \
-    vm->ldst_trace = true; \
+    vm->jit_skip_exec = false; \
     if (unlikely(vm->jit_compiling)) { \
         intrinsic; \
         vm->jit.pc_off += insn_size; \
-        vm->block_ends = false; \
+        vm->jit_block_ends = false; \
     } \
 } while (0)
 
@@ -64,13 +64,13 @@ do { \
 #define RVVM_RVJIT_TRACE_JAL(intrinsic, offset, insn_size) \
 do { \
     if (!vm->jit_compiling && riscv_jit_tlb_lookup(vm)) { \
-        vm->registers[REGISTER_PC] -= insn_size; \
+        vm->registers[RISCV_REG_PC] -= insn_size; \
         return; \
     } \
     if (unlikely(vm->jit_compiling)) { \
         intrinsic; \
         vm->jit.pc_off += offset; \
-        vm->block_ends = vm->jit.size > UNROLL_MAX_BLOCK_SIZE; \
+        vm->jit_block_ends = vm->jit.size > UNROLL_MAX_BLOCK_SIZE; \
     } \
 } while (0)
 
@@ -86,14 +86,14 @@ do { \
 #define RVVM_RVJIT_TRACE_BRANCH(intrinsic, target_off, falthrough_off, insn_size) \
 do { \
     if (!vm->jit_compiling && riscv_jit_tlb_lookup(vm)) { \
-        vm->registers[REGISTER_PC] -= insn_size; \
+        vm->registers[RISCV_REG_PC] -= insn_size; \
         return; \
     } \
     if (unlikely(vm->jit_compiling)) { \
         vm->jit.pc_off += falthrough_off; \
         intrinsic; \
         vm->jit.pc_off += (target_off - falthrough_off); \
-        vm->block_ends = vm->jit.size > UNROLL_MAX_BLOCK_SIZE; \
+        vm->jit_block_ends = vm->jit.size > UNROLL_MAX_BLOCK_SIZE; \
     } \
 } while (0)
 
