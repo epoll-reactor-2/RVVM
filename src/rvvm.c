@@ -29,6 +29,7 @@ static cond_var_t* eventloop_cond = NULL;
 static thread_ctx_t* eventloop_thread = NULL;
 
 #ifdef USE_FDT
+
 static void rvvm_init_fdt(rvvm_machine_t* machine)
 {
     machine->fdt = fdt_node_create(NULL);
@@ -43,9 +44,9 @@ static void rvvm_init_fdt(rvvm_machine_t* machine)
     fdt_node_add_prop(chosen, "rng-seed", rng_buffer, sizeof(rng_buffer));
     fdt_node_add_child(machine->fdt, chosen);
 
-    struct fdt_node* memory = fdt_node_create_reg("memory", machine->mem.begin);
+    struct fdt_node* memory = fdt_node_create_reg("memory", machine->mem.addr);
     fdt_node_add_prop_str(memory, "device_type", "memory");
-    fdt_node_add_prop_reg(memory, "reg", machine->mem.begin, machine->mem.size);
+    fdt_node_add_prop_reg(memory, "reg", machine->mem.addr, machine->mem.size);
     fdt_node_add_child(machine->fdt, memory);
 
     struct fdt_node* cpus = fdt_node_create("cpus");
@@ -131,6 +132,7 @@ static void rvvm_prepare_fdt(rvvm_machine_t* machine)
         }
     }
 }
+
 #endif
 
 #define RVVM_POWER_OFF   0
@@ -152,9 +154,9 @@ static rvvm_addr_t rvvm_pass_dtb(rvvm_machine_t* machine)
         uint32_t dtb_size = rvfilesize(machine->dtb_file);
         size_t dtb_off = rvvm_dtb_addr(machine, dtb_size);
         if (dtb_size < machine->mem.size) {
-            rvread(machine->dtb_file, machine->mem.data + dtb_off, machine->mem.size - dtb_off, 0);
-            rvvm_info("Loaded DTB at 0x%08"PRIxXLEN", size %u", (phys_addr_t)(machine->mem.begin + dtb_off), dtb_size);
-            return machine->mem.begin + dtb_off;
+            rvread(machine->dtb_file, ((uint8_t*)machine->mem.data) + dtb_off, machine->mem.size - dtb_off, 0);
+            rvvm_info("Loaded DTB at 0x%08"PRIx64", size %u", machine->mem.addr + dtb_off, dtb_size);
+            return machine->mem.addr + dtb_off;
         }
     } else {
         // Generate DTB
@@ -162,9 +164,9 @@ static rvvm_addr_t rvvm_pass_dtb(rvvm_machine_t* machine)
         rvvm_prepare_fdt(machine);
         uint32_t dtb_size = fdt_size(machine->fdt);
         size_t dtb_off = rvvm_dtb_addr(machine, dtb_size);
-        if (fdt_serialize(machine->fdt, machine->mem.data + dtb_off, machine->mem.size - dtb_off, 0)) {
-            rvvm_info("Generated DTB at 0x%08"PRIxXLEN", size %u", (phys_addr_t)(machine->mem.begin + dtb_off), dtb_size);
-            return machine->mem.begin + dtb_off;
+        if (fdt_serialize(machine->fdt, ((uint8_t*)machine->mem.data) + dtb_off, machine->mem.size - dtb_off, 0)) {
+            rvvm_info("Generated DTB at 0x%08"PRIx64", size %u", machine->mem.addr + dtb_off, dtb_size);
+            return machine->mem.addr + dtb_off;
         }
 #else
         rvvm_error("This build doesn't support FDT generation");
@@ -193,7 +195,7 @@ static void rvvm_reset_machine_state(rvvm_machine_t* machine)
     if (machine->kernel_file) {
         size_t kernel_offset = machine->rv64 ? 0x200000 : 0x400000;
         size_t kernel_size = machine->mem.size > kernel_offset ? machine->mem.size - kernel_offset : 0;
-        bin_objcopy(machine->kernel_file, machine->mem.data + kernel_offset, kernel_size, elf);
+        bin_objcopy(machine->kernel_file, ((uint8_t*)machine->mem.data) + kernel_offset, kernel_size, elf);
     }
     rvvm_addr_t dtb_addr = rvvm_pass_dtb(machine);
     // Reset CPUs
@@ -202,19 +204,19 @@ static void rvvm_reset_machine_state(rvvm_machine_t* machine)
         rvvm_hart_t* vm = vector_at(machine->harts, i);
         // a0 register & mhartid csr contain hart ID
         vm->csr.hartid = i;
-        vm->registers[REGISTER_X10] = i;
+        vm->registers[RISCV_REG_X10] = i;
         // a1 register contains FDT address
-        vm->registers[REGISTER_X11] = dtb_addr;
+        vm->registers[RISCV_REG_X11] = dtb_addr;
         // Jump to RESET_PC
-        vm->registers[REGISTER_PC] = rvvm_get_opt(machine, RVVM_OPT_RESET_PC);
-        riscv_switch_priv(vm, PRIVILEGE_MACHINE);
+        vm->registers[RISCV_REG_PC] = rvvm_get_opt(machine, RVVM_OPT_RESET_PC);
+        riscv_switch_priv(vm, RISCV_PRIV_MACHINE);
         riscv_jit_flush_cache(vm);
     }
 }
 
 static void* rvvm_eventloop(void* manual)
 {
-    if (!manual && rvvm_getarg_int("noisolation") < 1) {
+    if (!manual && !rvvm_has_arg("noisolation")) {
         rvvm_restrict_this_thread();
     }
     /*
@@ -397,27 +399,27 @@ PUBLIC rvvm_machine_t* rvvm_create_machine(size_t mem_size, size_t hart_count, c
 
 PUBLIC bool rvvm_write_ram(rvvm_machine_t* machine, rvvm_addr_t dest, const void* src, size_t size)
 {
-    if (dest < machine->mem.begin
-    || (dest - machine->mem.begin + size) > machine->mem.size) return false;
-    memcpy(machine->mem.data + (dest - machine->mem.begin), src, size);
+    if (dest < machine->mem.addr
+    || (dest - machine->mem.addr + size) > machine->mem.size) return false;
+    memcpy(((uint8_t*)machine->mem.data) + (dest - machine->mem.addr), src, size);
     riscv_jit_mark_dirty_mem(machine, dest, size);
     return true;
 }
 
 PUBLIC bool rvvm_read_ram(rvvm_machine_t* machine, void* dest, rvvm_addr_t src, size_t size)
 {
-    if (src < machine->mem.begin
-    || (src - machine->mem.begin + size) > machine->mem.size) return false;
-    memcpy(dest, machine->mem.data + (src - machine->mem.begin), size);
+    if (src < machine->mem.addr
+    || (src - machine->mem.addr + size) > machine->mem.size) return false;
+    memcpy(dest, ((uint8_t*)machine->mem.data) + (src - machine->mem.addr), size);
     return true;
 }
 
 PUBLIC void* rvvm_get_dma_ptr(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
 {
-    if (addr < machine->mem.begin
-    || (addr - machine->mem.begin + size) > machine->mem.size) return NULL;
+    if (addr < machine->mem.addr
+    || (addr - machine->mem.addr + size) > machine->mem.size) return NULL;
     riscv_jit_mark_dirty_mem(machine, addr, size);
-    return machine->mem.data + (addr - machine->mem.begin);
+    return ((uint8_t*)machine->mem.data) + (addr - machine->mem.addr);
 }
 
 PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
@@ -522,7 +524,7 @@ PUBLIC rvvm_addr_t rvvm_get_opt(rvvm_machine_t* machine, uint32_t opt)
         return atomic_load_uint64_ex(&machine->opts[opt], ATOMIC_RELAXED);
     }
     switch (opt) {
-        case RVVM_OPT_MEM_BASE: return machine->mem.begin;
+        case RVVM_OPT_MEM_BASE: return machine->mem.addr;
         case RVVM_OPT_MEM_SIZE: return machine->mem.size;
         case RVVM_OPT_HART_COUNT: return vector_size(machine->harts);
     }
@@ -537,7 +539,7 @@ PUBLIC bool rvvm_set_opt(rvvm_machine_t* machine, uint32_t opt, rvvm_addr_t val)
     }
     switch (opt) {
         case RVVM_OPT_MEM_BASE:
-            machine->mem.begin = val;
+            machine->mem.addr = val;
             return true;
     }
     return false;
@@ -723,8 +725,8 @@ PUBLIC rvvm_addr_t rvvm_mmio_zone_auto(rvvm_machine_t* machine, rvvm_addr_t addr
         bool free_zone = false;
         while (!free_zone) {
             free_zone = true;
-            if (rvvm_mmio_overlap_check(addr, size, machine->mem.begin, machine->mem.size)) {
-                addr = (machine->mem.begin + machine->mem.size + 0xFFF) & ~0xFFFULL;
+            if (rvvm_mmio_overlap_check(addr, size, machine->mem.addr, machine->mem.size)) {
+                addr = (machine->mem.addr + machine->mem.size + 0xFFF) & ~0xFFFULL;
                 free_zone = false;
                 continue;
             }
@@ -851,8 +853,8 @@ PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 
     // Bypass entire process memory except the NULL page
     // RVVM expects mem.data to be non-NULL, let's leave that for now
-    machine->mem.begin = 0x1000;
-    machine->mem.size = (phys_addr_t)-0x1000ULL;
+    machine->mem.addr = 0x1000;
+    machine->mem.size = (size_t)-0x1000ULL;
     machine->mem.data = (void*)0x1000;
     machine->rv64 = rv64;
 
@@ -872,25 +874,25 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
     rvvm_hart_t* thread = riscv_hart_init(machine);
     riscv_hart_prepare(thread);
     // Allow time CSR access from U-mode
-    thread->csr.counteren[PRIVILEGE_MACHINE] = CSR_COUNTEREN_MASK;
-    thread->csr.counteren[PRIVILEGE_SUPERVISOR] = CSR_COUNTEREN_MASK;
+    thread->csr.counteren[RISCV_PRIV_MACHINE] = CSR_COUNTEREN_MASK;
+    thread->csr.counteren[RISCV_PRIV_SUPERVISOR] = CSR_COUNTEREN_MASK;
 
     // Allow Zkr seed CSR access from U-mode
     thread->csr.mseccfg = CSR_MSECCFG_MASK;
 
     // Allow Zicboz/Zicbom access from U-mode
-    thread->csr.envcfg[PRIVILEGE_MACHINE] = CSR_MENVCFG_MASK;
-    thread->csr.envcfg[PRIVILEGE_SUPERVISOR] = CSR_SENVCFG_MASK;
+    thread->csr.envcfg[RISCV_PRIV_MACHINE] = CSR_MENVCFG_MASK;
+    thread->csr.envcfg[RISCV_PRIV_SUPERVISOR] = CSR_SENVCFG_MASK;
 #ifdef USE_FPU
     // Initialize FPU by writing to status CSR
-    maxlen_t mstatus = (FS_INITIAL << 13);
+    rvvm_uxlen_t mstatus = (FS_INITIAL << 13);
     riscv_csr_op(thread, CSR_MSTATUS, &mstatus, CSR_SETBITS);
 #endif
 #ifdef USE_JIT
     // Enable pointer optimization
     rvjit_set_native_ptrs(&thread->jit, true);
 #endif
-    riscv_switch_priv(thread, PRIVILEGE_USER);
+    riscv_switch_priv(thread, RISCV_PRIV_USER);
     spin_lock(&global_lock);
     if (!vector_size(machine->harts)) {
         // This is the main thread, initialize the timer
@@ -931,11 +933,11 @@ PUBLIC rvvm_addr_t rvvm_read_cpu_reg(rvvm_hart_t* thread, size_t reg_id)
         return ret;
 #endif
     } else if (reg_id == RVVM_REGID_PC) {
-        return thread->registers[REGISTER_PC];
+        return thread->registers[RISCV_REG_PC];
     } else if (reg_id == RVVM_REGID_CAUSE) {
-        return thread->csr.cause[PRIVILEGE_USER];
+        return thread->csr.cause[RISCV_PRIV_USER];
     } else if (reg_id == RVVM_REGID_TVAL) {
-        return thread->csr.tval[PRIVILEGE_USER];
+        return thread->csr.tval[RISCV_PRIV_USER];
     } else {
         rvvm_warn("Unknown register %d in rvvm_read_cpu_reg()!", (uint32_t)reg_id);
         return 0;
@@ -951,11 +953,11 @@ PUBLIC void rvvm_write_cpu_reg(rvvm_hart_t* thread, size_t reg_id, rvvm_addr_t r
         memcpy(&thread->fpu_registers[reg_id - RVVM_REGID_F0], &reg, sizeof(reg));
 #endif
     } else if (reg_id == RVVM_REGID_PC) {
-        thread->registers[REGISTER_PC] = reg;
+        thread->registers[RISCV_REG_PC] = reg;
     } else if (reg_id == RVVM_REGID_CAUSE) {
-        thread->csr.cause[PRIVILEGE_USER] = reg;
+        thread->csr.cause[RISCV_PRIV_USER] = reg;
     } else if (reg_id == RVVM_REGID_TVAL) {
-        thread->csr.tval[PRIVILEGE_USER] = reg;
+        thread->csr.tval[RISCV_PRIV_USER] = reg;
     } else {
         rvvm_warn("Unknown register %d in rvvm_write_cpu_reg()!", (uint32_t)reg_id);
     }
