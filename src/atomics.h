@@ -200,7 +200,7 @@ static forceinline uint32_t atomic_load_uint32_ex(const void* addr, int memorder
 #elif defined(GNU_ATOMICS_IMPL)
     return __atomic_load_4((const uint32_t*)addr, memorder);
 #elif defined(_WIN32)
-    return InterlockedOr((LONG*)addr, 0);
+    return InterlockedExchangeAdd((LONG*)addr, 0);
 #elif defined(SYNC_ATOMICS_IMPL)
     return __sync_fetch_and_add((uint32_t*)addr, 0);
 #else
@@ -442,7 +442,7 @@ static forceinline uint64_t atomic_load_uint64_ex(const void* addr, int memorder
 #elif defined(GNU_ATOMICS_IMPL)
     return __atomic_load_8((const uint64_t*)addr, memorder);
 #elif defined(_WIN32)
-    return InterlockedOr64((LONG64*)addr, 0);
+    return InterlockedExchangeAdd64((LONG64*)addr, 0);
 #elif defined(SYNC_ATOMICS_IMPL)
     return __sync_fetch_and_add((uint64_t*)addr, 0);
 #else
