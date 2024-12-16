@@ -560,12 +560,6 @@ ifneq (,$(strip $(SRC_CXX)))
 override CC_LD := $(CXX)
 endif
 
-# Sign binaries on MacOS host
-ifneq (,$(if $(findstring darwin,$(OS)),$(shell which codesign $(NULL_STDERR))))
-override ENTITLEMENTS := $(SRCDIR)/bindings/macos_codesign/rvvm_debug.entitlements
-override CODESIGN = codesign -s - --force --options=runtime --entitlements $(ENTITLEMENTS) $@
-endif
-
 #
 # Print build information
 #
@@ -594,13 +588,11 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.cpp Makefile
 $(BINARY): $(OBJS)
 	$(info $(WHITE)[$(GREEN)LD$(WHITE)] $@ $(RESET))
 	@$(CC_LD) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
-	@$(CODESIGN)
 
 # Shared library
 $(SHARED): $(LIB_OBJS)
 	$(info $(WHITE)[$(GREEN)LD$(WHITE)] $@ $(RESET))
 	@$(CC_LD) $(CFLAGS) $(LIB_OBJS) $(LDFLAGS) -shared -o $@
-	@$(CODESIGN)
 
 # Static library
 $(STATIC): $(LIB_OBJS)
@@ -617,11 +609,12 @@ lib: $(if $(findstring 1,$(USE_LIB)),$(SHARED)) $(if $(findstring 1,$(USE_LIB_ST
 test: all
 	$(if $(wildcard $(BUILDDIR)/riscv-tests.tar.gz),,@cd "$(BUILDDIR)"; curl -LO "https://github.com/LekKit/riscv-tests/releases/download/rvvm-tests/riscv-tests.tar.gz")
 	@tar xf "$(BUILDDIR)/riscv-tests.tar.gz" -C $(BUILDDIR)
+ifeq ($(USE_RV32),1)
 	@echo
-	@echo "$(INFO_PREFIX) Running RISC-V Tests (RV32)$(RESET)"
+	@echo "$(INFO_PREFIX) Running RISC-V Tests (riscv32)$(RESET)"
 	@echo
 	@for file in "$(BUILDDIR)/riscv-tests/rv32"*; do \
-		result=$$($(BINARY) $$file -nogui -rv32 | tr -d '\0'); \
+		result=$$($(BINARY) $$file -nonet -nogui -rv32 | tr -d '\0'); \
 		result="$${result##* }"; \
 		if [ "$$result" -eq "0" ]; then \
 		echo "$(WHITE)[$(GREEN)PASS$(WHITE)] $$file$(RESET)"; \
@@ -630,12 +623,13 @@ test: all
 		exit -1; \
 		fi; \
 	done
+endif
 ifeq ($(USE_RV64),1)
 	@echo
-	@echo "$(INFO_PREFIX) Running RISC-V Tests (RV64)$(RESET)"
+	@echo "$(INFO_PREFIX) Running RISC-V Tests (riscv64)$(RESET)"
 	@echo
 	@for file in "$(BUILDDIR)/riscv-tests/rv64"*; do \
-		result=$$($(BINARY) $$file -nogui -rv64 | tr -d '\0'); \
+		result=$$($(BINARY) $$file -nonet -nogui -rv64 | tr -d '\0'); \
 		result="$${result##* }"; \
 		if [ "$$result" -eq "0" ]; then \
 		echo "$(WHITE)[$(GREEN)PASS$(WHITE)] $$file$(RESET)"; \
