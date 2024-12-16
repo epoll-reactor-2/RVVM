@@ -384,13 +384,16 @@ static rgb_fmt_t sdl_get_rgb_format(const SDL_PixelFormat* format)
     return RGB_FMT_INVALID;
 }
 
+static bool sdl_used = false;
+static bool sdl_grabbed = false;
+
 #if USE_SDL == 2
 static SDL_Window* sdl_window = NULL;
 static SDL_Renderer* sdl_renderer = NULL;
 static SDL_Texture* sdl_texture = NULL;
 #endif
+
 static SDL_Surface* sdl_surface = NULL;
-static bool sdl_grabbed = false;
 
 static void sdl_window_draw(gui_window_t* win)
 {
@@ -522,6 +525,7 @@ static void sdl_window_remove(gui_window_t* win)
 #endif
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
     sdl_surface = NULL;
+    sdl_used = false;
 }
 
 #define SDL_DLIB_RESOLVE(lib, sym) \
@@ -579,19 +583,21 @@ bool sdl_window_init(gui_window_t* win)
         return false;
     }
 
-#ifndef _WIN32
+#ifdef __unix__
     DO_ONCE(setenv("SDL_DEBUG", "1", false));
 #endif
 
-    if (sdl_surface) {
+    if (sdl_used) {
         // SDL_PollEvent is very inconvenient to use, SDL1 doesn't support multiwindow at all
         rvvm_error("SDL doesn't support multiple windows");
         return false;
     }
+
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         rvvm_error("Failed to initialize SDL");
         return false;
     }
+
 #if USE_SDL == 2
     if (rvvm_strcmp(SDL_GetCurrentVideoDriver(), "x11")) {
         // Prevent messing with the compositor
@@ -606,13 +612,17 @@ bool sdl_window_init(gui_window_t* win)
         rvvm_error("SDL_CreateWindow() failed!");
         return false;
     }
+#ifndef __EMSCRIPTEN__
+    // Force SDL Renderer on Emscripten for proper ARGB framebuffer
     sdl_surface = SDL_GetWindowSurface(sdl_window);
+#endif
     if (sdl_surface == NULL) {
         rvvm_info("No SDL framebuffer surface, using SDL renderer. Expect higher CPU use.");
         sdl_renderer = SDL_CreateRenderer(sdl_window, -1, 0);
         sdl_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_ARGB8888,
                                         SDL_TEXTUREACCESS_STREAMING, win->fb.width, win->fb.height);
         win->fb.buffer = vma_alloc(NULL, framebuffer_size(&win->fb), VMA_RDWR);
+        win->fb.format = RGB_FMT_A8R8G8B8;
     }
 #else
     sdl_surface = SDL_SetVideoMode(win->fb.width, win->fb.height,
@@ -623,6 +633,7 @@ bool sdl_window_init(gui_window_t* win)
     }
     SDL_WM_SetCaption("RVVM", NULL);
 #endif
+
     SDL_ShowCursor(SDL_DISABLE);
     if (sdl_surface) {
         win->fb.format = sdl_get_rgb_format(sdl_surface->format);
@@ -643,6 +654,8 @@ bool sdl_window_init(gui_window_t* win)
     win->remove = sdl_window_remove;
     win->grab_input = sdl_window_grab_input;
     win->set_title = sdl_window_set_title;
+
+    sdl_used = true;
 
     return true;
 }
