@@ -74,10 +74,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RVJIT_CALL
 #endif
 
-typedef void (* RVJIT_CALL rvjit_func_t)(void* vm);
-typedef size_t   branch_t;
+typedef void (* RVJIT_CALL rvjit_func_t)(void*);
+
 typedef uint8_t  regflags_t;
 typedef uint32_t regmask_t;
+typedef size_t   branch_t;
+typedef size_t   rvjit_addr_t;
 
 #define BRANCH_NEW ((branch_t)-1)
 #define BRANCH_ENTRY  false
@@ -118,7 +120,7 @@ typedef struct {
     size_t space;
 
     // Block exit paths
-    vector_t(struct {phys_addr_t dest; size_t ptr;}) links;
+    vector_t(struct {rvjit_addr_t dest; size_t ptr;}) links;
 
     regmask_t hreg_mask;       // Bitmask of available non-clobbered host registers
     regmask_t abireclaim_mask; // Bitmask of reclaimed abi-clobbered host registers to restore
@@ -129,8 +131,8 @@ typedef struct {
     rvjit_reginfo_t fpu_regs[RVJIT_REGISTERS];
 #endif
 
-    virt_addr_t virt_pc;
-    phys_addr_t phys_pc;
+    rvjit_addr_t virt_pc;
+    rvjit_addr_t phys_pc;
     int32_t pc_off;
 
     bool rv64;
@@ -175,11 +177,11 @@ static inline bool rvjit_block_nonempty(rvjit_block_t* block)
 rvjit_func_t rvjit_block_finalize(rvjit_block_t* block);
 
 // Looks up for compiled block by phys_pc, returns NULL when no block was found
-rvjit_func_t rvjit_block_lookup(rvjit_block_t* block, phys_addr_t phys_pc);
+rvjit_func_t rvjit_block_lookup(rvjit_block_t* block, rvjit_addr_t phys_pc);
 
 // Track dirty memory to transparently invalidate JIT caches
 void rvjit_init_memtracking(rvjit_block_t* block, size_t size);
-void rvjit_mark_dirty_mem(rvjit_block_t* block, phys_addr_t addr, size_t size);
+void rvjit_mark_dirty_mem(rvjit_block_t* block, rvjit_addr_t addr, size_t size);
 
 // Cleans up internal heap & lookup cache entirely
 void rvjit_flush_cache(rvjit_block_t* block);

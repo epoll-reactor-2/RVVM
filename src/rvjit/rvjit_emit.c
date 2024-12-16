@@ -30,18 +30,13 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // RVVM-specific configuration
 
-#define VM_REG_OFFSET(reg) (offsetof(rvvm_hart_t, registers) + (sizeof(maxlen_t) * reg))
+#define VM_REG_OFFSET(reg) (offsetof(rvvm_hart_t, registers) + (sizeof(rvvm_uxlen_t) * reg))
 #define VM_TLB_OFFSET      offsetof(rvvm_hart_t, tlb)
-#define VM_TLB_MASK        (TLB_SIZE-1)
 #define VM_TLB_R           offsetof(rvvm_tlb_entry_t, r)
 #define VM_TLB_W           offsetof(rvvm_tlb_entry_t, w)
 #define VM_TLB_E           offsetof(rvvm_tlb_entry_t, e)
 
-#if defined(USE_RV64) || defined(RVJIT_NATIVE_64BIT)
 #define VM_TLB_SHIFT 5
-#else
-#define VM_TLB_SHIFT 4
-#endif
 
 void rvjit_emit_init(rvjit_block_t* block)
 {
@@ -190,20 +185,20 @@ static void rvjit_update_vm_pc(rvjit_block_t* block)
 {
     if (block->pc_off == 0) return;
 #ifdef RVJIT_X86
-    rvjit_x86_memref_addi(block, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]), block->pc_off, block->rv64);
+    rvjit_x86_memref_addi(block, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]), block->pc_off, block->rv64);
 #else
     regid_t pc = rvjit_claim_hreg(block);
 #ifdef RVJIT_NATIVE_64BIT
     if (block->rv64) {
-        rvjit64_native_ld(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+        rvjit64_native_ld(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
         rvjit64_native_addi(block, pc, pc, block->pc_off);
-        rvjit64_native_sd(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+        rvjit64_native_sd(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
     } else
 #endif
     {
-        rvjit32_native_lw(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+        rvjit32_native_lw(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
         rvjit32_native_addi(block, pc, pc, block->pc_off);
-        rvjit32_native_sw(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+        rvjit32_native_sw(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
     }
     rvjit_free_hreg(block, pc);
 #endif
@@ -305,22 +300,22 @@ static void rvjit_lookup_block(rvjit_block_t* block)
     code[2] |= VM_PTR_REG;
     code[19] |= (VM_PTR_REG << 3);
     code[30] |= VM_PTR_REG;
-    write_uint32_le_m(code + 3, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+    write_uint32_le_m(code + 3, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
     code[11] = VM_TLB_SHIFT - 2;
-    write_uint32_le_m(code + 13, VM_TLB_MASK << (VM_TLB_SHIFT - 1));
-    write_uint32_le_m(code + 23, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jtlb_entry_t, pc));
-    write_uint32_le_m(code + 36, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jtlb_entry_t, block));
+    write_uint32_le_m(code + 13, RVVM_TLB_MASK << (VM_TLB_SHIFT - 1));
+    write_uint32_le_m(code + 23, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jit_tlb_entry_t, pc));
+    write_uint32_le_m(code + 36, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jit_tlb_entry_t, block));
     rvjit_put_code(block, code, sizeof(code));
 #elif defined(RVJIT_X86) && defined(RVJIT_ABI_FASTCALL)
     uint8_t code[38] = {0x8B, 0x91, 0x04, 0x01, 0x00, 0x00, 0x89, 0xD0,
         0xC1, 0xE0, 0x03, 0x25, 0xF0, 0x0F, 0x00, 0x00, 0x01, 0xC8, 0x39,
         0x90, 0x1C, 0x22, 0x00, 0x00, 0x75, 0x0B, 0x83, 0x39, 0x00, 0x74,
         0x06, 0xFF, 0xA0, 0x14, 0x22, 0x00, 0x00, 0xC3};
-    write_uint32_le_m(code + 2, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+    write_uint32_le_m(code + 2, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
     code[10] = VM_TLB_SHIFT - 2;
-    write_uint32_le_m(code + 12, VM_TLB_MASK << (VM_TLB_SHIFT - 1));
-    write_uint32_le_m(code + 20, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jtlb_entry_t, pc));
-    write_uint32_le_m(code + 33, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jtlb_entry_t, block));
+    write_uint32_le_m(code + 12, RVVM_TLB_MASK << (VM_TLB_SHIFT - 1));
+    write_uint32_le_m(code + 20, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jit_tlb_entry_t, pc));
+    write_uint32_le_m(code + 33, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jit_tlb_entry_t, block));
     rvjit_put_code(block, code, sizeof(code));
 #else
     regid_t pc = rvjit_try_claim_hreg(block);
@@ -339,18 +334,18 @@ static void rvjit_lookup_block(rvjit_block_t* block)
     }
 
 #if defined(RVJIT_NATIVE_64BIT) && defined(USE_RV64)
-    rvjit64_native_ld(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+    rvjit64_native_ld(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
 #else
-    rvjit32_native_lw(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+    rvjit32_native_lw(block, pc, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
 #endif
 
 #if defined(RVJIT_X86) || defined(RVJIT_ARM64)
     // x86 & ARM64 can carry big mask immediate without spilling
     rvjit32_native_slli(block, tpc, pc, VM_TLB_SHIFT - 2);
-    rvjit32_native_andi(block, tpc, tpc, VM_TLB_MASK << (VM_TLB_SHIFT - 1));
+    rvjit32_native_andi(block, tpc, tpc, RVVM_TLB_MASK << (VM_TLB_SHIFT - 1));
 #else
     rvjit32_native_srli(block, tpc, pc, 1);
-    rvjit32_native_andi(block, tpc, tpc, VM_TLB_MASK);
+    rvjit32_native_andi(block, tpc, tpc, RVVM_TLB_MASK);
     rvjit32_native_slli(block, tpc, tpc, VM_TLB_SHIFT - 1);
 #endif
 
@@ -360,18 +355,18 @@ static void rvjit_lookup_block(rvjit_block_t* block)
     rvjit32_native_add(block, tpc, tpc, VM_PTR_REG);
 #endif
 #if defined(RVJIT_NATIVE_64BIT) && defined(USE_RV64)
-    rvjit64_native_ld(block, cpc, tpc, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jtlb_entry_t, pc));
+    rvjit64_native_ld(block, cpc, tpc, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jit_tlb_entry_t, pc));
     branch_t l1 = rvjit64_native_bne(block, cpc, pc, BRANCH_NEW, false);
 #else
-    rvjit32_native_lw(block, cpc, tpc, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jtlb_entry_t, pc));
+    rvjit32_native_lw(block, cpc, tpc, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jit_tlb_entry_t, pc));
     branch_t l1 = rvjit32_native_bne(block, cpc, pc, BRANCH_NEW, false);
 #endif
     rvjit32_native_lw(block, cpc, VM_PTR_REG, 0);
     branch_t l2 = rvjit32_native_beqz(block, cpc, BRANCH_NEW, false);
 #ifdef RVJIT_NATIVE_64BIT
-    rvjit64_native_ld(block, pc, tpc, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jtlb_entry_t, block));
+    rvjit64_native_ld(block, pc, tpc, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jit_tlb_entry_t, block));
 #else
-    rvjit32_native_lw(block, pc, tpc, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jtlb_entry_t, block));
+    rvjit32_native_lw(block, pc, tpc, offsetof(rvvm_hart_t, jtlb) + offsetof(rvvm_jit_tlb_entry_t, block));
 #endif
     rvjit_jmp_reg(block, pc);
 #if defined(RVJIT_NATIVE_64BIT) && defined(USE_RV64)
@@ -395,7 +390,7 @@ static void rvjit_lookup_block(rvjit_block_t* block)
 static void rvjit_link_block(rvjit_block_t* block)
 {
 #ifdef RVJIT_NATIVE_LINKER
-    phys_addr_t next_pc = block->phys_pc + block->pc_off;
+    rvjit_addr_t next_pc = block->phys_pc + block->pc_off;
     size_t exit_ptr = (size_t)(block->heap.data + block->heap.curr + block->size);
     size_t next_block;
     if (next_pc == block->phys_pc) {
@@ -689,7 +684,7 @@ void rvjit32_auipc(rvjit_block_t* block, regid_t rds, int32_t imm)
 {
     if (rds == RVJIT_REGISTER_ZERO) return;
     regid_t hrds = rvjit_map_reg(block, rds, REG_DST);
-    rvjit32_native_lw(block, hrds, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+    rvjit32_native_lw(block, hrds, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
     imm += block->pc_off;
     if (imm) {
         rvjit32_native_addi(block, hrds, hrds, imm);
@@ -706,7 +701,7 @@ void rvjit32_jalr(rvjit_block_t* block, regid_t rds, regid_t rs, int32_t imm, ui
     if (rds != RVJIT_REGISTER_ZERO) {
         int32_t new_imm = block->pc_off + isize;
         regid_t hrds = rvjit_map_reg(block, rds, REG_DST);
-        rvjit32_native_lw(block, hrds, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+        rvjit32_native_lw(block, hrds, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
         if (new_imm) {
             rvjit32_native_addi(block, hrds, hrds, new_imm);
         }
@@ -718,7 +713,7 @@ void rvjit32_jalr(rvjit_block_t* block, regid_t rds, regid_t rs, int32_t imm, ui
     } else {
         block->pc_off = 0;
         block->linkage = LINKAGE_TAIL;
-        rvjit32_native_sw(block, hjmp, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+        rvjit32_native_sw(block, hjmp, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
     }
 
     rvjit_free_hreg(block, hjmp);
@@ -739,7 +734,7 @@ void rvjit64_auipc(rvjit_block_t* block, regid_t rds, int32_t imm)
 {
     if (rds == RVJIT_REGISTER_ZERO) return;
     regid_t hrds = rvjit_map_reg(block, rds, REG_DST);
-    rvjit64_native_ld(block, hrds, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+    rvjit64_native_ld(block, hrds, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
     imm += block->pc_off;
     if (imm) {
         rvjit64_native_addi(block, hrds, hrds, imm);
@@ -756,7 +751,7 @@ void rvjit64_jalr(rvjit_block_t* block, regid_t rds, regid_t rs, int32_t imm, ui
     if (rds != RVJIT_REGISTER_ZERO) {
         int32_t new_imm = block->pc_off + isize;
         regid_t hrds = rvjit_map_reg(block, rds, REG_DST);
-        rvjit64_native_ld(block, hrds, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+        rvjit64_native_ld(block, hrds, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
         if (new_imm) {
             rvjit64_native_addi(block, hrds, hrds, new_imm);
         }
@@ -768,7 +763,7 @@ void rvjit64_jalr(rvjit_block_t* block, regid_t rds, regid_t rs, int32_t imm, ui
     } else {
         block->pc_off = 0;
         block->linkage = LINKAGE_TAIL;
-        rvjit64_native_sd(block, hjmp, VM_PTR_REG, offsetof(rvvm_hart_t, registers[REGISTER_PC]));
+        rvjit64_native_sd(block, hjmp, VM_PTR_REG, offsetof(rvvm_hart_t, registers[RISCV_REG_PC]));
     }
 
     rvjit_free_hreg(block, hjmp);
@@ -788,7 +783,7 @@ static void rvjit_tlb_lookup(rvjit_block_t* block, regid_t haddr, regid_t vaddr,
 
     rvjit64_native_addi(block, hvaddr, hrs, offset);
     rvjit64_native_srli(block, a3, hvaddr, 12);
-    rvjit64_native_andi(block, a2, a3, VM_TLB_MASK);
+    rvjit64_native_andi(block, a2, a3, RVVM_TLB_MASK);
     rvjit32_native_slli(block, a2, a2, VM_TLB_SHIFT);
     rvjit64_native_add(block, a2, a2, VM_PTR_REG);
     rvjit64_native_ld(block, haddr, a2, VM_TLB_OFFSET + moff);
@@ -823,7 +818,7 @@ static void rvjit_tlb_lookup(rvjit_block_t* block, regid_t haddr, regid_t vaddr,
 
     rvjit32_native_addi(block, hvaddr, hrs, offset);
     rvjit32_native_srli(block, a3, hvaddr, 12);
-    rvjit32_native_andi(block, a2, a3, VM_TLB_MASK);
+    rvjit32_native_andi(block, a2, a3, RVVM_TLB_MASK);
     rvjit32_native_slli(block, a2, a2, VM_TLB_SHIFT);
 #ifdef RVJIT_NATIVE_64BIT
     rvjit64_native_add(block, a2, a2, VM_PTR_REG);
