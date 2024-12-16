@@ -60,54 +60,51 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define unlikely(x)   (x)
 #endif
 
+// Memory prefetch hints
 #if GNU_BUILTIN(__builtin_prefetch) && !defined(NO_PREFETCH)
 #define mem_prefetch(addr, rw, loc) __builtin_prefetch(addr, !!(rw), loc)
 #else
 #define mem_prefetch(addr, rw, loc)
 #endif
 
-// Never inline this function
-#if GNU_ATTRIBUTE(__noinline__)
-#define NOINLINE      __attribute__((__noinline__))
-#elif defined(_MSC_VER)
-#define NOINLINE      __declspec(noinline)
+// Allow aliasing for type with this attribute
+#if GNU_ATTRIBUTE(__may_alias__)
+#define safe_aliasing __attribute__((__may_alias__))
 #else
-#define NOINLINE
+#define safe_aliasing
 #endif
 
-#if GNU_ATTRIBUTE(__destructor__)
-#define GNU_DESTRUCTOR __attribute__((__destructor__))
-#else
-#define GNU_DESTRUCTOR
-#endif
-
-#if GNU_ATTRIBUTE(__constructor__)
-#define GNU_CONSTRUCTOR __attribute__((__constructor__))
-#else
-#define GNU_CONSTRUCTOR
-#endif
-
-/*
- * This is used to remove unnecessary register spills from algorithm fast path
- * when a slow path call is present. Hopefully one day similar thing will appear in GCC.
- *
- * This attribute is BROKEN before Clang 17 and generates broken binaries if used <17!!!
- */
-#if CLANG_CHECK_VER(17, 0) && GNU_ATTRIBUTE(__preserve_most__) && (defined(__x86_64__) || defined(__aarch64__))
-#define slow_path __attribute__((__preserve_most__,__noinline__,__cold__))
-#elif GNU_ATTRIBUTE(__cold__)
-#define slow_path NOINLINE __attribute__((__cold__))
-#else
-#define slow_path NOINLINE
-#endif
-
-// Always inline this function into the caller
+// Force-inline function attribute
 #if GNU_ATTRIBUTE(__always_inline__)
 #define forceinline inline __attribute__((__always_inline__))
 #elif defined(_MSC_VER)
 #define forceinline __forceinline
 #else
 #define forceinline inline
+#endif
+
+// Never inline this function
+#if GNU_ATTRIBUTE(__noinline__)
+#define no_inline      __attribute__((__noinline__))
+#elif defined(_MSC_VER)
+#define no_inline      __declspec(noinline)
+#else
+#define no_inline
+#endif
+
+// Never inline a function, assume it's a slow path, and minimize pessimizations at the call size
+#if CLANG_CHECK_VER(17, 0) && GNU_ATTRIBUTE(__preserve_most__) && (defined(__x86_64__) || defined(__aarch64__))
+/*
+ * This is used to remove unnecessary register spills from algorithm fast path
+ * when a slow path call is present. Hopefully one day similar thing will appear in GCC.
+ *
+ * This attribute is BROKEN before Clang 17 and generates broken binaries if used <17!!!
+ */
+#define slow_path __attribute__((__preserve_most__,__noinline__,__cold__))
+#elif GNU_ATTRIBUTE(__cold__)
+#define slow_path no_inline __attribute__((__cold__))
+#else
+#define slow_path no_inline
 #endif
 
 // Inline all function calls into the caller marked with flatten_calls. Use with care!
@@ -129,6 +126,20 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define deallocate_with(deallocator) warn_unused_ret __attribute__((__malloc__,__malloc__(deallocator, 1)))
 #else
 #define deallocate_with(deallocator) warn_unused_ret
+#endif
+
+// Call this function upon exit / library unload (GNU compilers only)
+#if GNU_ATTRIBUTE(__destructor__)
+#define GNU_DESTRUCTOR __attribute__((__destructor__))
+#else
+#define GNU_DESTRUCTOR
+#endif
+
+// Call this function upon startup / library load (GNU compilers only)
+#if GNU_ATTRIBUTE(__constructor__)
+#define GNU_CONSTRUCTOR __attribute__((__constructor__))
+#else
+#define GNU_CONSTRUCTOR
 #endif
 
 // Match GCC macro __SANITIZE_THREAD__, __SANITIZE_ADDRESS__ on Clang, provide __SANITIZE_MEMORY__
