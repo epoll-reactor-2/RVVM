@@ -3,18 +3,9 @@ plic.c - Platform-Level Interrupt Controller
 Copyright (C) 2023  LekKit <github.com/LekKit>
               2021  cerg2010cerg2010 <github.com/cerg2010cerg2010>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "plic.h"
@@ -34,7 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // In QEMU, those are reversed for whatever reason, but on most actual
 // boards it's done this way. Should we ever do 1:1 QEMU compat, swap those...
-#define CTX_IRQ_PRIO(ctx) (((ctx) & 1) ? INTERRUPT_SEXTERNAL : INTERRUPT_MEXTERNAL)
+#define CTX_IRQ_PRIO(ctx) (((ctx) & 1) ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL)
 
 struct plic {
     rvvm_machine_t* machine;
