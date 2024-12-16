@@ -31,7 +31,7 @@ static bool aclint_mswi_read(rvvm_mmio_dev_t* device, void* data, size_t offset,
 
     if (hartid < vector_size(device->machine->harts)) {
         rvvm_hart_t* vm = vector_at(device->machine->harts, hartid);
-        write_uint32_le_m(data, (riscv_interrupts_raised(vm) >> INTERRUPT_MSOFTWARE) & 1);
+        write_uint32_le_m(data, (riscv_interrupts_raised(vm) >> RISCV_INTERRUPT_MSOFTWARE) & 1);
         return true;
     }
 
@@ -46,9 +46,9 @@ static bool aclint_mswi_write(rvvm_mmio_dev_t* device, void* data, size_t offset
     if (hartid < vector_size(device->machine->harts)) {
         rvvm_hart_t* vm = vector_at(device->machine->harts, hartid);
         if (read_uint32_le_m(data) & 1) {
-            riscv_interrupt(vm, INTERRUPT_MSOFTWARE);
+            riscv_interrupt(vm, RISCV_INTERRUPT_MSOFTWARE);
         } else {
-            riscv_interrupt_clear(vm, INTERRUPT_MSOFTWARE);
+            riscv_interrupt_clear(vm, RISCV_INTERRUPT_MSOFTWARE);
         }
         return true;
     }
@@ -89,9 +89,9 @@ static bool aclint_mtimer_write(rvvm_mmio_dev_t* device, void* data, size_t offs
         rvvm_hart_t* vm = vector_at(device->machine->harts, hartid);
         rvtimecmp_set(&vm->mtimecmp, read_uint64_le_m(data));
         if (rvtimecmp_pending(&vm->mtimecmp)) {
-            riscv_interrupt(vm, INTERRUPT_MTIMER);
+            riscv_interrupt(vm, RISCV_INTERRUPT_MTIMER);
         } else {
-            riscv_interrupt_clear(vm, INTERRUPT_MTIMER);
+            riscv_interrupt_clear(vm, RISCV_INTERRUPT_MTIMER);
         }
         return true;
     }
@@ -139,8 +139,8 @@ PUBLIC void clint_init(rvvm_machine_t* machine, rvvm_addr_t addr)
         if (cpu_irq) {
             uint32_t irq_phandle = fdt_node_get_phandle(cpu_irq);
             irq_ext[(i << 2)] = irq_ext[(i << 2) + 2] = irq_phandle;
-            irq_ext[(i << 2) + 1] = INTERRUPT_MSOFTWARE;
-            irq_ext[(i << 2) + 3] = INTERRUPT_MTIMER;
+            irq_ext[(i << 2) + 1] = RISCV_INTERRUPT_MSOFTWARE;
+            irq_ext[(i << 2) + 3] = RISCV_INTERRUPT_MTIMER;
         } else {
             rvvm_warn("Missing nodes in FDT!");
         }
