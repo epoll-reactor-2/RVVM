@@ -38,6 +38,6 @@ typedef struct {
 
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf);
 
-bool bin_objcopy(rvfile_t* file, void* buffer, size_t size, bool allow_elf);
+bool bin_objcopy(rvfile_t* file, void* buffer, size_t size, bool try_elf);
 
 #endif
