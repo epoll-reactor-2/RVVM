@@ -67,8 +67,8 @@ static forceinline float fpu_read_s(rvvm_hart_t* vm, regid_t reg)
 // For bit-precise float register writes
 static forceinline void fpu_emit_s(rvvm_hart_t* vm, regid_t reg, float val)
 {
-    fpu_set_fs(vm, FS_DIRTY);
     write_float_nanbox(&vm->fpu_registers[reg], val);
+    riscv_fpu_set_dirty(vm);
 }
 
 // Canonizes the written result
@@ -88,8 +88,8 @@ static forceinline double fpu_read_d(rvvm_hart_t* vm, regid_t reg)
 
 static forceinline void fpu_emit_d(rvvm_hart_t* vm, regid_t reg, double val)
 {
-    fpu_set_fs(vm, FS_DIRTY);
     vm->fpu_registers[reg] = val;
+    riscv_fpu_set_dirty(vm);
 }
 
 static forceinline void fpu_write_d(rvvm_hart_t* vm, regid_t reg, double val)
@@ -318,7 +318,7 @@ static forceinline void riscv_emulate_f_opc_load(rvvm_hart_t* vm, const uint32_t
     const regid_t rs1 = bit_cut(insn, 15, 5);
     const sxlen_t offset = sign_extend(bit_cut(insn, 20, 12), 12);
     const xlen_t  addr = riscv_read_reg(vm, rs1) + offset;
-    if (likely(fpu_is_enabled(vm))) {
+    if (likely(riscv_fpu_is_enabled(vm))) {
         switch (funct3) {
             case 0x2: // flw
                 riscv_load_float(vm, addr, rds);
@@ -338,7 +338,7 @@ static forceinline void riscv_emulate_f_opc_store(rvvm_hart_t* vm, const uint32_
     const regid_t rs2 = bit_cut(insn, 20, 5);
     const sxlen_t offset = sign_extend(bit_cut(insn, 7, 5) | (bit_cut(insn, 25, 7) << 5), 12);
     const xlen_t addr = riscv_read_reg(vm, rs1) + offset;
-    if (likely(fpu_is_enabled(vm))) {
+    if (likely(riscv_fpu_is_enabled(vm))) {
         switch (funct3) {
             case 0x2: // fsw
                 riscv_store_float(vm, addr, rs2);
@@ -367,7 +367,7 @@ static forceinline void riscv_emulate_f_fmadd(rvvm_hart_t* vm, const uint32_t in
     const uint32_t funct2 = bit_cut(insn, 25, 2);
     const regid_t rs3 = insn >> 27;
 
-    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+    if (unlikely(!riscv_fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
         riscv_illegal_insn(vm, insn);
         return;
     }
@@ -392,7 +392,7 @@ static forceinline void riscv_emulate_f_fmsub(rvvm_hart_t* vm, const uint32_t in
     const uint32_t funct2 = bit_cut(insn, 25, 2);
     const regid_t rs3 = insn >> 27;
 
-    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+    if (unlikely(!riscv_fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
         riscv_illegal_insn(vm, insn);
         return;
     }
@@ -417,7 +417,7 @@ static forceinline void riscv_emulate_f_fnmsub(rvvm_hart_t* vm, const uint32_t i
     const uint32_t funct2 = bit_cut(insn, 25, 2);
     const regid_t rs3 = insn >> 27;
 
-    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+    if (unlikely(!riscv_fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
         riscv_illegal_insn(vm, insn);
         return;
     }
@@ -442,7 +442,7 @@ static forceinline void riscv_emulate_f_fnmadd(rvvm_hart_t* vm, const uint32_t i
     const uint32_t funct2 = bit_cut(insn, 25, 2);
     const regid_t rs3 = insn >> 27;
 
-    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+    if (unlikely(!riscv_fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
         riscv_illegal_insn(vm, insn);
         return;
     }
@@ -466,7 +466,7 @@ static forceinline void riscv_emulate_f_opc_op(rvvm_hart_t* vm, const uint32_t i
     const regid_t rs2 = bit_cut(insn, 20, 5);
     const uint32_t funct7 = insn >> 25;
 
-    if (unlikely(!fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
+    if (unlikely(!riscv_fpu_is_enabled(vm) || riscv_fpu_rm_invalid(rm))) {
         riscv_illegal_insn(vm, insn);
         return;
     }
