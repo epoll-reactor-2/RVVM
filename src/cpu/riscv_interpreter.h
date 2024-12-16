@@ -1,5 +1,5 @@
 /*
-riscv_interpreter.h - RISC-V Template interpreter
+riscv_interpreter.h - RISC-V Template Interpreter
 Copyright (C) 2024  LekKit <github.com/LekKit>
 
 This Source Code Form is subject to the terms of the Mozilla Public
@@ -25,7 +25,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #ifdef RV64
 
 typedef uint64_t xlen_t;
-typedef int64_t sxlen_t;
+typedef int64_t  sxlen_t;
 typedef uint64_t xaddr_t;
 #define SHAMT_BITS 6
 #define DIV_OVERFLOW_RS1 ((sxlen_t)0x8000000000000000ULL)
@@ -33,7 +33,7 @@ typedef uint64_t xaddr_t;
 #else
 
 typedef uint32_t xlen_t;
-typedef int32_t sxlen_t;
+typedef int32_t  sxlen_t;
 typedef uint32_t xaddr_t;
 #define SHAMT_BITS 5
 #define DIV_OVERFLOW_RS1 ((sxlen_t)0x80000000U)
@@ -59,53 +59,59 @@ static forceinline void riscv_write_reg(rvvm_hart_t* vm, regid_t reg, sxlen_t da
 #include "riscv_compressed.h"
 
 /*
- * JIT glue
- */
-
-static forceinline void riscv_emulate(rvvm_hart_t *vm, const uint32_t instruction)
-{
-#if defined(USE_JIT) && (defined(RVJIT_NATIVE_64BIT) || !defined(RV64))
-    if (unlikely(vm->jit_compiling)) {
-        // If we hit non-compilable instruction or cross page boundaries, the block is finalized.
-        if (vm->block_ends || (vm->jit.virt_pc >> MMU_PAGE_SHIFT) != (vm->registers[REGISTER_PC] >> MMU_PAGE_SHIFT)) {
-            riscv_jit_finalize(vm);
-        }
-        vm->block_ends = true;
-    }
-#endif
-    riscv_emulate_insn(vm, instruction);
-}
-
-/*
- * Optimized dispatch loop that does not fetch each instruction,
- * and invokes MMU on page change instead.
- * This gains us about 40-60% more performance depending on workload.
- * Attention: Any TLB flush must clear vm->wait_event to
- * restart dispatch loop, otherwise it will continue executing current page
+ * Optimized CPU interpreter dispatch loop.
+ * Executes instructions until some event occurs (interrupt, trap).
+ *
+ * Calling this with vm->running == 0 allows single-stepping guest instructions.
+ *
+ * NOTE: Call riscv_restart_dispatch() after flushing TLB around PC,
+ * otherwise the CPU loop will continue executing current page.
  */
 
 TSAN_SUPPRESS void riscv_run_interpreter(rvvm_hart_t* vm)
 {
-    size_t inst_ptr = 0;  // Updated before any read
-    uint32_t instruction = 0;
-    // page_addr should always mismatch pc by at least 1 page before execution
-    xlen_t page_addr = vm->registers[REGISTER_PC] + 0x1000;
+    uint32_t insn = 0;
 
-    // Execute instructions loop until some event occurs (interrupt, trap)
-    while (likely(vm->wait_event)) {
-        xlen_t inst_addr = vm->registers[REGISTER_PC];
-        if (likely(inst_addr - page_addr < 0xFFD)) {
-            instruction = read_uint32_le_m((vmptr_t)(size_t)(inst_ptr + TLB_VADDR(inst_addr)));
-        } else if (likely(riscv_fetch_inst(vm, inst_addr, &instruction))) {
-            // Update pointer to the current page in real memory
-            // If we are executing code from MMIO, direct memory fetch fails
-            const xlen_t vpn = vm->registers[REGISTER_PC] >> 12;
-            inst_ptr = vm->tlb[vpn & TLB_MASK].ptr;
-            page_addr = vm->tlb[vpn & TLB_MASK].e << 12;
-        } else break;
-        vm->registers[REGISTER_ZERO] = 0;
-        riscv_emulate(vm, instruction);
-    }
+    // This is similar to TLB mechanism, but persists in local variables across instructions
+    size_t insn_ptr = 0;
+    xlen_t insn_page = vm->registers[RISCV_REG_PC] + RISCV_PAGE_SIZE;
+
+    do {
+        const xlen_t insn_addr = vm->registers[RISCV_REG_PC];
+        if (likely(insn_addr - insn_page <= 0xFFC)) {
+            // Direct instruction fetch by pointer
+            insn = read_uint32_le_m((const void*)(size_t)(insn_ptr + insn_addr));
+        } else {
+            uint32_t tmp = 0;
+            if (likely(riscv_fetch_insn(vm, insn_addr, &tmp))) {
+                // Update pointer to the current page in real memory
+                // If we are executing code from MMIO, direct memory fetch fails
+                const xlen_t vpn = vm->registers[RISCV_REG_PC] >> RISCV_PAGE_SHIFT;
+                const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+                insn = tmp;
+                insn_ptr = entry->ptr;
+                insn_page = entry->e << RISCV_PAGE_SHIFT;
+            } else {
+                // Instruction fetch fault happened
+                return;
+            }
+        }
+
+#if defined(USE_JIT) && (defined(RVJIT_NATIVE_64BIT) || !defined(RV64))
+        if (likely(vm->jit_compiling)) {
+            // If we hit non-compilable instruction or cross page boundaries, current JIT block is finalized.
+            if (vm->jit_block_ends || (vm->jit.virt_pc >> RISCV_PAGE_SHIFT) != (vm->registers[RISCV_REG_PC] >> RISCV_PAGE_SHIFT)) {
+                riscv_jit_finalize(vm);
+            }
+            vm->jit_block_ends = true;
+        }
+#endif
+
+        // Implicitly zero x0 register each time
+        vm->registers[RISCV_REG_ZERO] = 0;
+
+        riscv_emulate_insn(vm, insn);
+    } while (likely(vm->running));
 }
 
 #endif
