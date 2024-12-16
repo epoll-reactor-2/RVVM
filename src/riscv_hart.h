@@ -71,7 +71,7 @@ void riscv_switch_priv(rvvm_hart_t* vm, uint8_t priv_mode);
 void riscv_update_xlen(rvvm_hart_t* vm);
 
 // Traps the hart. Should be the last operation before returning to dispatch.
-void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, maxlen_t tval);
+void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval);
 
 /*
  * Running the hart

@@ -17,10 +17,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "atomics.h"
 #include "bit_ops.h"
 
-// Valid vm->wait_event values
-#define HART_STOPPED 0
-#define HART_RUNNING 1
-
 // Valid vm->pending_events bits deliverable to the hart
 #define HART_EVENT_PAUSE   0x1 // Pause the hart in a consistent state
 #define HART_EVENT_PREEMPT 0x2 // Preempt the hart for vm->preempt_ms
@@ -32,7 +28,7 @@ rvvm_hart_t* riscv_hart_init(rvvm_machine_t* machine)
     vm->machine = machine;
     vm->mem = machine->mem;
     vm->rv64 = machine->rv64;
-    vm->priv_mode = PRIVILEGE_MACHINE;
+    vm->priv_mode = RISCV_PRIV_MACHINE;
 
     riscv_csr_init(vm);
 
@@ -76,13 +72,13 @@ void riscv_hart_free(rvvm_hart_t* vm)
 rvvm_addr_t riscv_hart_run_userland(rvvm_hart_t* vm)
 {
     vm->userland = true;
-    atomic_store_uint32(&vm->wait_event, HART_RUNNING);
+    atomic_store_uint32_ex(&vm->running, true, ATOMIC_RELAXED);
     riscv_run_till_event(vm);
     if (vm->trap) {
-        vm->registers[REGISTER_PC] = vm->trap_pc;
+        vm->registers[RISCV_REG_PC] = vm->trap_pc;
         vm->trap = false;
     }
-    return vm->csr.cause[PRIVILEGE_USER];
+    return vm->csr.cause[RISCV_PRIV_USER];
 }
 
 void riscv_switch_priv(rvvm_hart_t* vm, uint8_t priv_mode)
@@ -96,17 +92,17 @@ void riscv_switch_priv(rvvm_hart_t* vm, uint8_t priv_mode)
 
 void riscv_update_xlen(rvvm_hart_t* vm)
 {
-#ifdef USE_RV64
+#if defined(USE_RV64) && defined(USE_RV32)
     bool rv64 = false;
     switch (vm->priv_mode) {
-        case PRIVILEGE_MACHINE:
+        case RISCV_PRIV_MACHINE:
             rv64 = !!(vm->csr.isa & CSR_MISA_RV64);
             break;
-        case PRIVILEGE_HYPERVISOR: // TODO
-        case PRIVILEGE_SUPERVISOR:
+        case RISCV_PRIV_HYPERVISOR: // TODO
+        case RISCV_PRIV_SUPERVISOR:
             rv64 = bit_check(vm->csr.status, 35);
             break;
-        case PRIVILEGE_USER:
+        case RISCV_PRIV_USER:
             rv64 = bit_check(vm->csr.status, 33);
             break;
     }
@@ -128,46 +124,49 @@ void riscv_update_xlen(rvvm_hart_t* vm)
 static void riscv_trap_priv_helper(rvvm_hart_t* vm, uint8_t target_priv)
 {
     switch (target_priv) {
-        case PRIVILEGE_MACHINE:
+        case RISCV_PRIV_MACHINE:
             vm->csr.status = bit_replace(vm->csr.status, 11, 2, vm->priv_mode);
             vm->csr.status = bit_replace(vm->csr.status, 7, 1, bit_cut(vm->csr.status, 3, 1));
             vm->csr.status = bit_replace(vm->csr.status, 3, 1, 0);
             break;
-        case PRIVILEGE_HYPERVISOR:
-            vm->csr.status = bit_replace(vm->csr.status, 9, 2, vm->priv_mode);
-            vm->csr.status = bit_replace(vm->csr.status, 6, 1, bit_cut(vm->csr.status, 2, 1));
-            vm->csr.status = bit_replace(vm->csr.status, 2, 1, 0);
-            break;
-        case PRIVILEGE_SUPERVISOR:
+        case RISCV_PRIV_HYPERVISOR: // TODO
+        case RISCV_PRIV_SUPERVISOR:
             vm->csr.status = bit_replace(vm->csr.status, 8, 1, vm->priv_mode);
             vm->csr.status = bit_replace(vm->csr.status, 5, 1, bit_cut(vm->csr.status, 1, 1));
             vm->csr.status = bit_replace(vm->csr.status, 1, 1, 0);
             break;
-        case PRIVILEGE_USER:
+        case RISCV_PRIV_USER:
             vm->csr.status = bit_replace(vm->csr.status, 4, 1, bit_cut(vm->csr.status, 0, 1));
             vm->csr.status = bit_replace(vm->csr.status, 0, 1, 0);
             break;
     }
 }
 
-void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, maxlen_t tval)
+void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval)
 {
-    vm->trap = true;
-    if (cause < TRAP_ENVCALL_UMODE || cause > TRAP_ENVCALL_MMODE) {
+    if (unlikely(vm->trap)) {
+        // Only one trap may be raised per CPU dispatch cycle
+        return;
+    }
+    if (cause >= RISCV_TRAP_INSN_PAGEFAULT && cause <= RISCV_TRAP_STORE_PAGEFAULT) {
+        // Discard compiled JIT block torn by (likely recoverable) pagefault
         riscv_jit_discard(vm);
+    } else {
+        // End the compiled JIT block right before the trapping instruction
+        riscv_jit_compile(vm);
     }
     if (vm->userland) {
         // Defer userland trap
-        vm->csr.cause[PRIVILEGE_USER] = cause;
-        vm->csr.tval[PRIVILEGE_USER] = tval;
-        vm->trap_pc = vm->registers[REGISTER_PC];
+        vm->csr.cause[RISCV_PRIV_USER] = cause;
+        vm->csr.tval[RISCV_PRIV_USER] = tval;
+        vm->trap_pc = vm->registers[RISCV_REG_PC];
     } else {
         // Target privilege mode
-        uint8_t priv = PRIVILEGE_MACHINE;
+        uint8_t priv = RISCV_PRIV_MACHINE;
         // Delegate to lower privilege mode if needed
         while ((priv > vm->priv_mode) && (vm->csr.edeleg[priv] & (1 << cause))) priv--;
         // Write exception info
-        vm->csr.epc[priv] = vm->registers[REGISTER_PC];
+        vm->csr.epc[priv] = vm->registers[RISCV_REG_PC];
         vm->csr.cause[priv] = cause;
         vm->csr.tval[priv] = tval;
         // Modify exception stack in csr.status
@@ -176,12 +175,14 @@ void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, maxlen_t tval)
         vm->trap_pc = vm->csr.tvec[priv] & (~3ULL);
         riscv_switch_priv(vm, priv);
     }
+
+    vm->trap = true;
     riscv_restart_dispatch(vm);
 }
 
 void riscv_restart_dispatch(rvvm_hart_t* vm)
 {
-    atomic_store_uint32_ex(&vm->wait_event, HART_STOPPED, ATOMIC_RELAXED);
+    atomic_store_uint32_ex(&vm->running, false, ATOMIC_RELAXED);
 }
 
 static void riscv_hart_notify(rvvm_hart_t* vm)
@@ -224,10 +225,10 @@ void riscv_hart_check_timer(rvvm_hart_t* vm)
     // WFI precisely checks timers by itself
     if (!condvar_waiters(vm->wfi_cond)) {
         uint64_t timer = rvtimer_get(&vm->machine->timer);
-        if (timer >= rvtimecmp_get(&vm->mtimecmp) && riscv_interrupt_set(vm, INTERRUPT_MTIMER)) {
+        if (timer >= rvtimecmp_get(&vm->mtimecmp) && riscv_interrupt_set(vm, RISCV_INTERRUPT_MTIMER)) {
             riscv_restart_dispatch(vm);
         }
-        if (timer >= rvtimecmp_get(&vm->stimecmp) && riscv_interrupt_set(vm, INTERRUPT_STIMER)) {
+        if (timer >= rvtimecmp_get(&vm->stimecmp) && riscv_interrupt_set(vm, RISCV_INTERRUPT_STIMER)) {
             riscv_restart_dispatch(vm);
         }
     }
@@ -242,18 +243,13 @@ void riscv_hart_preempt(rvvm_hart_t* vm, uint32_t preempt_ms)
     }
 }
 
-static inline maxlen_t riscv_cause_irq_mask(rvvm_hart_t* vm)
+static inline rvvm_uxlen_t riscv_cause_irq_mask(rvvm_hart_t* vm)
 {
-#ifdef USE_RV64
     if (vm->rv64) {
-        return 0x8000000000000000ULL;
+        return (rvvm_uxlen_t)0x8000000000000000ULL;
     } else {
         return 0x80000000U;
     }
-#else
-    UNUSED(vm);
-    return 0x80000000U;
-#endif
 }
 
 static void riscv_handle_irqs(rvvm_hart_t* vm)
@@ -262,38 +258,43 @@ static void riscv_handle_irqs(rvvm_hart_t* vm)
     uint32_t pending_irqs = riscv_interrupts_pending(vm);
     if (unlikely(pending_irqs)) {
         // Target privilege mode
-        uint8_t priv = PRIVILEGE_MACHINE;
+        uint8_t priv = RISCV_PRIV_MACHINE;
         uint32_t irqs = 0;
+
         // Delegate pending IRQs from M to the highest possible mode
         do {
             irqs = pending_irqs & ~vm->csr.ideleg[priv];
             pending_irqs &= vm->csr.ideleg[priv];
             if (irqs) break;
         } while (--priv);
-        // Skip if target priv < current priv, or equal and IRQs are disabled in status CSR
-        if (vm->priv_mode > priv) return;
-        if (vm->priv_mode == priv && !((1 << vm->priv_mode) & vm->csr.status)) return;
 
-        for (int i=11; i>=0; --i) {
-            if (irqs & (1 << i)) {
-                // Modify exception stack in csr.status
-                riscv_trap_priv_helper(vm, priv);
-                // Discard unfinished JIT block
-                riscv_jit_discard(vm);
-                // Switch privilege
-                riscv_switch_priv(vm, priv);
-                // Write exception info
-                vm->csr.epc[priv] = vm->registers[REGISTER_PC];
-                vm->csr.cause[priv] = i | riscv_cause_irq_mask(vm);
-                vm->csr.tval[priv] = 0;
-                // Jump to trap vector
-                if (vm->csr.tvec[priv] & 1) {
-                    vm->registers[REGISTER_PC] = (vm->csr.tvec[priv] & (~3ULL)) + (i << 2);
-                } else {
-                    vm->registers[REGISTER_PC] = vm->csr.tvec[priv] & (~3ULL);
-                }
-                return;
-            }
+        if (vm->priv_mode > priv) {
+            // Target privilege mode is less privileged than current
+            return;
+        }
+
+        if (vm->priv_mode == priv && !((1 << vm->priv_mode) & vm->csr.status)) {
+            // Target privilege mode is equal, but IRQs are disabled in status CSR
+            return;
+        }
+
+        // Discard compiled JIT block torn by interrupt
+        riscv_jit_discard(vm);
+
+        uint32_t irq = bit_clz64(irqs) ^ 63;
+        // Modify exception stack in csr.status
+        riscv_trap_priv_helper(vm, priv);
+        // Switch privilege
+        riscv_switch_priv(vm, priv);
+        // Write exception info
+        vm->csr.epc[priv] = vm->registers[RISCV_REG_PC];
+        vm->csr.cause[priv] = irq | riscv_cause_irq_mask(vm);
+        vm->csr.tval[priv] = 0;
+        // Jump to trap vector
+        if (vm->csr.tvec[priv] & 1) {
+            vm->registers[RISCV_REG_PC] = (vm->csr.tvec[priv] & (~3ULL)) + (irq << 2);
+        } else {
+            vm->registers[RISCV_REG_PC] = vm->csr.tvec[priv] & (~3ULL);
         }
     }
     return;
@@ -305,7 +306,7 @@ void riscv_hart_run(rvvm_hart_t* vm)
 
     while (true) {
         // Allow hart to run
-        atomic_store_uint32_ex(&vm->wait_event, HART_RUNNING, ATOMIC_RELAXED);
+        atomic_store_uint32_ex(&vm->running, true, ATOMIC_RELAXED);
 
         // Handle events
         uint32_t events = atomic_swap_uint32(&vm->pending_events, 0);
@@ -324,25 +325,28 @@ void riscv_hart_run(rvvm_hart_t* vm)
         // Run the hart
         riscv_run_till_event(vm);
         if (vm->trap) {
-            vm->registers[REGISTER_PC] = vm->trap_pc;
+            vm->registers[RISCV_REG_PC] = vm->trap_pc;
             vm->trap = false;
         }
     }
 }
 
-static void* riscv_hart_run_wrap(void* ptr)
+static void* riscv_hart_run_thread(void* ptr)
 {
-    if (rvvm_getarg_int("noisolation") < 1) {
+    rvvm_hart_t* vm = ptr;
+    if (!rvvm_has_arg("noisolation")) {
         rvvm_restrict_this_thread();
     }
-    riscv_hart_run((rvvm_hart_t*)ptr);
+    riscv_csr_sync_fpu(vm);
+    riscv_hart_run(vm);
+    riscv_csr_sync_fpu(vm);
     return NULL;
 }
 
 void riscv_hart_spawn(rvvm_hart_t *vm)
 {
     atomic_store_uint32(&vm->pending_events, 0);
-    vm->thread = thread_create(riscv_hart_run_wrap, (void*)vm);
+    vm->thread = thread_create(riscv_hart_run_thread, (void*)vm);
 }
 
 void riscv_hart_queue_pause(rvvm_hart_t* vm)
