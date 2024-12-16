@@ -35,7 +35,7 @@ static void spin_global_init(void)
     });
 }
 
-NOINLINE static void spin_lock_debug_report(spinlock_t* lock, bool crash)
+static no_inline void spin_lock_debug_report(spinlock_t* lock, bool crash)
 {
 #ifdef USE_SPINLOCK_DEBUG
     rvvm_warn("The lock was previously held at %s", lock->location);
