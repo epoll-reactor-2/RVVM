@@ -10,6 +10,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "utils.h"
+#include "blk_io.h"
 #include "rvtimer.h"
 #include "vector.h"
 #include "spinlock.h"
@@ -20,222 +21,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <string.h>
 #include <stdio.h>
 
-static int loglevel = LOG_WARN;
-
-static int argc = 0;
-static const char** argv = NULL;
-
-
-size_t rvvm_strlen(const char* string)
-{
-    size_t i = 0;
-    while (string[i]) i++;
-    return i;
-}
-
-size_t rvvm_strnlen(const char* string, size_t size)
-{
-    size_t i = 0;
-    while (i < size && string[i]) i++;
-    return i;
-}
-
-bool rvvm_strcmp(const char* s1, const char* s2)
-{
-    size_t i = 0;
-    while (s1[i] && s1[i] == s2[i]) i++;
-    return s1[i] == s2[i];
-}
-
-size_t rvvm_strlcpy(char* dst, const char* src, size_t size)
-{
-    size_t i = 0;
-    while (i + 1 < size && src[i]) {
-        dst[i] = src[i];
-        i++;
-    }
-    if (size) dst[i] = 0;
-    return i;
-}
-
-const char* rvvm_strfind(const char* string, const char* pattern)
-{
-    while (*string) {
-        const char* tmp = string;
-        const char* pat = pattern;
-        while (*tmp && *tmp == *pat) {
-            tmp++;
-            pat++;
-        }
-        if (!(*pat)) return string;
-        string++;
-    }
-    return NULL;
-}
-
-void rvvm_set_loglevel(int level)
-{
-    loglevel = level;
-}
-
-static bool log_has_colors(void)
-{
-    return getenv("TERM") != NULL;
-}
-
-static void log_print(const char* prefix, const char* fmt, va_list args)
-{
-    char buffer[256] = {0};
-    size_t pos = rvvm_strlcpy(buffer, prefix, sizeof(buffer));
-    size_t vsp_size = sizeof(buffer) - EVAL_MIN(pos + 6, sizeof(buffer));
-    if (vsp_size > 1) {
-        int tmp = vsnprintf(buffer + pos, vsp_size, fmt, args);
-        if (tmp > 0) pos += EVAL_MIN(vsp_size - 1, (size_t)tmp);
-    }
-    rvvm_strlcpy(buffer + pos, log_has_colors() ? "\033[0m\n" : "\n", sizeof(buffer) - pos);
-    fputs(buffer, stderr);
-}
-
-#ifdef USE_DEBUG
-
-PRINT_FORMAT void rvvm_debug(const char* str, ...)
-{
-    if (loglevel < LOG_INFO) return;
-    va_list args;
-    va_start(args, str);
-    log_print(log_has_colors() ? "\033[33;1mDEBUG\033[37;1m: " : "DEBUG: ", str, args);
-    va_end(args);
-}
-
-#endif
-
-PRINT_FORMAT void rvvm_info(const char* str, ...)
-{
-    if (loglevel < LOG_INFO) return;
-    va_list args;
-    va_start(args, str);
-    log_print(log_has_colors() ? "\033[33;1mINFO\033[37;1m: " : "INFO: ", str, args);
-    va_end(args);
-}
-
-PRINT_FORMAT void rvvm_warn(const char* str, ...)
-{
-    if (loglevel < LOG_WARN) return;
-    va_list args;
-    va_start(args, str);
-    log_print(log_has_colors() ? "\033[31;1mWARN\033[37;1m: " : "WARN: ", str, args);
-    va_end(args);
-}
-
-PRINT_FORMAT void rvvm_error(const char* str, ...)
-{
-    if (loglevel < LOG_ERROR) return;
-    va_list args;
-    va_start(args, str);
-    log_print(log_has_colors() ? "\033[31;1mERROR\033[37;1m: " : "ERROR: ", str, args);
-    va_end(args);
-}
-
-PRINT_FORMAT void rvvm_fatal(const char* str, ...)
-{
-    va_list args;
-    va_start(args, str);
-    log_print(log_has_colors() ? "\033[31;1mFATAL\033[37;1m: " : "FATAL: ", str, args);
-    va_end(args);
-    stacktrace_print();
-    abort();
-}
-
-SAFE_MALLOC void* safe_malloc(size_t size)
-{
-    void* ret = malloc(size);
-    if (unlikely(!size)) rvvm_warn("Suspicious 0-byte allocation");
-    if (unlikely(ret == NULL)) {
-        rvvm_fatal("Out of memory!");
-    }
-    return ret;
-}
-
-SAFE_CALLOC void* safe_calloc(size_t size, size_t n)
-{
-    void* ret = calloc(size, n);
-    if (unlikely(!size || !n)) rvvm_warn("Suspicious 0-byte allocation");
-    if (unlikely(ret == NULL)) {
-        rvvm_fatal("Out of memory!");
-    }
-    // Fence zeroing of allocated memory
-    atomic_fence_ex(ATOMIC_RELEASE);
-    return ret;
-}
-
-SAFE_REALLOC void* safe_realloc(void* ptr, size_t size)
-{
-    void* ret = realloc(ptr, size);
-    if (unlikely(!size)) rvvm_warn("Suspicious 0-byte allocation");
-    if (unlikely(ret == NULL)) {
-        rvvm_fatal("Out of memory!");
-    }
-    return ret;
-}
-
-NOINLINE void do_once_finalize(uint32_t* ticket)
-{
-    while (atomic_load_uint32_ex(ticket, ATOMIC_ACQUIRE) != 2) {
-        sleep_ms(1);
-    }
-}
-
-typedef void (*deinit_func_t)(void);
-static vector_t(deinit_func_t) deinit_funcs = {0};
-static spinlock_t deinit_lock = {0};
-static bool deinit_happened = false;
-
-void call_at_deinit(void (*function)(void))
-{
-    bool call_func = false;
-
-    while (!spin_try_lock(&deinit_lock)) sleep_ms(1);
-    if (!deinit_happened) {
-        vector_push_back(deinit_funcs, function);
-    } else {
-        call_func = true;
-    }
-    spin_unlock(&deinit_lock);
-
-    if (call_func) {
-        function();
-    }
-}
-
-static deinit_func_t dequeue_func(void)
-{
-    deinit_func_t ret = NULL;
-
-    while (!spin_try_lock(&deinit_lock)) sleep_ms(1);
-    deinit_happened = true;
-    if (vector_size(deinit_funcs) == 0) {
-        vector_free(deinit_funcs);
-    } else {
-        size_t end = vector_size(deinit_funcs) - 1;
-        ret = vector_at(deinit_funcs, end);
-        vector_erase(deinit_funcs, end);
-    }
-    spin_unlock(&deinit_lock);
-    return ret;
-}
-
-GNU_DESTRUCTOR void full_deinit(void)
-{
-    rvvm_info("Fully deinitializing librvvm");
-    while (true) {
-        deinit_func_t func = dequeue_func();
-        if (func) {
-            func();
-        } else {
-            break;
-        }
-    }
-}
+/*
+ * String/Integer conversions
+ */
 
 static inline char digit_symbol(uint32_t val)
 {
@@ -332,86 +120,60 @@ int64_t str_to_int_dec(const char* str)
     return str_to_int_base(str, NULL, 0);
 }
 
-void rvvm_set_args(int new_argc, const char** new_argv)
-{
-    argc = new_argc;
-    argv = new_argv;
+/*
+ * String functions
+ */
 
-    if (rvvm_has_arg("v") || rvvm_has_arg("verbose")) {
-        rvvm_set_loglevel(LOG_INFO);
-    }
+size_t rvvm_strlen(const char* string)
+{
+    size_t i = 0;
+    while (string[i]) i++;
+    return i;
 }
 
-bool rvvm_has_arg(const char* arg)
+size_t rvvm_strnlen(const char* string, size_t size)
 {
-    size_t offset, j;
-    for (int i = 0; i < argc; i++) {
-        if (argv[i] == NULL) return false;
-        if (argv[i][0] == '-') {
-            offset = (argv[i][1] == '-') ? 2 : 1;
-            j = 0;
-            while (arg[j]
-               && argv[i][j + offset]
-               && argv[i][j + offset] != '='
-               && argv[i][j + offset] == arg[j]) j++;
-            if (arg[j] == 0 && (argv[i][j + offset] == 0 || argv[i][j + offset] == '=')) {
-                return true;
-            }
-        }
-    }
-    return false;
+    size_t i = 0;
+    while (i < size && string[i]) i++;
+    return i;
 }
 
-const char* rvvm_getarg(const char* arg)
+bool rvvm_strcmp(const char* s1, const char* s2)
 {
-    size_t offset, j;
-    for (int i = 0; i < argc; i++) {
-        if (argv[i] == NULL) return NULL;
-        if (argv[i][0] == '-') {
-            offset = (argv[i][1] == '-') ? 2 : 1;
-            j = 0;
-            while (arg[j]
-                && argv[i][j + offset]
-                && argv[i][j + offset] != '='
-                && argv[i][j + offset] == arg[j]) j++;
-            if (arg[j] == 0 && (argv[i][j + offset] == 0 || argv[i][j + offset] == '=')) {
-                if (argv[i + 1] != NULL && argv[i + 1][0] != '-') {
-                    return argv[i + 1];
-                }
-            }
-            if (argv[i][j + offset] == '=') {
-                offset += j+1;
-                return argv[i]+offset;
-            }
+    size_t i = 0;
+    while (s1[i] && s1[i] == s2[i]) i++;
+    return s1[i] == s2[i];
+}
+
+size_t rvvm_strlcpy(char* dst, const char* src, size_t size)
+{
+    size_t i = 0;
+    while (i + 1 < size && src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    if (size) dst[i] = 0;
+    return i;
+}
+
+const char* rvvm_strfind(const char* string, const char* pattern)
+{
+    while (*string) {
+        const char* tmp = string;
+        const char* pat = pattern;
+        while (*tmp && *tmp == *pat) {
+            tmp++;
+            pat++;
         }
+        if (!(*pat)) return string;
+        string++;
     }
     return NULL;
 }
 
-bool rvvm_getarg_bool(const char* arg)
-{
-    const char* argvalue = rvvm_getarg(arg);
-    if (argvalue == NULL) return false;
-    if (rvvm_strcmp("on", argvalue)
-     || rvvm_strcmp("true", argvalue)
-     || rvvm_strcmp("y", argvalue)
-     || rvvm_strcmp("1", argvalue)) return true;
-    return false;
-}
-
-int rvvm_getarg_int(const char* arg)
-{
-    const char* argvalue = rvvm_getarg(arg);
-    if (argvalue == NULL) return 0;
-    return str_to_int_dec(argvalue);
-}
-
-uint64_t rvvm_getarg_size(const char* arg)
-{
-    const char* argvalue = rvvm_getarg(arg);
-    if (argvalue == NULL) return 0;
-    return ((uint64_t)str_to_int_dec(argvalue)) << mem_suffix_shift(argvalue[rvvm_strlen(argvalue)-1]);
-}
+/*
+ * Random generation
+ */
 
 void rvvm_randombytes(void* buffer, size_t size)
 {
@@ -442,5 +204,365 @@ void rvvm_randomserial(char* serial, size_t size)
         size_t c = ((uint8_t*)serial)[i] % ('Z' - 'A' + 10);
         if (c <= 9) serial[i] = '0' + c;
         else serial[i] = 'A' + c - 10;
+    }
+}
+
+/*
+ * Safe memory allocation
+ */
+
+SAFE_MALLOC void* safe_malloc(size_t size)
+{
+    void* ret = malloc(size);
+    if (unlikely(!size)) rvvm_warn("Suspicious 0-byte allocation");
+    if (unlikely(ret == NULL)) {
+        rvvm_fatal("Out of memory!");
+    }
+    return ret;
+}
+
+SAFE_CALLOC void* safe_calloc(size_t size, size_t n)
+{
+    void* ret = calloc(size, n);
+    if (unlikely(!size || !n)) rvvm_warn("Suspicious 0-byte allocation");
+    if (unlikely(ret == NULL)) {
+        rvvm_fatal("Out of memory!");
+    }
+    // Fence zeroing of allocated memory
+    atomic_fence_ex(ATOMIC_RELEASE);
+    return ret;
+}
+
+SAFE_REALLOC void* safe_realloc(void* ptr, size_t size)
+{
+    void* ret = realloc(ptr, size);
+    if (unlikely(!size)) rvvm_warn("Suspicious 0-byte allocation");
+    if (unlikely(ret == NULL)) {
+        rvvm_fatal("Out of memory!");
+    }
+    return ret;
+}
+
+/*
+ * Command line & config parsing
+ */
+
+static int    argc_internal = 0;
+static char** argv_internal = NULL;
+
+void rvvm_set_args(int argc, char** argv)
+{
+    argc_internal = argc;
+    argv_internal = argv;
+
+    if (rvvm_has_arg("v") || rvvm_has_arg("verbose")) {
+        rvvm_set_loglevel(LOG_INFO);
+    }
+}
+
+static bool config_skip(const char** strptr)
+{
+    bool found_newline = false;
+    const char* str = *strptr;
+    while (*str == ' ' || *str == '\n') {
+        if (*str++ == '\n') {
+            found_newline = true;
+        }
+    }
+    if (*str == '#') {
+        // Found a comment. skip till newline
+        while (*str && *str != '\n') {
+            str++;
+        }
+        *strptr = str;
+        config_skip(strptr);
+        return true;
+    }
+    *strptr = str;
+    return found_newline;
+}
+
+static int config_split(const char* str, char** argv)
+{
+    int argc = 1;
+    bool arg_prefix = true;
+    if (argv) {
+        argv[0] = "rvvm";
+    }
+    config_skip(&str);
+    while (*str) {
+        const char* arg_start = str;
+        while (*str && *str != ' ' && *str != '\n') {
+            str++;
+        }
+        if (argv) {
+            size_t arg_size = str - arg_start;
+            char* buffer = safe_new_arr(char, arg_size + (arg_prefix ? 2 : 1));
+            if (arg_prefix) {
+                buffer[0] = '-';
+                memcpy(buffer + 1, arg_start, arg_size);
+            } else {
+                memcpy(buffer, arg_start, arg_size);
+            }
+            argv[argc] = buffer;
+        }
+        arg_prefix = config_skip(&str);
+        argc++;
+    }
+    return argc;
+}
+
+bool rvvm_load_config(const char* path)
+{
+    rvfile_t* cfg = rvopen(path, 0);
+    if (cfg) {
+        size_t filesize = rvfilesize(cfg);
+        char* filebuf = safe_new_arr(char, filesize + 1);
+        rvread(cfg, filebuf, filesize, 0);
+        rvclose(cfg);
+
+        int argc = config_split(filebuf, NULL);
+        char** argv = safe_new_arr(char*, argc + 1);
+        config_split(filebuf, argv);
+        free(filebuf);
+        rvvm_set_args(argc, argv);
+    }
+    return false;
+}
+
+const char* rvvm_next_arg(const char** val, int* iter)
+{
+    int i = *iter;
+    if (argc_internal < 2) {
+        DO_ONCE(rvvm_load_config("rvvm.cfg"));
+    }
+    if (val) {
+        *val = NULL;
+    }
+    if (argv_internal && i < argc_internal && argv_internal[i]) {
+        const char* arg = argv_internal[i];
+        if (arg[0] == '-') {
+            // Skip -, -- argument prefix
+            arg += (arg[1] == '-') ? 2 : 1;
+            // Get trailing argument value, if any
+            if (i + 1 < argc_internal) {
+                const char* next_arg = argv_internal[i + 1];
+                if (next_arg && next_arg[0] != '-') {
+                    if (val) {
+                        *val = next_arg;
+                    }
+                    i++;
+                }
+            }
+        } else {
+            // This is a free-standing value without -arg prefix
+            if (val) {
+                *val = arg;
+            }
+            arg = "";
+        }
+        *iter = i + 1;
+        return arg;
+    }
+    return NULL;
+}
+
+bool rvvm_has_arg(const char* arg)
+{
+    const char* arg_name = NULL;
+    int arg_iter = 1;
+    while ((arg_name = rvvm_next_arg(NULL, &arg_iter))) {
+        if (rvvm_strcmp(arg_name, arg)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char* rvvm_getarg(const char* arg)
+{
+    const char* arg_name = NULL;
+    const char* arg_val = NULL;
+    int arg_iter = 1;
+    while ((arg_name = rvvm_next_arg(&arg_val, &arg_iter))) {
+        if (rvvm_strcmp(arg_name, arg)) {
+            return arg_val;
+        }
+    }
+    return NULL;
+}
+
+bool rvvm_getarg_bool(const char* arg)
+{
+    const char* arg_val = rvvm_getarg(arg);
+    if (arg_val) {
+        return rvvm_strcmp(arg_val, "true");
+    }
+    return false;
+}
+
+int rvvm_getarg_int(const char* arg)
+{
+    const char* arg_val = rvvm_getarg(arg);
+    if (arg_val) {
+        return str_to_int_dec(arg_val);
+    }
+    return 0;
+}
+
+uint64_t rvvm_getarg_size(const char* arg)
+{
+    const char* arg_val = rvvm_getarg(arg);
+    if (arg_val) {
+        size_t len = 0;
+        uint64_t ret = str_to_int_base(arg_val, &len, 0);
+        return ret << mem_suffix_shift(arg_val[len]);
+    }
+    return 0;
+}
+
+/*
+ * Logger
+ */
+
+static int rvvm_loglevel = LOG_WARN;
+
+void rvvm_set_loglevel(int loglevel)
+{
+    rvvm_loglevel = loglevel;
+}
+
+static bool log_has_colors(void)
+{
+    return getenv("TERM") != NULL;
+}
+
+static void log_print(const char* prefix, const char* fmt, va_list args)
+{
+    char buffer[256] = {0};
+    size_t pos = rvvm_strlcpy(buffer, prefix, sizeof(buffer));
+    size_t vsp_size = sizeof(buffer) - EVAL_MIN(pos + 6, sizeof(buffer));
+    if (vsp_size > 1) {
+        int tmp = vsnprintf(buffer + pos, vsp_size, fmt, args);
+        if (tmp > 0) pos += EVAL_MIN(vsp_size - 1, (size_t)tmp);
+    }
+    rvvm_strlcpy(buffer + pos, log_has_colors() ? "\033[0m\n" : "\n", sizeof(buffer) - pos);
+    fputs(buffer, stderr);
+}
+
+#ifdef USE_DEBUG
+
+PRINT_FORMAT void rvvm_debug(const char* format_str, ...)
+{
+    if (rvvm_loglevel >= LOG_INFO) {
+        va_list args;
+        va_start(args, format_str);
+        log_print(log_has_colors() ? "\033[33;1mDEBUG\033[37;1m: " : "DEBUG: ", format_str, args);
+        va_end(args);
+    }
+}
+
+#endif
+
+PRINT_FORMAT void rvvm_info(const char* format_str, ...)
+{
+    if (rvvm_loglevel >= LOG_INFO) {
+        va_list args;
+        va_start(args, format_str);
+        log_print(log_has_colors() ? "\033[33;1mINFO\033[37;1m: " : "INFO: ", format_str, args);
+        va_end(args);
+    }
+}
+
+PRINT_FORMAT void rvvm_warn(const char* format_str, ...)
+{
+    if (rvvm_loglevel >= LOG_WARN) {
+        va_list args;
+        va_start(args, format_str);
+        log_print(log_has_colors() ? "\033[31;1mWARN\033[37;1m: " : "WARN: ", format_str, args);
+        va_end(args);
+    }
+}
+
+PRINT_FORMAT void rvvm_error(const char* format_str, ...)
+{
+    if (rvvm_loglevel >= LOG_ERROR) {
+        va_list args;
+        va_start(args, format_str);
+        log_print(log_has_colors() ? "\033[31;1mERROR\033[37;1m: " : "ERROR: ", format_str, args);
+        va_end(args);
+    }
+}
+
+PRINT_FORMAT void rvvm_fatal(const char* format_str, ...)
+{
+    va_list args;
+    va_start(args, format_str);
+    log_print(log_has_colors() ? "\033[31;1mFATAL\033[37;1m: " : "FATAL: ", format_str, args);
+    va_end(args);
+    stacktrace_print();
+    abort();
+}
+
+/*
+ * Initialization/deinitialization
+ */
+
+slow_path void do_once_finalize(uint32_t* ticket)
+{
+    while (atomic_load_uint32_ex(ticket, ATOMIC_ACQUIRE) != 2) {
+        sleep_ms(1);
+    }
+}
+
+typedef void (*deinit_func_t)(void);
+static vector_t(deinit_func_t) deinit_funcs = {0};
+static spinlock_t deinit_lock = {0};
+static bool deinit_happened = false;
+
+void call_at_deinit(void (*function)(void))
+{
+    bool call_func = false;
+
+    while (!spin_try_lock(&deinit_lock)) sleep_ms(1);
+    if (!deinit_happened) {
+        vector_push_back(deinit_funcs, function);
+    } else {
+        call_func = true;
+    }
+    spin_unlock(&deinit_lock);
+
+    if (call_func) {
+        function();
+    }
+}
+
+static deinit_func_t dequeue_func(void)
+{
+    deinit_func_t ret = NULL;
+
+    while (!spin_try_lock(&deinit_lock)) sleep_ms(1);
+    deinit_happened = true;
+    if (vector_size(deinit_funcs) == 0) {
+        vector_free(deinit_funcs);
+    } else {
+        size_t end = vector_size(deinit_funcs) - 1;
+        ret = vector_at(deinit_funcs, end);
+        vector_erase(deinit_funcs, end);
+    }
+    spin_unlock(&deinit_lock);
+    return ret;
+}
+
+GNU_DESTRUCTOR void full_deinit(void)
+{
+    rvvm_info("Fully deinitializing librvvm");
+    while (true) {
+        deinit_func_t func = dequeue_func();
+        if (func) {
+            func();
+        } else {
+            break;
+        }
     }
 }
