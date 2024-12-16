@@ -2,18 +2,9 @@
 riscv_mmu.h - RISC-V Memory Mapping Unit
 Copyright (C) 2021  LekKit <github.com/LekKit>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #ifndef RISCV_MMU_H
@@ -24,347 +15,354 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "mem_ops.h"
 #include "riscv_csr.h"
 
-#define MMU_VALID_PTE     0x1
-#define MMU_READ          0x2
-#define MMU_WRITE         0x4
-#define MMU_EXEC          0x8
-#define MMU_LEAF_PTE      0xA
-#define MMU_USER_USABLE   0x10
-#define MMU_GLOBAL_MAP    0x20
-#define MMU_PAGE_ACCESSED 0x40
-#define MMU_PAGE_DIRTY    0x80
+// MMU page access bits
+#define RISCV_MMU_READ     0x2
+#define RISCV_MMU_WRITE    0x4
+#define RISCV_MMU_EXEC     0x8
 
-#define MMU_PAGE_SHIFT    12
-#define MMU_PAGE_MASK     0xFFF
-#define MMU_PAGE_SIZE     0x1000
-#define MMU_PAGE_PNMASK   (~0xFFFULL)
+#define RISCV_PTE_VALID    0x1
+#define RISCV_PTE_LEAF     0xA
+#define RISCV_PTE_USER     0x10
+#define RISCV_PTE_GLOBAL   0x20
+#define RISCV_PTE_ACCESSED 0x40
+#define RISCV_PTE_DIRTY    0x80
 
-#define TLB_MASK          (TLB_SIZE-1)
-#define TLB_VADDR(vaddr)  (vaddr)
-//#define TLB_VADDR(vaddr)  ((vaddr) & PAGE_MASK) // we may remove vaddr offset if needed
+#define RISCV_PAGE_SHIFT   12
+#define RISCV_PAGE_MASK    0xFFF
+#define RISCV_PAGE_SIZE    0x1000
+#define RISCV_PAGE_PNMASK  (~0xFFFULL)
 
 // Init physical memory (be careful to not overlap MMIO regions!)
-bool riscv_init_ram(rvvm_ram_t* mem, phys_addr_t begin, phys_addr_t size);
+bool riscv_init_ram(rvvm_ram_t* mem, rvvm_addr_t base_addr, size_t size);
 void riscv_free_ram(rvvm_ram_t* mem);
 
-// Flush the TLB (on context switch, SFENCE.VMA, etc)
+// Flush the TLB (For SFENCE.VMA, etc)
 void riscv_tlb_flush(rvvm_hart_t* vm);
-void riscv_tlb_flush_page(rvvm_hart_t* vm, virt_addr_t addr);
+void riscv_tlb_flush_page(rvvm_hart_t* vm, rvvm_addr_t addr);
 
 #ifdef USE_JIT
 void riscv_jit_tlb_flush(rvvm_hart_t* vm);
 #endif
 
 /*
- * Non-inlined slow memory operations, perform MMU translation,
- * call MMIO handlers if needed.
+ * Slow memory access path which walks the MMU, calls MMIO handlers if needed.
  */
 
+#define RISCV_MMU_ATTR_NO_TRAP 0x100 // Never trap the CPU
+#define RISCV_MMU_ATTR_PHYS    0x200 // Translate into physical address and write to *data
+#define RISCV_MMU_ATTR_RMW     0x400 // Return direct pointer for RMW atomics, data is used for MMIO if non-NULL
+
+no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint32_t attr);
+
+static forceinline void* riscv_mmu_op_helper(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint32_t attr, uint8_t size, uint8_t access)
+{
+    return riscv_mmu_op_internal(vm, vaddr, data, (((uint32_t)size) << 16) | (attr & 0xFF00) | access);
+}
+
+static forceinline bool riscv_mmu_op(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint8_t size, uint8_t access)
+{
+    return !!riscv_mmu_op_helper(vm, vaddr, data, 0, size, access);
+}
+
 // Translate virtual address to physical with respect to current CPU mode
-bool riscv_mmu_translate(rvvm_hart_t* vm, virt_addr_t vaddr, phys_addr_t* paddr, uint8_t access);
-// Translate virtual address into VM pointer OR buff in case of RMW MMIO operation
-vmptr_t riscv_mmu_vma_translate(rvvm_hart_t* vm, virt_addr_t addr, void* buff, size_t size, uint8_t access);
-// Commit changes back to MMIO
-void riscv_mmu_vma_mmio_write(rvvm_hart_t* vm, virt_addr_t addr, void* buff, size_t size);
-
-// Fetch instruction from virtual address
-bool riscv_mmu_fetch_inst(rvvm_hart_t* vm, virt_addr_t addr, uint32_t* inst);
-
-// Load/store operations on virtual address (uses MMU translation)
-void riscv_mmu_load_u64(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_load_u32(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_load_s32(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_load_u16(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_load_s16(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_load_u8(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_load_s8(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-
-void riscv_mmu_store_u64(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_store_u32(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_store_u16(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_store_u8(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-
-#ifdef USE_FPU
-void riscv_mmu_load_double(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_load_float(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-
-void riscv_mmu_store_double(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-void riscv_mmu_store_float(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg);
-#endif
-
-// Alignment checks / fixup
-
-static inline bool riscv_block_in_page(virt_addr_t addr, size_t size)
+static forceinline bool riscv_mmu_virt_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, rvvm_addr_t* paddr, uint8_t access)
 {
-    return (addr & MMU_PAGE_MASK) + size <= MMU_PAGE_SIZE;
+    return !!riscv_mmu_op_helper(vm, vaddr, paddr, RISCV_MMU_ATTR_PHYS | RISCV_MMU_ATTR_NO_TRAP, 0, access);
 }
 
-static inline bool riscv_block_aligned(virt_addr_t addr, size_t size)
+// Translate virtual address into VM pointer for RMW atomics, data is used as MMIO bounce buffer
+static forceinline void* riscv_mmu_rmw_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, size_t size, uint8_t access)
 {
-    return (addr & (size - 1)) == 0;
+    return riscv_mmu_op_helper(vm, vaddr, data, RISCV_MMU_ATTR_RMW, size, access);
 }
 
-static inline virt_addr_t riscv_align_addr(virt_addr_t addr, size_t size)
+// Commit RMW changes back to MMIO
+static forceinline void riscv_rmw_mmio_write(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, size_t size)
 {
-    return addr & (~(virt_addr_t)(size - 1));
+    riscv_mmu_op_helper(vm, vaddr, data, RISCV_MMU_ATTR_NO_TRAP, size, RISCV_MMU_WRITE);
 }
 
 /*
- * Inlined TLB-cached memory operations (used for performance)
+ * Inlined TLB-cached memory operations (Used for performance)
  * Fall back to MMU functions if:
- *     Address is not TLB-cached (TLB miss/protection fault)
- *     Address misalign (optimized on hosts without misalign)
- *     MMIO is accessed (since MMIO regions aren't memory)
+ * - Address is not TLB-cached (TLB miss / possible pagefault)
+ * - Address misaligned
+ * - MMIO is accessed (Since MMIO regions aren't memory)
  */
 
-static forceinline bool riscv_fetch_inst(rvvm_hart_t* vm, virt_addr_t addr, uint32_t* inst)
+// Instruction fetch
+
+static forceinline bool riscv_fetch_insn(rvvm_hart_t* vm, rvvm_addr_t vaddr, uint32_t* insn)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].e == vpn)) {
-        *inst = read_uint16_le_m((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        if ((*inst & 0x3) == 0x3) {
-            // This is a 4-byte instruction, force tlb lookup again
-            vpn = (addr + 2) >> MMU_PAGE_SHIFT;
-            if (likely(vm->tlb[vpn & TLB_MASK].e == vpn)) {
-                *inst |= ((uint32_t)read_uint16_le_m((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr + 2)))) << 16;
+    rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    if (likely(vm->tlb[vpn & RVVM_TLB_MASK].e == vpn)) {
+        uint32_t tmp = read_uint16_le_m((void*)(size_t)(vm->tlb[vpn & RVVM_TLB_MASK].ptr + vaddr));
+        if ((tmp & 0x3) == 0x3) {
+            // This is a 4-byte instruction, fetch the next half
+            vpn = (vaddr + 2) >> RISCV_PAGE_SHIFT;
+            if (likely(vm->tlb[vpn & RVVM_TLB_MASK].e == vpn)) {
+                tmp |= ((uint32_t)read_uint16_le_m((void*)(size_t)(vm->tlb[vpn & RVVM_TLB_MASK].ptr + vaddr + 2))) << 16;
+                *insn = tmp;
                 return true;
             }
-        } else return true;
+        } else {
+            *insn = tmp;
+            return true;
+        }
     }
-    return riscv_mmu_fetch_inst(vm, addr, inst);
+    uint8_t buff[4] = {0};
+    if (unlikely(!riscv_mmu_op(vm, vaddr, buff, 2, RISCV_MMU_EXEC))) {
+        return false;
+    }
+    if ((buff[0] & 0x3) == 0x3) {
+        // This is a 4-byte instruction scattered between pages
+        // Fetch second part (may trigger a pagefault, that's the point)
+        if (unlikely(!riscv_mmu_op(vm, vaddr + 2, buff + 2, 2, RISCV_MMU_EXEC))) {
+            return false;
+        }
+    }
+    *insn = read_uint32_le_m(buff);
+    return true;
 }
 
-// VM Address translation (translated within single page bounds)
+// VM Address translation (May not span over page bounds!)
 
-static inline bool riscv_virt_translate_r(rvvm_hart_t* vm, virt_addr_t vaddr, phys_addr_t* paddr)
+static forceinline bool riscv_virt_translate_e(rvvm_hart_t* vm, rvvm_addr_t vaddr, rvvm_addr_t* paddr)
 {
-    virt_addr_t vpn = vaddr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn)) {
-        *paddr = vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(vaddr) - (size_t)vm->mem.data + vm->mem.begin;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->e == vpn)) {
+        *paddr = entry->ptr + vaddr - (size_t)vm->mem.data + vm->mem.addr;
         return true;
     }
-    return riscv_mmu_translate(vm, vaddr, paddr, MMU_READ);
+    return riscv_mmu_virt_translate(vm, vaddr, paddr, RISCV_MMU_EXEC);
 }
 
-static inline bool riscv_virt_translate_w(rvvm_hart_t* vm, virt_addr_t vaddr, phys_addr_t* paddr)
+static forceinline void* riscv_rmw_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* buff, size_t size)
 {
-    virt_addr_t vpn = vaddr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].w == vpn)) {
-        *paddr = vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(vaddr) - (size_t)vm->mem.data + vm->mem.begin;
-        return true;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->w == vpn)) {
+        return (void*)(size_t)(entry->ptr + vaddr);
     }
-    return riscv_mmu_translate(vm, vaddr, paddr, MMU_WRITE);
+    return riscv_mmu_rmw_translate(vm, vaddr, buff, size, RISCV_MMU_WRITE);
 }
-
-static inline bool riscv_virt_translate_e(rvvm_hart_t* vm, virt_addr_t vaddr, phys_addr_t* paddr)
-{
-    virt_addr_t vpn = vaddr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].e == vpn)) {
-        *paddr = vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(vaddr) - (size_t)vm->mem.data + vm->mem.begin;
-        return true;
-    }
-    return riscv_mmu_translate(vm, vaddr, paddr, MMU_EXEC);
-}
-
-static inline vmptr_t riscv_vma_translate_r(rvvm_hart_t* vm, virt_addr_t addr, void* buff, size_t size)
-{
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn)) {
-        return (vmptr_t)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr));
-    }
-    return riscv_mmu_vma_translate(vm, addr, buff, size, MMU_READ);
-}
-
-static inline vmptr_t riscv_vma_translate_w(rvvm_hart_t* vm, virt_addr_t addr, void* buff, size_t size)
-{
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].w == vpn)) {
-        return (vmptr_t)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr));
-    }
-    return riscv_mmu_vma_translate(vm, addr, buff, size, MMU_WRITE);
-}
-
-static inline vmptr_t riscv_vma_translate_e(rvvm_hart_t* vm, virt_addr_t addr, void* buff, size_t size)
-{
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].e == vpn)) {
-        return (vmptr_t)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr));
-    }
-    return riscv_mmu_vma_translate(vm, addr, buff, size, MMU_EXEC);
-}
-
-#ifdef USE_VMSWAP
-vmptr_t riscv_phys_translate(rvvm_hart_t* vm, phys_addr_t addr)
-#else
-static inline vmptr_t riscv_phys_translate(rvvm_hart_t* vm, phys_addr_t addr)
-{
-    if (likely(addr >= vm->mem.begin && (addr - vm->mem.begin) < vm->mem.size)) {
-        return vm->mem.data + (addr - vm->mem.begin);
-    }
-    return NULL;
-}
-#endif
 
 // Integer load operations
 
-static forceinline void riscv_load_u64(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_u64(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn && (addr & 7) == 0)) {
-        vm->registers[reg] = read_uint64_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn && !(vaddr & 7))) {
+        vm->registers[reg] = read_uint64_le((void*)(size_t)(entry->ptr + vaddr));
+    } else {
+        uint64_t tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            vm->registers[reg] = read_uint64_le(&tmp);
+        }
     }
-    riscv_mmu_load_u64(vm, addr, reg);
 }
 
-static forceinline void riscv_load_u32(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_u32(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn && (addr & 3) == 0)) {
-        vm->registers[reg] = read_uint32_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn && !(vaddr & 3))) {
+        vm->registers[reg] = read_uint32_le((void*)(size_t)(entry->ptr + vaddr));
+    } else {
+        uint32_t tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            vm->registers[reg] = read_uint32_le(&tmp);
+        }
     }
-    riscv_mmu_load_u32(vm, addr, reg);
 }
 
-static forceinline void riscv_load_s32(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_s32(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn && (addr & 3) == 0)) {
-        vm->registers[reg] = (int32_t)read_uint32_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn && !(vaddr & 3))) {
+        vm->registers[reg] = (int32_t)read_uint32_le((void*)(size_t)(entry->ptr + vaddr));
+    } else {
+        uint32_t tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            vm->registers[reg] = (int32_t)read_uint32_le(&tmp);
+        }
     }
-    riscv_mmu_load_s32(vm, addr, reg);
 }
 
-static forceinline void riscv_load_u16(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_u16(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn && (addr & 1) == 0)) {
-        vm->registers[reg] = read_uint16_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn && !(vaddr & 1))) {
+        vm->registers[reg] = read_uint16_le((void*)(size_t)(entry->ptr + vaddr));
+    } else {
+        uint16_t tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            vm->registers[reg] = read_uint16_le(&tmp);
+        }
     }
-    riscv_mmu_load_u16(vm, addr, reg);
 }
 
-static forceinline void riscv_load_s16(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_s16(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn && (addr & 1) == 0)) {
-        vm->registers[reg] = (int16_t)read_uint16_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn && !(vaddr & 1))) {
+        vm->registers[reg] = (int16_t)read_uint16_le((void*)(size_t)(entry->ptr + vaddr));
+    } else {
+        uint16_t tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            vm->registers[reg] = (int16_t)read_uint16_le(&tmp);
+        }
     }
-    riscv_mmu_load_s16(vm, addr, reg);
 }
 
-static forceinline void riscv_load_u8(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_u8(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn)) {
-        vm->registers[reg] = read_uint8((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn)) {
+        vm->registers[reg] = read_uint8((void*)(size_t)(entry->ptr + vaddr));
+    } else {
+        uint8_t tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            vm->registers[reg] = tmp;
+        }
     }
-    riscv_mmu_load_u8(vm, addr, reg);
 }
 
-static forceinline void riscv_load_s8(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_s8(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn)) {
-        vm->registers[reg] = (int8_t)read_uint8((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn)) {
+        vm->registers[reg] = (int8_t)read_uint8((void*)(size_t)(entry->ptr + vaddr));
+    } else {
+        uint8_t tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            vm->registers[reg] = (int8_t)tmp;
+        }
     }
-    riscv_mmu_load_s8(vm, addr, reg);
 }
 
 // Integer store operations
 
-static forceinline void riscv_store_u64(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_store_u64(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].w == vpn && (addr & 7) == 0)) {
-        write_uint64_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)), vm->registers[reg]);
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->w == vpn && !(vaddr & 7))) {
+        write_uint64_le((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+    } else {
+        uint64_t tmp;
+        write_uint64_le_m(&tmp, vm->registers[reg]);
+        riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_WRITE);
     }
-    riscv_mmu_store_u64(vm, addr, reg);
 }
 
-static forceinline void riscv_store_u32(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_store_u32(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].w == vpn && (addr & 3) == 0)) {
-        write_uint32_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)), vm->registers[reg]);
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->w == vpn && !(vaddr & 3))) {
+        write_uint32_le((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+    } else {
+        uint32_t tmp;
+        write_uint32_le_m(&tmp, vm->registers[reg]);
+        riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_WRITE);
     }
-    riscv_mmu_store_u32(vm, addr, reg);
 }
 
-static forceinline void riscv_store_u16(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_store_u16(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].w == vpn && (addr & 1) == 0)) {
-        write_uint16_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)), vm->registers[reg]);
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->w == vpn && !(vaddr & 1))) {
+        write_uint16_le((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+    } else {
+        uint16_t tmp;
+        write_uint16_le_m(&tmp, vm->registers[reg]);
+        riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_WRITE);
     }
-    riscv_mmu_store_u16(vm, addr, reg);
 }
 
-static forceinline void riscv_store_u8(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_store_u8(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].w == vpn)) {
-        write_uint8((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)), vm->registers[reg]);
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->w == vpn)) {
+        write_uint8((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+    } else {
+        uint8_t tmp = vm->registers[reg];
+        riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_WRITE);
     }
-    riscv_mmu_store_u8(vm, addr, reg);
 }
 
 #ifdef USE_FPU
 
 // FPU load operations
 
-static forceinline void riscv_load_double(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_double(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn && (addr & 7) == 0)) {
-        vm->fpu_registers[reg] = read_double_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)));
-        fpu_set_fs(vm, FS_DIRTY);
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn && !(vaddr & 7))) {
+        vm->fpu_registers[reg] = read_double_le((void*)(size_t)(entry->ptr + vaddr));
+        riscv_fpu_set_dirty(vm);
+    } else {
+        double tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            vm->fpu_registers[reg] = read_double_le_m(&tmp);
+            riscv_fpu_set_dirty(vm);
+        }
     }
-    riscv_mmu_load_double(vm, addr, reg);
 }
 
-static forceinline void riscv_load_float(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_load_float(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].r == vpn && (addr & 3) == 0)) {
-        write_float_nanbox(&vm->fpu_registers[reg], read_float_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr))));
-        fpu_set_fs(vm, FS_DIRTY);
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn && !(vaddr & 3))) {
+        write_float_nanbox(&vm->fpu_registers[reg], read_float_le((void*)(size_t)(entry->ptr + vaddr)));
+        riscv_fpu_set_dirty(vm);
+    } else {
+        float tmp;
+        if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
+            write_float_nanbox(&vm->fpu_registers[reg], read_float_le_m(&tmp));
+            riscv_fpu_set_dirty(vm);
+        }
     }
-    riscv_mmu_load_float(vm, addr, reg);
 }
 
 // FPU store operations
 
-static forceinline void riscv_store_double(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_store_double(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].w == vpn && (addr & 7) == 0)) {
-        write_double_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)), vm->fpu_registers[reg]);
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->w == vpn && !(vaddr & 7))) {
+        write_double_le((void*)(size_t)(entry->ptr + vaddr), vm->fpu_registers[reg]);
+    } else {
+        double tmp;
+        write_double_le_m(&tmp, vm->fpu_registers[reg]);
+        riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_WRITE);
     }
-    riscv_mmu_store_double(vm, addr, reg);
 }
 
-static forceinline void riscv_store_float(rvvm_hart_t* vm, virt_addr_t addr, regid_t reg)
+static forceinline void riscv_store_float(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_t reg)
 {
-    virt_addr_t vpn = addr >> MMU_PAGE_SHIFT;
-    if (likely(vm->tlb[vpn & TLB_MASK].w == vpn && (addr & 3) == 0)) {
-        write_float_le((void*)(size_t)(vm->tlb[vpn & TLB_MASK].ptr + TLB_VADDR(addr)), read_float_nanbox(&vm->fpu_registers[reg]));
-        return;
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->w == vpn && !(vaddr & 3))) {
+        write_float_le((void*)(size_t)(entry->ptr + vaddr), read_float_nanbox(&vm->fpu_registers[reg]));
+    } else {
+        float tmp;
+        write_float_le_m(&tmp, read_float_nanbox(&vm->fpu_registers[reg]));
+        riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_WRITE);
     }
-    riscv_mmu_store_float(vm, addr, reg);
 }
 
 #endif
