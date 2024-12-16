@@ -345,16 +345,16 @@ int32_t rvwrite_chunk(rvfile_t* file, const void* src, size_t size, uint64_t off
     return ret;
 }
 
-size_t rvwrite(rvfile_t* file, const void* source, size_t count, uint64_t offset)
+size_t rvwrite(rvfile_t* file, const void* src, size_t size, uint64_t offset)
 {
-    if (!file || count == 0) return 0;
+    if (!file || size == 0) return 0;
     uint64_t pos = (offset == RVFILE_CUR) ? rvtell(file) : offset;
-    const uint8_t* buffer = source;
+    const uint8_t* buffer = src;
     size_t ret = 0;
 
-    while (ret < count) {
-        size_t size = EVAL_MIN(count - ret, RVFILE_MAX_BUFF);
-        int32_t tmp = rvwrite_chunk(file, buffer + ret, size, pos + ret);
+    while (ret < size) {
+        size_t chunk_size = EVAL_MIN(size - ret, RVFILE_MAX_BUFF);
+        int32_t tmp = rvwrite_chunk(file, buffer + ret, chunk_size, pos + ret);
         if (tmp > 0) {
             ret += tmp;
         } else if (tmp == 0) {
@@ -368,18 +368,18 @@ size_t rvwrite(rvfile_t* file, const void* source, size_t count, uint64_t offset
     return ret;
 }
 
-bool rvtrim(rvfile_t* file, uint64_t offset, uint64_t count)
+bool rvtrim(rvfile_t* file, uint64_t offset, uint64_t size)
 {
     if (!file) return false;
 #if defined(POSIX_FILE_IMPL) && defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
-    return fallocate(file->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, count) == 0;
+    return fallocate(file->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) == 0;
 #elif defined(POSIX_FILE_IMPL) && defined(__FreeBSD__) && defined(SYS_fspacectl)
     struct {
         off_t r_offset;
         off_t r_len;
     } rmsr = {
         .r_offset = offset,
-        .r_len = count,
+        .r_len = size,
     };
     // Use fspacectl(SPACECTL_DEALLOC) added in FreeBSD 14
     return syscall(SYS_fspacectl, file->fd, 1, &rmsr, 0, NULL) == 0;
@@ -387,12 +387,12 @@ bool rvtrim(rvfile_t* file, uint64_t offset, uint64_t count)
     SET_ZERO_DATA_INFO fz = {0};
     DWORD tmp = 0;
     fz.FileOffset.QuadPart = offset;
-    fz.BeyondFinalZero.QuadPart = offset + count;
+    fz.BeyondFinalZero.QuadPart = offset + size;
     return DeviceIoControl(file->handle, DEVIOCTL_SET_ZERO_DATA, &fz, sizeof(fz), NULL, 0 , &tmp, NULL);
 #else
     UNUSED(file);
     UNUSED(offset);
-    UNUSED(count);
+    UNUSED(size);
     return false;
 #endif
 }
