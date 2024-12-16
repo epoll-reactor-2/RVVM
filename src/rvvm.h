@@ -28,174 +28,194 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "rvjit/rvjit.h"
 #endif
 
-#define TLB_SIZE 256  // Always nonzero, power of 2 (32, 64..)
-BUILD_ASSERT(TLB_SIZE && !((TLB_SIZE - 1) & TLB_SIZE));
+#define RVVM_TLB_SIZE 256  // Always nonzero & power of 2 (32, 64..)
+#define RVVM_TLB_MASK (RVVM_TLB_SIZE - 1)
 
-#define REGISTER_ZERO 0
-#define REGISTER_X0   0
-#define REGISTER_X1   1
-#define REGISTER_X2   2
-#define REGISTER_X3   3
-#define REGISTER_X4   4
-#define REGISTER_X5   5
-#define REGISTER_X6   6
-#define REGISTER_X7   7
-#define REGISTER_X8   8
-#define REGISTER_X9   9
-#define REGISTER_X10  10
-#define REGISTER_X11  11
-#define REGISTER_X12  12
-#define REGISTER_X13  13
-#define REGISTER_X14  14
-#define REGISTER_X15  15
-#define REGISTER_X16  16
-#define REGISTER_X17  17
-#define REGISTER_X18  18
-#define REGISTER_X19  19
-#define REGISTER_X20  20
-#define REGISTER_X21  21
-#define REGISTER_X22  22
-#define REGISTER_X23  23
-#define REGISTER_X24  24
-#define REGISTER_X25  25
-#define REGISTER_X26  26
-#define REGISTER_X27  27
-#define REGISTER_X28  28
-#define REGISTER_X29  29
-#define REGISTER_X30  30
-#define REGISTER_X31  31
-#define REGISTER_PC   32
+BUILD_ASSERT(RVVM_TLB_SIZE);
+BUILD_ASSERT(!((RVVM_TLB_SIZE - 1) & RVVM_TLB_SIZE));
 
-#define REGISTERS_MAX 33
-#define FPU_REGISTERS_MAX 32
+#define RISCV_REG_ZERO 0
+#define RISCV_REG_X0   0
+#define RISCV_REG_X1   1
+#define RISCV_REG_X2   2
+#define RISCV_REG_X3   3
+#define RISCV_REG_X4   4
+#define RISCV_REG_X5   5
+#define RISCV_REG_X6   6
+#define RISCV_REG_X7   7
+#define RISCV_REG_X8   8
+#define RISCV_REG_X9   9
+#define RISCV_REG_X10  10
+#define RISCV_REG_X11  11
+#define RISCV_REG_X12  12
+#define RISCV_REG_X13  13
+#define RISCV_REG_X14  14
+#define RISCV_REG_X15  15
+#define RISCV_REG_X16  16
+#define RISCV_REG_X17  17
+#define RISCV_REG_X18  18
+#define RISCV_REG_X19  19
+#define RISCV_REG_X20  20
+#define RISCV_REG_X21  21
+#define RISCV_REG_X22  22
+#define RISCV_REG_X23  23
+#define RISCV_REG_X24  24
+#define RISCV_REG_X25  25
+#define RISCV_REG_X26  26
+#define RISCV_REG_X27  27
+#define RISCV_REG_X28  28
+#define RISCV_REG_X29  29
+#define RISCV_REG_X30  30
+#define RISCV_REG_X31  31
+#define RISCV_REG_PC   32
 
-#define PRIVILEGE_USER       0
-#define PRIVILEGE_SUPERVISOR 1 // VS-mode supervisor
-#define PRIVILEGE_HYPERVISOR 2 // HS-mode supervisor
-#define PRIVILEGE_MACHINE    3
+#define RISCV_REGS_MAX 33
+#define RISCV_FPU_REGS_MAX 32
 
-#define PRIVILEGES_MAX       4
+#define RISCV_PRIV_USER       0
+#define RISCV_PRIV_SUPERVISOR 1
+#define RISCV_PRIV_HYPERVISOR 2
+#define RISCV_PRIV_MACHINE    3
 
-#define INTERRUPT_USOFTWARE    0x0
-#define INTERRUPT_SSOFTWARE    0x1
-#define INTERRUPT_MSOFTWARE    0x3
-#define INTERRUPT_UTIMER       0x4
-#define INTERRUPT_STIMER       0x5
-#define INTERRUPT_MTIMER       0x7
-#define INTERRUPT_UEXTERNAL    0x8
-#define INTERRUPT_SEXTERNAL    0x9
-#define INTERRUPT_MEXTERNAL    0xB
+#define RISCV_PRIVS_MAX       4
 
-#define TRAP_INSTR_MISALIGN    0x0
-#define TRAP_INSTR_FETCH       0x1
-#define TRAP_ILL_INSTR         0x2
-#define TRAP_BREAKPOINT        0x3
-#define TRAP_LOAD_MISALIGN     0x4
-#define TRAP_LOAD_FAULT        0x5
-#define TRAP_STORE_MISALIGN    0x6
-#define TRAP_STORE_FAULT       0x7
-#define TRAP_ENVCALL_UMODE     0x8
-#define TRAP_ENVCALL_SMODE     0x9
-#define TRAP_ENVCALL_MMODE     0xB
-#define TRAP_INSTR_PAGEFAULT   0xC
-#define TRAP_LOAD_PAGEFAULT    0xD
-#define TRAP_STORE_PAGEFAULT   0xF
+#define RISCV_INTERRUPT_SSOFTWARE    0x1 // S-mode Software Interrupt (ACLINT-SSWI)
+#define RISCV_INTERRUPT_MSOFTWARE    0x3 // M-mode Software Interrupt (ACLINT-MSWI)
+#define RISCV_INTERRUPT_STIMER       0x5 // S-mode Timer Interrupt (Sstc)
+#define RISCV_INTERRUPT_MTIMER       0x7 // M-mode Timer Interrupt (ACLINT-MTIMER)
+#define RISCV_INTERRUPT_SEXTERNAL    0x9 // S-mode External Interrupt (PLIC)
+#define RISCV_INTERRUPT_MEXTERNAL    0xB // M-mode External Interrupt (PLIC)
+#define RISCV_INTERRUPT_COUNTER_OVF  0xD // Local Counter Overflow (Sscofpmf)
+
+#define RISCV_TRAP_INSN_MISALIGN     0x0 // Instruction Misaligned
+#define RISCV_TRAP_INSN_FETCH        0x1 // Instruction Fetch Fault
+#define RISCV_TRAP_ILL_INSN          0x2 // Illegal Instruction
+#define RISCV_TRAP_BREAKPOINT        0x3 // Software Breakpoint
+#define RISCV_TRAP_LOAD_MISALIGN     0x4 // Load Misaligned
+#define RISCV_TRAP_LOAD_FAULT        0x5 // Load Fault
+#define RISCV_TRAP_STORE_MISALIGN    0x6 // Store Misaligned
+#define RISCV_TRAP_STORE_FAULT       0x7 // Store Fault
+#define RISCV_TRAP_ECALL_UMODE       0x8 // Environment call from U-mode
+#define RISCV_TRAP_ECALL_SMODE       0x9 // Environment call from S-mode
+#define RISCV_TRAP_ECALL_MMODE       0xB // Environment call from M-mode
+#define RISCV_TRAP_INSN_PAGEFAULT    0xC // Instruction fetch pagefault
+#define RISCV_TRAP_LOAD_PAGEFAULT    0xD // Load pagefault
+#define RISCV_TRAP_STORE_PAGEFAULT   0xF // Store pagefault
+
+#ifdef USE_RV64
+
+typedef uint64_t rvvm_uxlen_t;
+typedef int64_t  rvvm_sxlen_t;
+
+#else
+
+typedef uint32_t rvvm_uxlen_t;
+typedef int32_t  rvvm_sxlen_t;
+
+#endif
 
 /*
  * Address translation cache
  * In future, it would be nice to verify if cache-line alignment
  * gives any profit (entries scattered between cachelines waste L1)
  */
+
 typedef struct {
-    // Pointer to page (with vaddr subtracted? faster tlb translation)
+    // Pointer to page (With vaddr subtracted, for faster TLB translation)
     size_t ptr;
-    // Make entry size a power of 2 (32 or 16 bytes)
-#if !defined(HOST_64BIT) && defined(USE_RV64)
+#if !defined(HOST_64BIT)
+    // Make entry size a power of 2 (32 bytes)
     size_t align;
 #endif
     // Virtual page number per each op type (vaddr >> 12)
-    virt_addr_t r;
-    virt_addr_t w;
-    virt_addr_t e;
-#if defined(HOST_64BIT) && !defined(USE_RV64)
-    virt_addr_t align[3];
-#endif
+    rvvm_addr_t r;
+    rvvm_addr_t w;
+    rvvm_addr_t e;
 } rvvm_tlb_entry_t;
 
 #ifdef USE_JIT
+
 typedef struct {
     // Pointer to code block
     rvjit_func_t block;
-#if !defined(HOST_64BIT) && defined(USE_RV64)
+#if !defined(HOST_64BIT)
     size_t align;
 #endif
     // Virtual PC of this entry
-    virt_addr_t pc;
-#if defined(HOST_64BIT) && !defined(USE_RV64)
-    virt_addr_t align;
-#endif
-} rvvm_jtlb_entry_t;
+    rvvm_addr_t pc;
+} rvvm_jit_tlb_entry_t;
+
+BUILD_ASSERT(sizeof(rvvm_tlb_entry_t) == 32);
+BUILD_ASSERT(sizeof(rvvm_jit_tlb_entry_t) == 16);
+
 #endif
 
 typedef struct {
-    phys_addr_t begin; // First usable address in physical memory
-    phys_addr_t size;  // Memory amount (since the region may be empty)
-    vmptr_t data;      // Pointer to memory data
+    rvvm_addr_t addr; // Physical memory base address (Should be page-aligned)
+    size_t      size; // Physical memory amount (Should be page-aligned)
+    void*       data; // Pointer to memory data (Preferably page-aligned)
 } rvvm_ram_t;
 
 struct rvvm_hart_t {
-    uint32_t wait_event;
-    maxlen_t registers[REGISTERS_MAX];
+    uint32_t running;
+
+    rvvm_uxlen_t registers[RISCV_REGS_MAX];
 #ifdef USE_FPU
-    double fpu_registers[FPU_REGISTERS_MAX];
+    double fpu_registers[RISCV_FPU_REGS_MAX];
 #endif
 
     // We want short offsets from vmptr to tlb
-    rvvm_tlb_entry_t tlb[TLB_SIZE];
+    rvvm_tlb_entry_t tlb[RVVM_TLB_SIZE];
 #ifdef USE_JIT
-    rvvm_jtlb_entry_t jtlb[TLB_SIZE];
+    rvvm_jit_tlb_entry_t jtlb[RVVM_TLB_SIZE];
 #endif
+
+    // Everything below here isn't accessed by JIT
     rvvm_ram_t mem;
     rvvm_machine_t* machine;
-    phys_addr_t root_page_table;
+    rvvm_addr_t root_page_table;
     uint8_t mmu_mode;
     uint8_t priv_mode;
     bool rv64;
+
     bool trap;
-    maxlen_t trap_pc;
+    rvvm_addr_t trap_pc;
 
     bool userland;
 
-    uint32_t lrsc;
-    maxlen_t lrsc_cas;
+    bool lrsc;
+    rvvm_uxlen_t lrsc_addr;
+    rvvm_uxlen_t lrsc_cas;
 
     struct {
-        maxlen_t hartid;
-        maxlen_t isa;
-        maxlen_t status;
-        maxlen_t fcsr;
+        uint32_t     fcsr;
+        uint32_t     hartid;
+        rvvm_uxlen_t status;
 
-        maxlen_t ie;
-        maxlen_t ip;
+        rvvm_uxlen_t ie;
+        rvvm_uxlen_t ip;
 
-        maxlen_t edeleg[PRIVILEGES_MAX];
-        maxlen_t ideleg[PRIVILEGES_MAX];
-        maxlen_t tvec[PRIVILEGES_MAX];
-        maxlen_t scratch[PRIVILEGES_MAX];
-        maxlen_t epc[PRIVILEGES_MAX];
-        maxlen_t cause[PRIVILEGES_MAX];
-        maxlen_t tval[PRIVILEGES_MAX];
-        maxlen_t counteren[PRIVILEGES_MAX];
-        uint64_t envcfg[PRIVILEGES_MAX];
-        uint64_t mseccfg;
+        rvvm_uxlen_t isa;
+
+        rvvm_uxlen_t edeleg[RISCV_PRIVS_MAX];
+        rvvm_uxlen_t ideleg[RISCV_PRIVS_MAX];
+        rvvm_uxlen_t tvec[RISCV_PRIVS_MAX];
+        rvvm_uxlen_t scratch[RISCV_PRIVS_MAX];
+        rvvm_uxlen_t epc[RISCV_PRIVS_MAX];
+        rvvm_uxlen_t cause[RISCV_PRIVS_MAX];
+        rvvm_uxlen_t tval[RISCV_PRIVS_MAX];
+
+        rvvm_uxlen_t counteren[RISCV_PRIVS_MAX];
+        uint64_t     envcfg[RISCV_PRIVS_MAX];
+        uint64_t     mseccfg;
     } csr;
 
 #ifdef USE_JIT
     rvjit_block_t jit;
     bool jit_enabled;
     bool jit_compiling;
-    bool block_ends;
-    bool ldst_trace;
+    bool jit_block_ends;
+    bool jit_skip_exec;
 #endif
 
     thread_ctx_t* thread;
