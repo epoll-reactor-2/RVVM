@@ -2,18 +2,9 @@
 riscv_csr.h - RISC-V Control and Status Registers
 Copyright (C) 2021  LekKit <github.com/LekKit>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #ifndef RISCV_CSR_H
@@ -199,11 +190,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define CSR_MSECCFG_USEED (1ULL << 8)
 #define CSR_MSECCFG_SSEED (1ULL << 9)
 
-#define CSR_SATP_MODE_PHYS   0
-#define CSR_SATP_MODE_SV32   1
-#define CSR_SATP_MODE_SV39   8
-#define CSR_SATP_MODE_SV48   9
-#define CSR_SATP_MODE_SV57   10
+#define CSR_SATP_MODE_BARE 0x0
+#define CSR_SATP_MODE_SV32 0x1
+#define CSR_SATP_MODE_SV39 0x8
+#define CSR_SATP_MODE_SV48 0x9
+#define CSR_SATP_MODE_SV57 0xA
 
 #define CSR_MISA_RV32  0x40000000U
 #define CSR_MISA_RV64  0x8000000000000000ULL
@@ -213,6 +204,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 /*
  * CSR Masks (For WARL behavior of CSRs)
  */
+
+#define CSR_FFLAGS_MASK 0x1F
+#define CSR_FRM_MASK    0x7
+#define CSR_FCSR_MASK   0xFF
 
 #define CSR_MSTATUS_MASK 0xF007FFFAAULL
 #define CSR_SSTATUS_MASK 0x3000DE7A2ULL
@@ -235,10 +230,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
  * FPU control stuff
  */
 
-#define FS_OFF      0
-#define FS_INITIAL  1
-#define FS_CLEAN    2
-#define FS_DIRTY    3
+#define FS_OFF     0x0
+#define FS_INITIAL 0x1
+#define FS_CLEAN   0x2
+#define FS_DIRTY   0x3
 
 #define FFLAG_NX (1 << 0) // Inexact
 #define FFLAG_UF (1 << 1) // Undeflow
@@ -246,27 +241,24 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define FFLAG_DZ (1 << 3) // Divide by zero
 #define FFLAG_NV (1 << 4) // Invalid operation
 
-#define RM_RNE 0 // Round to nearest, ties to even
-#define RM_RTZ 1 // Round to zero
-#define RM_RDN 2 // Round down - towards -inf
-#define RM_RUP 3 // Round up - towards +inf
-#define RM_RMM 4 // Round to nearest, ties to max magnitude
-#define RM_DYN 7 // Round to instruction's rm field
-#define RM_INVALID 255 // Invalid rounding mode was specified - should cause a trap
+#define RM_RNE 0x0 // Round to nearest, ties to even
+#define RM_RTZ 0x1 // Round to zero
+#define RM_RDN 0x2 // Round down - towards -inf
+#define RM_RUP 0x3 // Round up - towards +inf
+#define RM_RMM 0x4 // Round to nearest, ties to max magnitude
+#define RM_DYN 0x7 // Round to instruction's rm field
+#define RM_INVALID 0xFF // Invalid rounding mode was specified - should cause a trap
 
-static forceinline bool fpu_is_enabled(rvvm_hart_t* vm)
+static forceinline bool riscv_fpu_is_enabled(rvvm_hart_t* vm)
 {
     return bit_cut(vm->csr.status, 13, 2) != FS_OFF;
 }
 
-static forceinline void fpu_set_fs(rvvm_hart_t* vm, uint8_t value)
+static forceinline void riscv_fpu_set_dirty(rvvm_hart_t* vm)
 {
-#ifdef USE_PRECISE_FS
-    vm->csr.status = bit_replace(vm->csr.status, 13, 2, value);
-#else
-    UNUSED(vm);
-    UNUSED(value);
-#endif
+    if (unlikely(bit_cut(vm->csr.status, 13, 2) != FS_DIRTY)) {
+        vm->csr.status |= (FS_DIRTY << 13);
+    }
 }
 
 /*
@@ -274,73 +266,77 @@ static forceinline void fpu_set_fs(rvvm_hart_t* vm, uint8_t value)
  */
 
 // Get minimal privilege mode to access CSR
-static inline uint8_t riscv_csr_privilege(uint32_t csr_id)
+static forceinline uint8_t riscv_csr_privilege(uint32_t csr_id)
 {
     return bit_cut(csr_id, 8, 2);
 }
 
 // Check whether writes are illegal for this CSR
-static inline bool riscv_csr_readonly(uint32_t csr_id)
+static forceinline bool riscv_csr_readonly(uint32_t csr_id)
 {
     return bit_cut(csr_id, 10, 2) == 0x3;
 }
 
 // Perform a CSR operation, set *dest to original CSR value
 // Returns false on failure (To raise exception afterwards)
-bool riscv_csr_op(rvvm_hart_t* vm, uint32_t csr_id, maxlen_t* dest, uint8_t op);
+bool riscv_csr_op(rvvm_hart_t* vm, uint32_t csr_id, rvvm_uxlen_t* dest, uint8_t op);
 
+// Initialize CSRs on a new hart
 void riscv_csr_init(rvvm_hart_t* vm);
+
+// Synchronize hart FPU CSR state with hart thread on thread creation/destruction
+void riscv_csr_sync_fpu(rvvm_hart_t* vm);
 
 /*
  * Feature enablement checks
  */
 
-static inline bool riscv_csr_envcfg_enabled(rvvm_hart_t* vm, uint64_t mask)
+static forceinline bool riscv_csr_envcfg_enabled(rvvm_hart_t* vm, uint64_t mask)
 {
-    if (vm->priv_mode < PRIVILEGE_MACHINE) mask &= vm->csr.envcfg[PRIVILEGE_MACHINE];
+    if (vm->priv_mode < RISCV_PRIV_MACHINE) mask &= vm->csr.envcfg[RISCV_PRIV_MACHINE];
     // TODO: henvcfg delegation?
-    if (vm->priv_mode < PRIVILEGE_SUPERVISOR) mask &= vm->csr.envcfg[PRIVILEGE_SUPERVISOR];
+    if (vm->priv_mode < RISCV_PRIV_SUPERVISOR) mask &= vm->csr.envcfg[RISCV_PRIV_SUPERVISOR];
     return !!mask;
 }
 
-static inline bool riscv_csr_counter_enabled(rvvm_hart_t* vm, uint32_t mask)
+static forceinline bool riscv_csr_counter_enabled(rvvm_hart_t* vm, uint32_t mask)
 {
-    if (vm->priv_mode < PRIVILEGE_MACHINE) mask &= vm->csr.counteren[PRIVILEGE_MACHINE];
+    if (vm->priv_mode < RISCV_PRIV_MACHINE) mask &= vm->csr.counteren[RISCV_PRIV_MACHINE];
     // TODO: hcounteren delegation?
-    if (vm->priv_mode < PRIVILEGE_SUPERVISOR) mask &= vm->csr.counteren[PRIVILEGE_SUPERVISOR];
+    if (vm->priv_mode < RISCV_PRIV_SUPERVISOR) mask &= vm->csr.counteren[RISCV_PRIV_SUPERVISOR];
     return !!mask;
 }
 
-static inline bool riscv_csr_timer_enabled(rvvm_hart_t* vm)
+static forceinline bool riscv_csr_timer_enabled(rvvm_hart_t* vm)
 {
     return riscv_csr_counter_enabled(vm, CSR_COUNTEREN_TM);
 }
 
-static inline bool riscv_csr_seed_enabled(rvvm_hart_t* vm)
+static forceinline bool riscv_csr_seed_enabled(rvvm_hart_t* vm)
 {
-    if (vm->priv_mode == PRIVILEGE_USER) {
+    if (vm->priv_mode == RISCV_PRIV_USER) {
         return !!(vm->csr.mseccfg & CSR_MSECCFG_USEED);
-    } else if (vm->priv_mode < PRIVILEGE_MACHINE) {
+    } else if (vm->priv_mode < RISCV_PRIV_MACHINE) {
         return !!(vm->csr.mseccfg & CSR_MSECCFG_SSEED);
     } else return true;
 }
 
-static inline bool riscv_csr_cbi_enabled(rvvm_hart_t* vm)
+static forceinline bool riscv_csr_cbi_enabled(rvvm_hart_t* vm)
 {
     return riscv_csr_envcfg_enabled(vm, CSR_ENVCFG_CBIE);
 }
 
-static inline bool riscv_csr_cbcf_enabled(rvvm_hart_t* vm)
+static forceinline bool riscv_csr_cbcf_enabled(rvvm_hart_t* vm)
 {
     return riscv_csr_envcfg_enabled(vm, CSR_ENVCFG_CBCFE);
 }
 
-static inline bool riscv_csr_cbz_enabled(rvvm_hart_t* vm)
+static forceinline bool riscv_csr_cbz_enabled(rvvm_hart_t* vm)
 {
     return riscv_csr_envcfg_enabled(vm, CSR_ENVCFG_CBZE);
 }
 
-static inline bool riscv_csr_sstc_enabled(rvvm_hart_t* vm)
+static forceinline bool riscv_csr_sstc_enabled(rvvm_hart_t* vm)
 {
     return riscv_csr_envcfg_enabled(vm, CSR_ENVCFG_STCE);
 }
