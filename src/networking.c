@@ -26,6 +26,7 @@ typedef int net_addrlen_t;
 #include <sys/select.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
