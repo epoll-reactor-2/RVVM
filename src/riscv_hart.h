@@ -73,6 +73,9 @@ void riscv_update_xlen(rvvm_hart_t* vm);
 // Traps the hart. Should be the last operation before returning to dispatch.
 void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval);
 
+// Execute a breakpoint. Reports each breakpoint to GDB stub once
+void riscv_breakpoint(rvvm_hart_t* vm);
+
 /*
  * Running the hart
  */

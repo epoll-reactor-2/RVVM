@@ -7,15 +7,17 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
+#include "bit_ops.h"
+#include "atomics.h"
+#include "threading.h"
+#include "gdbstub.h"
+
 #include "rvvm_isolation.h"
 #include "riscv_hart.h"
 #include "riscv_mmu.h"
 #include "riscv_csr.h"
 #include "riscv_priv.h"
 #include "riscv_cpu.h"
-#include "threading.h"
-#include "atomics.h"
-#include "bit_ops.h"
 
 // Valid vm->pending_events bits deliverable to the hart
 #define HART_EVENT_PAUSE   0x1 // Pause the hart in a consistent state
@@ -142,6 +144,14 @@ static void riscv_trap_priv_helper(rvvm_hart_t* vm, uint8_t target_priv)
     }
 }
 
+static inline void riscv_restart_at_pc(rvvm_hart_t* vm, rvvm_uxlen_t pc)
+{
+    vm->trap_pc = pc;
+    vm->trap = true;
+    riscv_restart_dispatch(vm);
+
+}
+
 void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval)
 {
     if (unlikely(vm->trap)) {
@@ -160,6 +170,7 @@ void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval)
         vm->csr.cause[RISCV_PRIV_USER] = cause;
         vm->csr.tval[RISCV_PRIV_USER] = tval;
         vm->trap_pc = vm->registers[RISCV_REG_PC];
+        riscv_restart_at_pc(vm, vm->registers[RISCV_REG_PC]);
     } else {
         // Target privilege mode
         uint8_t priv = RISCV_PRIV_MACHINE;
@@ -172,12 +183,22 @@ void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval)
         // Modify exception stack in csr.status
         riscv_trap_priv_helper(vm, priv);
         // Jump to trap vector, switch to target priv
-        vm->trap_pc = vm->csr.tvec[priv] & (~3ULL);
         riscv_switch_priv(vm, priv);
+        riscv_restart_at_pc(vm, vm->csr.tvec[priv] & (~3ULL));
     }
+}
 
-    vm->trap = true;
-    riscv_restart_dispatch(vm);
+void riscv_breakpoint(rvvm_hart_t* vm)
+{
+    if (vm->machine->gdbstub) {
+        // Report software breakpoints to GDB stub
+        if (gdbstub_halt(vm->machine->gdbstub)) {
+            // GDB ate the breakpoint
+            riscv_restart_at_pc(vm, vm->registers[RISCV_REG_PC]);
+            return;
+        }
+    }
+    riscv_trap(vm, RISCV_TRAP_BREAKPOINT, 0);
 }
 
 void riscv_restart_dispatch(rvvm_hart_t* vm)
@@ -345,8 +366,10 @@ static void* riscv_hart_run_thread(void* ptr)
 
 void riscv_hart_spawn(rvvm_hart_t *vm)
 {
-    atomic_store_uint32(&vm->pending_events, 0);
-    vm->thread = thread_create(riscv_hart_run_thread, (void*)vm);
+    if (!vm->thread) {
+        atomic_store_uint32(&vm->pending_events, 0);
+        vm->thread = thread_create(riscv_hart_run_thread, vm);
+    }
 }
 
 void riscv_hart_queue_pause(rvvm_hart_t* vm)
@@ -357,10 +380,9 @@ void riscv_hart_queue_pause(rvvm_hart_t* vm)
 
 void riscv_hart_pause(rvvm_hart_t* vm)
 {
-    riscv_hart_queue_pause(vm);
-
-    // Clear vm->thread before freeing it
-    thread_ctx_t* thread = vm->thread;
-    vm->thread = NULL;
-    thread_join(thread);
+    if (vm->thread) {
+        riscv_hart_queue_pause(vm);
+        thread_join(vm->thread);
+        vm->thread = NULL;
+    }
 }

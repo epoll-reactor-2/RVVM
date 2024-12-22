@@ -23,6 +23,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "threading.h"
 #include "blk_io.h"
 #include "fdtlib.h"
+#include "gdbstub.h"
 
 #ifdef USE_JIT
 #include "rvjit/rvjit.h"
@@ -249,6 +250,8 @@ struct rvvm_machine_t {
     plic_ctx_t* plic;
     pci_bus_t*  pci_bus;
     i2c_bus_t*  i2c_bus;
+
+    gdb_server_t* gdbstub;
 
     rvvm_addr_t opts[RVVM_OPTS_ARR_SIZE];
 #ifdef USE_FDT
