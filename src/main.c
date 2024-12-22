@@ -25,6 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "rvvm_isolation.h"
 #include "utils.h"
 #include "dlib.h"
+#include "gdbstub.h"
 
 #include "devices/clint.h"
 #include "devices/plic.h"
@@ -219,6 +220,10 @@ static int rvvm_cli_main(int argc, char** argv)
 
     rtc_goldfish_init_auto(machine);
     syscon_init_auto(machine);
+
+    if (rvvm_has_arg("gdbstub")) {
+        gdbstub_init(machine, rvvm_getarg("gdbstub"));
+    }
 
     if (!rvvm_has_arg("serial")) {
         ns16550a_init_term_auto(machine);
