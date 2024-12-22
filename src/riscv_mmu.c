@@ -478,6 +478,7 @@ no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
 {
     rvvm_addr_t paddr = 0;
     uint8_t access = attr & 0xFF;
+    uint8_t mmu_access = access;
     size_t size = attr >> 16;
 
     if (unlikely(!riscv_block_in_page(vaddr, size))) {
@@ -495,7 +496,11 @@ no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
         }
     }
 
-    if (likely(riscv_mmu_translate(vm, vaddr, &paddr, access))) {
+    if (unlikely(attr & RISCV_MMU_ATTR_NO_PROT)) {
+        mmu_access = RISCV_MMU_READ | RISCV_MMU_EXEC | RISCV_MMU_WRITE;
+    }
+
+    if (likely(riscv_mmu_translate(vm, vaddr, &paddr, mmu_access))) {
         if (unlikely(attr & RISCV_MMU_ATTR_PHYS)) {
             // Physical translation requested
             *(rvvm_addr_t*)data = paddr;

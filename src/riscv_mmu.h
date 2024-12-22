@@ -49,8 +49,13 @@ void riscv_jit_tlb_flush(rvvm_hart_t* vm);
  */
 
 #define RISCV_MMU_ATTR_NO_TRAP 0x100 // Never trap the CPU
-#define RISCV_MMU_ATTR_PHYS    0x200 // Translate into physical address and write to *data
-#define RISCV_MMU_ATTR_RMW     0x400 // Return direct pointer for RMW atomics, data is used for MMIO if non-NULL
+#define RISCV_MMU_ATTR_NO_PROT 0x200 // Ignore MMU protection
+#define RISCV_MMU_ATTR_PHYS    0x400 // Translate into physical address and write to *data
+#define RISCV_MMU_ATTR_RMW     0x800 // Return direct pointer for RMW atomics, data is used for MMIO if non-NULL
+
+// Used for GDB stub
+#define RISCV_MMU_ATTR_DEBUG   (RISCV_MMU_ATTR_NO_TRAP | RISCV_MMU_ATTR_NO_PROT)
+
 
 no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint32_t attr);
 
