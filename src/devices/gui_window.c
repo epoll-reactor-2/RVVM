@@ -258,14 +258,14 @@ bool gui_window_init_auto(rvvm_machine_t* machine, uint32_t width, uint32_t heig
         return false;
     }
 
-    // Placeholder for window data, region size is 0
-    rvvm_mmio_dev_t win_placeholder = {
-        .data = win,
-        .type = &gui_window_dev_type,
-    };
-    rvvm_attach_mmio(machine, &win_placeholder);
+    rvvm_mmio_dev_t* fb = framebuffer_init_auto(machine, &win->fb);
+    if (!fb) {
+        gui_window_free(win);
+        return false;
+    }
 
-    framebuffer_init_auto(machine, &win->fb);
+    fb->data = win;
+    fb->type = &gui_window_dev_type;
 
     return true;
 }
