@@ -33,7 +33,7 @@ slow_path void riscv_emulate_opc_system(rvvm_hart_t* vm, const uint32_t insn)
             riscv_trap(vm, RISCV_TRAP_ECALL_UMODE + vm->priv_mode, 0);
             return;
         case RISCV_PRIV_S_EBREAK:
-            riscv_trap(vm, RISCV_TRAP_BREAKPOINT, 0);
+            riscv_breakpoint(vm);
             return;
         case RISCV_PRIV_S_SRET:
             // Executing sret should trap in S-mode when mstatus.TSR is enabled
