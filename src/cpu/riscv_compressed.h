@@ -475,7 +475,7 @@ static forceinline void riscv_emulate_c_jr_mv(rvvm_hart_t* vm, const uint16_t in
             }
         } else {
             // c.ebreak
-            riscv_trap(vm, RISCV_TRAP_BREAKPOINT, 0);
+            riscv_breakpoint(vm);
         }
     } else {
         if (rs2 != 0) {
