@@ -30,6 +30,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define SV48_LEVELS       4
 #define SV57_LEVELS       5
 
+#define RISCV_MMU_DEBUG_ACCESS (RISCV_MMU_READ | RISCV_MMU_EXEC | RISCV_MMU_WRITE)
+
 bool riscv_init_ram(rvvm_ram_t* mem, rvvm_addr_t base_addr, size_t size)
 {
     // Memory boundaries should be always aligned to page size
@@ -151,6 +153,24 @@ static forceinline void* riscv_phys_access(rvvm_hart_t* vm, rvvm_addr_t paddr)
     return NULL;
 }
 
+static inline bool riscv_mmu_check_priv(rvvm_hart_t* vm, uint8_t priv, uint8_t access)
+{
+    if (access == RISCV_MMU_DEBUG_ACCESS) {
+        // Unrestrained page access to external debugger
+        return true;
+    }
+    if (access == RISCV_MMU_EXEC) {
+        // Do not allow executing user pages from supervisor and vice versa
+        // MXR sets access to RISCV_MMU_READ | RISCV_MMU_EXEC
+        return false;
+    }
+    if (priv != RISCV_PRIV_SUPERVISOR || !(vm->csr.status & CSR_STATUS_SUM)) {
+        // If we are supervisor with SUM bit set, RW operations on user pages are allowed
+        return false;
+    }
+    return true;
+}
+
 #ifdef USE_RV32
 
 // Virtual memory addressing mode (SV32)
@@ -172,11 +192,9 @@ static inline bool riscv_mmu_translate_sv32(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
             if (likely(pte & RISCV_PTE_VALID)) {
                 if (pte & RISCV_PTE_LEAF) {
                     // PGT entry is a leaf, check permissions
-                    // Check U bit != priv mode, otherwise do extended check
+                    // Check that PTE U-bit matches U-mode, otherwise do extended check
                     if (unlikely(!!(pte & RISCV_PTE_USER) == !!priv)) {
-                        // If we are supervisor with SUM bit set, rw operations are allowed
-                        // MXR sets access to RISCV_MMU_READ | RISCV_MMU_EXEC
-                        if (access == RISCV_MMU_EXEC || priv != RISCV_PRIV_SUPERVISOR || !(vm->csr.status & CSR_STATUS_SUM)) {
+                        if (!riscv_mmu_check_priv(vm, priv, access)) {
                             return false;
                         }
                     }
@@ -242,11 +260,9 @@ static inline bool riscv_mmu_translate_rv64(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
             if (likely(pte & RISCV_PTE_VALID)) {
                 if (pte & RISCV_PTE_LEAF) {
                     // PGT entry is a leaf, check permissions
-                    // Check U bit != priv mode, otherwise do extended check
+                    // Check that PTE U-bit matches U-mode, otherwise do extended check
                     if (unlikely(!!(pte & RISCV_PTE_USER) == !!priv)) {
-                        // If we are supervisor with SUM bit set, rw operations on user pages are allowed
-                        // MXR sets access to RISCV_MMU_READ | RISCV_MMU_EXEC
-                        if (access == RISCV_MMU_EXEC || priv != RISCV_PRIV_SUPERVISOR || !(vm->csr.status & CSR_STATUS_SUM)) {
+                        if (!riscv_mmu_check_priv(vm, priv, access)) {
                             return false;
                         }
                     }
@@ -497,7 +513,7 @@ no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
     }
 
     if (unlikely(attr & RISCV_MMU_ATTR_NO_PROT)) {
-        mmu_access = RISCV_MMU_READ | RISCV_MMU_EXEC | RISCV_MMU_WRITE;
+        mmu_access = RISCV_MMU_DEBUG_ACCESS;
     }
 
     if (likely(riscv_mmu_translate(vm, vaddr, &paddr, mmu_access))) {
