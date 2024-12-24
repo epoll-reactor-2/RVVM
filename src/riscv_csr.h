@@ -210,7 +210,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define CSR_FCSR_MASK   0xFF
 
 #define CSR_MSTATUS_MASK 0xF007FFFAAULL
-#define CSR_SSTATUS_MASK 0x3000DE7A2ULL
+#define CSR_SSTATUS_MASK 0x3000DE722ULL
 #define CSR_STATUS_FS_MASK 0x6000
 
 #define CSR_MEDELEG_MASK 0xB109
