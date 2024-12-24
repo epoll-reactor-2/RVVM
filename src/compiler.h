@@ -12,10 +12,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <stdint.h>
 
+/*
+ * Compiler feature detection
+ */
+
 #if defined(__GNUC__) || defined(__llvm__) || defined(__INTEL_COMPILER)
 #define GNU_EXTS 1
 #endif
 
+// GCC version checking
 #if defined(__GNUC__) && !defined(__llvm__) && !defined(__INTEL_COMPILER)
 #define GCC_CHECK_VER(major, minor) (__GNUC__ > major || \
         (__GNUC__ == major && __GNUC_MINOR__ >= minor))
@@ -23,11 +28,25 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define GCC_CHECK_VER(major, minor) 0
 #endif
 
+// Clang version checking
 #ifdef __clang__
 #define CLANG_CHECK_VER(major, minor) (__clang_major__ > major || \
           (__clang_major__ == major && __clang_minor__ >= minor))
 #else
 #define CLANG_CHECK_VER(major, minor) 0
+#endif
+
+// Uniformly define __SANITIZE_THREAD__, __SANITIZE_ADDRESS__, __SANITIZE_MEMORY__ on Clang & GCC
+#if defined(GNU_EXTS) && defined(__has_feature)
+#if __has_feature(address_sanitizer) && !defined(__SANITIZE_ADDRESS__)
+#define __SANITIZE_ADDRESS__
+#endif
+#if __has_feature(thread_sanitizer) && !defined(__SANITIZE_THREAD__)
+#define __SANITIZE_THREAD__
+#endif
+#if __has_feature(memory_sanitizer) && !defined(__SANITIZE_MEMORY__)
+#define __SANITIZE_MEMORY__
+#endif
 #endif
 
 // Check GNU attribute presence
@@ -51,6 +70,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define CHECK_INCLUDE(include, urgent) urgent
 #endif
 
+/*
+ * Optimization hints
+ */
+
 // Branch optimization hints
 #if GNU_BUILTIN(__builtin_expect)
 #define likely(x)     __builtin_expect(!!(x),1)
@@ -67,17 +90,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define mem_prefetch(addr, rw, loc)
 #endif
 
-// Allow aliasing for type with this attribute
-#if GNU_ATTRIBUTE(__may_alias__)
-#define safe_aliasing __attribute__((__may_alias__))
-#else
-#define safe_aliasing
-#endif
-
 // Force-inline function attribute
-#if GNU_ATTRIBUTE(__always_inline__)
+#if GNU_ATTRIBUTE(__always_inline__) && !defined(USE_RELAXED_INLINING) && !defined(__SANITIZE_THREAD__)
+// ThreadSanitizer doesn't play well with __always_inline__
 #define forceinline inline __attribute__((__always_inline__))
-#elif defined(_MSC_VER)
+#elif defined(_MSC_VER) && !defined(USE_RELAXED_INLINING)
 #define forceinline __forceinline
 #else
 #define forceinline inline
@@ -114,63 +131,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define flatten_calls
 #endif
 
-// Warn if return value is unused
-#if GNU_ATTRIBUTE(__warn_unused_result__)
-#define warn_unused_ret __attribute__((__warn_unused_result__))
-#else
-#define warn_unused_ret
-#endif
-
-// Explicitly mark deallocator for an allocator function
-#if GNU_ATTRIBUTE(__malloc__)
-#define deallocate_with(deallocator) warn_unused_ret __attribute__((__malloc__,__malloc__(deallocator, 1)))
-#else
-#define deallocate_with(deallocator) warn_unused_ret
-#endif
-
-// Call this function upon exit / library unload (GNU compilers only)
-#if GNU_ATTRIBUTE(__destructor__)
-#define GNU_DESTRUCTOR __attribute__((__destructor__))
-#else
-#define GNU_DESTRUCTOR
-#endif
-
-// Call this function upon startup / library load (GNU compilers only)
-#if GNU_ATTRIBUTE(__constructor__)
-#define GNU_CONSTRUCTOR __attribute__((__constructor__))
-#else
-#define GNU_CONSTRUCTOR
-#endif
-
-// Match GCC macro __SANITIZE_THREAD__, __SANITIZE_ADDRESS__ on Clang, provide __SANITIZE_MEMORY__
-#if defined(__clang__) && defined(__has_feature)
-#if __has_feature(address_sanitizer) && !defined(__SANITIZE_ADDRESS__)
-#define __SANITIZE_ADDRESS__
-#endif
-#if __has_feature(thread_sanitizer) && !defined(__SANITIZE_THREAD__)
-#define __SANITIZE_THREAD__
-#endif
-#if __has_feature(memory_sanitizer) && !defined(__SANITIZE_MEMORY__)
-#define __SANITIZE_MEMORY__
-#endif
-#endif
-
-// Suppress ThreadSanitizer in places with false alarms (emulated load/stores or RCU)
-// Guest dataraces hinder normal code instrumentation, so this is handy
-#if defined(__SANITIZE_THREAD__) && !defined(USE_SANITIZE_FULL) && GNU_ATTRIBUTE(__no_sanitize__)
-#define TSAN_SUPPRESS __attribute__((__no_sanitize__("thread")))
-#else
-#define TSAN_SUPPRESS
-#endif
-
-// Suppress MemorySanitizer in places with false alarms (non-instrumented syscalls, X11 libs, etc)
-#if defined(__SANITIZE_MEMORY__) && !defined(USE_SANITIZE_FULL) && GNU_ATTRIBUTE(__no_sanitize__)
-#define MSAN_SUPPRESS __attribute__((__no_sanitize__("memory")))
-#else
-#define MSAN_SUPPRESS
-#endif
-
-// Optimization pragmas (Clang doesn't support this)
+// Whole-source optimization pragmas (Clang doesn't support this)
 #if GCC_CHECK_VER(4, 4)
 #define SOURCE_OPTIMIZATION_NONE _Pragma("GCC optimize(\"O0\")")
 #define SOURCE_OPTIMIZATION_O2 _Pragma("GCC optimize(\"O2\")")
@@ -200,7 +161,71 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define POP_OPTIMIZATION_SIZE
 #endif
 
-// Guess endianness based on __BYTE_ORDER__, and arch ifdefs for older compilers
+/*
+ * Instrumentation helpers, compiler promises
+ */
+
+// Assume the pointer is aligned to specific constant pow2 size
+#if GNU_BUILTIN(__builtin_assume_aligned)
+#define assume_aligned_ptr(ptr, size) __builtin_assume_aligned((ptr), (size))
+#else
+#define assume_aligned_ptr(ptr, size) (ptr)
+#endif
+
+// Allow aliasing for type with this attribute (Same as char type)
+#if GNU_ATTRIBUTE(__may_alias__)
+#define safe_aliasing __attribute__((__may_alias__))
+#else
+#define safe_aliasing
+#endif
+
+// Warn if return value is unused
+#if GNU_ATTRIBUTE(__warn_unused_result__)
+#define warn_unused_ret __attribute__((__warn_unused_result__))
+#else
+#define warn_unused_ret
+#endif
+
+// Explicitly mark deallocator for an allocator function
+#if GNU_ATTRIBUTE(__malloc__)
+#define deallocate_with(deallocator) warn_unused_ret __attribute__((__malloc__,__malloc__(deallocator, 1)))
+#else
+#define deallocate_with(deallocator) warn_unused_ret
+#endif
+
+// Suppress ThreadSanitizer in places with false positives (Emulated load/stores or RCU)
+#if defined(__SANITIZE_THREAD__) && !defined(USE_SANITIZE_FULL) && GNU_ATTRIBUTE(__no_sanitize__)
+#define TSAN_SUPPRESS __attribute__((__no_sanitize__("thread")))
+#else
+#define TSAN_SUPPRESS
+#endif
+
+// Suppress MemorySanitizer in places with false positives (Non-instrumented syscalls, external libs, etc)
+#if defined(__SANITIZE_MEMORY__) && !defined(USE_SANITIZE_FULL) && GNU_ATTRIBUTE(__no_sanitize__)
+#define MSAN_SUPPRESS __attribute__((__no_sanitize__("memory")))
+#else
+#define MSAN_SUPPRESS
+#endif
+
+// Call this function upon exit / library unload (GNU compilers only)
+#if GNU_ATTRIBUTE(__destructor__)
+#define GNU_DESTRUCTOR __attribute__((__destructor__))
+#else
+#define GNU_DESTRUCTOR
+#endif
+
+// Call this function upon startup / library load (GNU compilers only)
+#if GNU_ATTRIBUTE(__constructor__)
+#define GNU_CONSTRUCTOR __attribute__((__constructor__))
+#else
+#define GNU_CONSTRUCTOR
+#endif
+
+/*
+ * Host platform feature detection
+ */
+
+// Detect endianness based on __BYTE_ORDER__, and arch ifdefs for older compilers
 #if (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__) || \
     defined(__MIPSEB__) || defined(__ARMEB__)
 #define HOST_BIG_ENDIAN 1
@@ -225,6 +250,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #elif UINTPTR_MAX == UINT32_MAX
 #define HOST_32BIT 1
 #endif
+
+/*
+ * Macro helpers
+ */
 
 // Unwrap a token or a token value into a string literal
 #define MACRO_MKSTRING(x) #x
@@ -255,13 +284,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define BUILD_ASSERT_EXPR(cond) 0
 #else
 #define BUILD_ASSERT_EXPR(cond) (sizeof(char[(cond) ? 1 : -1]) - 1)
-#endif
-
-// Weak symbol linkage (Runtime library probing)
-#if defined(GNU_EXTS)
-#define WEAK_LINKAGE(symbol) _Pragma(MACRO_TOSTRING(weak symbol))
-#else
-#define WEAK_LINKAGE(symbol)
 #endif
 
 #endif
