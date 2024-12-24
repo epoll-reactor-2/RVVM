@@ -99,7 +99,9 @@ thread_ctx_t* thread_create_ex(thread_func_t func, void* arg, uint32_t stack_siz
     void* entry = func;
 #endif
     thread->handle = CreateThread(NULL, stack_size, entry, arg, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (thread->handle) return thread;
+    if (thread->handle) {
+        return thread;
+    }
 #else
     pthread_attr_t thread_attr = {0};
     pthread_attr_t* pass_attr = &thread_attr;
@@ -123,37 +125,37 @@ thread_ctx_t* thread_create_ex(thread_func_t func, void* arg, uint32_t stack_siz
 
 thread_ctx_t* thread_create(thread_func_t func, void* arg)
 {
-    return thread_create_ex(func, arg, 65536);
+    return thread_create_ex(func, arg, 0x10000);
 }
 
-void* thread_join(thread_ctx_t* thread)
+bool thread_join(thread_ctx_t* thread)
 {
-    void* ret = NULL;
-    if (thread == NULL) return NULL;
+    if (thread == NULL) return false;
 #ifdef _WIN32
-    DWORD ltmp = 0;
+    DWORD tmp = 0;
     WaitForSingleObject(thread->handle, INFINITE);
-    GetExitCodeThread(thread->handle, &ltmp);
-    CloseHandle(thread->handle);
-    ret = (void*)(size_t)ltmp;
+    if (!GetExitCodeThread(thread->handle, &tmp) || !CloseHandle(thread->handle)) {
 #else
-    pthread_join(thread->pthread, &ret);
+    void* tmp = NULL;
+    if (pthread_join(thread->pthread, &tmp)) {
 #endif
+        rvvm_warn("Failed to join thread!");
+        return false;
+    }
     free(thread);
-    return ret;
+    return true;
 }
 
 bool thread_detach(thread_ctx_t* thread)
 {
-    bool ret = false;
     if (thread == NULL) return false;
 #ifdef _WIN32
-    ret = CloseHandle(thread->handle);
+    CloseHandle(thread->handle);
 #else
-    ret = pthread_detach(thread->pthread) == 0;
+    pthread_detach(thread->pthread);
 #endif
     free(thread);
-    return ret;
+    return true;
 }
 
 cond_var_t* condvar_create(void)
@@ -442,7 +444,7 @@ static void thread_workers_terminate(void)
         condvar_wake_all(pool_cond);
         sleep_ms(1);
     }
-    for (size_t i=0; i<WORKER_THREADS; ++i) {
+    for (size_t i = 0; i < WORKER_THREADS; ++i) {
         thread_join(pool_threads[i]);
         pool_threads[i] = NULL;
     }
@@ -466,7 +468,7 @@ static void threadpool_init(void)
     atomic_store_uint32(&pool_run, 1);
     workqueue_init(&pool_wq);
     pool_cond = condvar_create();
-    for (size_t i=0; i<WORKER_THREADS; ++i) {
+    for (size_t i = 0; i < WORKER_THREADS; ++i) {
         pool_threads[i] = thread_create(threadpool_worker, NULL);
     }
     call_at_deinit(thread_workers_terminate);
@@ -477,7 +479,6 @@ static bool thread_queue_task(thread_func_t func, void** arg, unsigned arg_count
     DO_ONCE(threadpool_init());
 
     if (workqueue_submit(&pool_wq, func, arg, arg_count, va)) {
-        //if (condvar_waiters(pool_cond) == WORKER_THREADS)
         condvar_wake(pool_cond);
         return true;
     }
