@@ -138,7 +138,7 @@ static forceinline void write_uint16_be_m(void* addr, uint16_t val) {
 
 TSAN_SUPPRESS static forceinline uint64_t read_uint64_le(const void* addr) {
 #ifdef HOST_LITTLE_ENDIAN
-    return *(const uint64_t*)addr;
+    return *(const safe_aliasing uint64_t*)addr;
 #else
     return read_uint64_le_m(addr);
 #endif
@@ -146,7 +146,7 @@ TSAN_SUPPRESS static forceinline uint64_t read_uint64_le(const void* addr) {
 
 TSAN_SUPPRESS static forceinline void write_uint64_le(void* addr, uint64_t val) {
 #ifdef HOST_LITTLE_ENDIAN
-    *(uint64_t*)addr = val;
+    *(safe_aliasing uint64_t*)addr = val;
 #else
     write_uint64_le_m(addr, val);
 #endif
@@ -154,7 +154,7 @@ TSAN_SUPPRESS static forceinline void write_uint64_le(void* addr, uint64_t val) 
 
 TSAN_SUPPRESS static forceinline uint32_t read_uint32_le(const void* addr) {
 #ifdef HOST_LITTLE_ENDIAN
-    return *(const uint32_t*)addr;
+    return *(const safe_aliasing uint32_t*)addr;
 #else
     return read_uint32_le_m(addr);
 #endif
@@ -162,7 +162,7 @@ TSAN_SUPPRESS static forceinline uint32_t read_uint32_le(const void* addr) {
 
 TSAN_SUPPRESS static forceinline void write_uint32_le(void* addr, uint32_t val) {
 #ifdef HOST_LITTLE_ENDIAN
-    *(uint32_t*)addr = val;
+    *(safe_aliasing uint32_t*)addr = val;
 #else
     write_uint32_le_m(addr, val);
 #endif
@@ -170,7 +170,7 @@ TSAN_SUPPRESS static forceinline void write_uint32_le(void* addr, uint32_t val) 
 
 TSAN_SUPPRESS static forceinline uint16_t read_uint16_le(const void* addr) {
 #ifdef HOST_LITTLE_ENDIAN
-    return *(const uint16_t*)addr;
+    return *(const safe_aliasing uint16_t*)addr;
 #else
     return read_uint16_le_m(addr);
 #endif
@@ -178,7 +178,7 @@ TSAN_SUPPRESS static forceinline uint16_t read_uint16_le(const void* addr) {
 
 TSAN_SUPPRESS static forceinline void write_uint16_le(void* addr, uint16_t val) {
 #ifdef HOST_LITTLE_ENDIAN
-    *(uint16_t*)addr = val;
+    *(safe_aliasing uint16_t*)addr = val;
 #else
     write_uint16_le_m(addr, val);
 #endif
@@ -228,7 +228,7 @@ static inline void write_float_le_m(void* addr, float val) {
 
 TSAN_SUPPRESS static forceinline float read_float_le(const void* addr) {
 #ifdef HOST_LITTLE_ENDIAN
-    return *(const float*)addr;
+    return *(const safe_aliasing float*)addr;
 #else
     return read_float_le_m(addr);
 #endif
@@ -236,7 +236,7 @@ TSAN_SUPPRESS static forceinline float read_float_le(const void* addr) {
 
 TSAN_SUPPRESS static forceinline double read_double_le(const void* addr) {
 #ifdef HOST_LITTLE_ENDIAN
-    return *(const double*)addr;
+    return *(const safe_aliasing double*)addr;
 #else
     return read_double_le_m(addr);
 #endif
@@ -244,7 +244,7 @@ TSAN_SUPPRESS static forceinline double read_double_le(const void* addr) {
 
 TSAN_SUPPRESS static forceinline void write_float_le(void* addr, float val) {
 #ifdef HOST_LITTLE_ENDIAN
-    *(float*)addr = val;
+    *(safe_aliasing float*)addr = val;
 #else
     write_float_le_m(addr, val);
 #endif
@@ -252,7 +252,7 @@ TSAN_SUPPRESS static forceinline void write_float_le(void* addr, float val) {
 
 TSAN_SUPPRESS static forceinline void write_double_le(void* addr, double val) {
 #ifdef HOST_LITTLE_ENDIAN
-    *(double*)addr = val;
+    *(safe_aliasing double*)addr = val;
 #else
     write_double_le_m(addr, val);
 #endif
