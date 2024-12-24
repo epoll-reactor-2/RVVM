@@ -172,7 +172,7 @@ static forceinline void riscv_emulate_atomic_d(rvvm_hart_t* vm, const uint32_t i
 
 #endif
 
-static forceinline void riscv_emulate_a_opc_amo(rvvm_hart_t* vm, const uint32_t insn)
+static no_inline void riscv_emulate_a_opc_amo(rvvm_hart_t* vm, const uint32_t insn)
 {
     const uint32_t funct3 = bit_cut(insn, 12, 3);
     switch (funct3) {
