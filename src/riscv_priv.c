@@ -171,6 +171,15 @@ slow_path void riscv_emulate_opc_system(rvvm_hart_t* vm, const uint32_t insn)
 
 #define RISCV_INSN_PAUSE 0x100000F // Instruction value for pause hint
 
+TSAN_SUPPRESS static forceinline void riscv_cbo_zero(rvvm_hart_t* vm, rvvm_addr_t vaddr)
+{
+    // ThreadSanitizer doesn't recognize fences between non-atomic memset and AMO
+    void* ptr = riscv_rmw_translate(vm, vaddr & ~63ULL, NULL, 64);
+    if (ptr) {
+        memset(assume_aligned_ptr(ptr, 64), 0, 64);
+    }
+}
+
 slow_path void riscv_emulate_opc_misc_mem(rvvm_hart_t* vm, const uint32_t insn)
 {
     const uint32_t funct3 = bit_cut(insn, 12, 3);
@@ -218,9 +227,7 @@ slow_path void riscv_emulate_opc_misc_mem(rvvm_hart_t* vm, const uint32_t insn)
                     break;
                 case 0x4: // cbo.zero
                     if (likely(!rds && riscv_csr_cbz_enabled(vm))) {
-                        const rvvm_addr_t vaddr = vm->registers[rs1] & ~63ULL;
-                        void* ptr = riscv_rmw_translate(vm, vaddr, NULL, 64);
-                        if (ptr) memset(ptr, 0, 64);
+                        riscv_cbo_zero(vm, vm->registers[rs1]);
                         return;
                     }
                     break;
