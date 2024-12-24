@@ -219,12 +219,13 @@ static bool riscv_csr_status(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint64_t mask,
     uint8_t vs = bit_cut(status, 9, 2);
     uint8_t xs = EVAL_MAX(fs, vs);
     status = bit_replace(status, 15, 2, xs);
-    if (xs == FS_DIRTY) {
-        // XS is dirty, set SD bit
-        status |= riscv_csr_sd_bit(vm);
-    }
 
     riscv_csr_helper_masked(vm, &status, dest, mask, op);
+
+    if (unlikely(xs == FS_DIRTY)) {
+        // XS is dirty, set SD bit
+        *dest |= riscv_csr_sd_bit(vm);
+    }
 
     if (unlikely(status != old_status)) {
         // Validate WARL fields
