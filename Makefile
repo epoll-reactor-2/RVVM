@@ -162,15 +162,16 @@ ifeq ($(OS),windows)
 override LDFLAGS += -static
 override BIN_EXT := .exe
 override LIB_EXT := .dll
+USE_WIN32_GUI ?= 1
 else
 
 # Emscripten-specific build options
 ifeq ($(OS),emscripten)
 override CFLAGS += -pthread
-override LDFLAGS += -s TOTAL_MEMORY=512MB -s PROXY_TO_PTHREAD
+override LDFLAGS += -s TOTAL_MEMORY=512MB
 override BIN_EXT := .html
 override LIB_EXT := .so
-USE_SDL ?= 1
+USE_SDL ?= 2
 USE_NET ?= 0
 else
 
@@ -210,6 +211,10 @@ endif
 ifneq (,$(findstring linux,$(OS))$(findstring bsd,$(OS))$(findstring sunos,$(OS)))
 # Enable X11 on Linux, *BSD, SunOS (Solaris) by default
 USE_X11 ?= 1
+endif
+
+ifeq ($(OS),haiku)
+USE_HAIKU_GUI ?= 1
 endif
 
 ifneq (,$(findstring darwin,$(OS))$(findstring serenity,$(OS)))
@@ -290,35 +295,6 @@ override CFLAGS := -I$(SRCDIR) -DRVVM_VERSION=\"$(VERSION)\" $(CFLAGS)
 # Select sources to compile
 override SRC := $(wildcard $(SRCDIR)/*.c $(SRCDIR)/devices/*.c)
 
-# OS-specific useflag CFLAGS/LDFLAGS
-ifeq ($(OS),windows)
-USE_WIN32_GUI ?= 1
-ifneq (,$(findstring main, $(subst WinMain,main,$(shell $(CC) $(CFLAGS) $(LDFLAGS) -lgdi32 2>&1))))
-# On WinCE it's not expected to link gdi32
-override LDFLAGS_USE_WIN32_GUI := -lgdi32
-endif
-ifneq (,$(findstring main, $(subst WinMain,main,$(shell $(CC) $(CFLAGS) $(LDFLAGS) -lws2 2>&1))))
-# On WinCE there is no _32 suffix
-override LDFLAGS_USE_NET := -lws2
-else
-override LDFLAGS_USE_NET := -lws2_32
-endif
-endif
-
-ifeq ($(OS),haiku)
-USE_HAIKU_GUI ?= 1
-override LDFLAGS_USE_HAIKU_GUI := -lbe
-override LDFLAGS_USE_NET := -lnetwork
-endif
-
-ifeq ($(OS),sunos)
-override LDFLAGS_USE_NET := -lsocket
-endif
-
-ifeq ($(OS),emscripten)
-override CFLAGS_USE_SDL := -s USE_SDL=$(USE_SDL)
-endif
-
 # Useflag sources
 override SRC_USE_WIN32_GUI := $(SRCDIR)/devices/win32window.c
 override SRC_CXX_USE_HAIKU_GUI := $(SRCDIR)/devices/haiku_window.cpp
@@ -341,14 +317,49 @@ override CFLAGS_USE_DEBUG := -DDEBUG -g -fno-omit-frame-pointer
 override CFLAGS_USE_DEBUG_FULL := -DDEBUG -Og -ggdb -fno-omit-frame-pointer
 override CFLAGS_USE_LIB := -fPIC
 
+# Useflag LDFLAGS
+# Needed for floating-point functions like fetestexcept/feraiseexcept
+override LDFLAGS_USE_FPU := -lm
+
+# Useflag dependencies
+override NEED_USE_X11 := USE_GUI
+override NEED_USE_SDL := USE_GUI
+override NEED_USE_JNI := USE_LIB
+
+#
+# OS-specific useflag CFLAGS/LDFLAGS
+#
+
+ifeq ($(OS),windows)
+ifneq (,$(findstring main, $(subst WinMain,main,$(shell $(CC) $(CFLAGS) $(LDFLAGS) -lgdi32 2>&1))))
+# On WinCE it's not expected to link gdi32
+override LDFLAGS_USE_WIN32_GUI := -lgdi32
+endif
+ifneq (,$(findstring main, $(subst WinMain,main,$(shell $(CC) $(CFLAGS) $(LDFLAGS) -lws2 2>&1))))
+# On WinCE there is no _32 suffix
+override LDFLAGS_USE_NET := -lws2
+else
+override LDFLAGS_USE_NET := -lws2_32
+endif
+endif
+
+ifeq ($(OS),haiku)
+override LDFLAGS_USE_HAIKU_GUI := -lbe
+override LDFLAGS_USE_NET := -lnetwork
+endif
+
+ifeq ($(OS),sunos)
+override LDFLAGS_USE_NET := -lsocket
+endif
+
+ifeq ($(OS),emscripten)
+override CFLAGS_USE_SDL := -s USE_SDL=$(USE_SDL)
+endif
+
 # Enable building the lib on lib or install target
 ifeq (,$(findstring lib, $(MAKECMDGOALS))$(findstring install, $(MAKECMDGOALS)))
 override USE_LIB := 0
 endif
-
-# Useflag LDFLAGS
-# Needed for floating-point functions like fetestexcept/feraiseexcept
-override LDFLAGS_USE_FPU := -lm
 
 # Fix Nix & MacOS brew issues with non-standard library paths
 ifneq (,$(findstring linux,$(OS))$(findstring darwin,$(OS)))
@@ -367,11 +378,6 @@ override LDFLAGS_USE_X11 := -Wl,-rpath,$(X11_LIBDIR)
 endif
 endif
 
-# Useflag dependencies
-override NEED_USE_X11 := USE_GUI
-override NEED_USE_SDL := USE_GUI
-override NEED_USE_JNI := USE_LIB
-
 # Check if RVJIT supports the target architecture
 ifeq ($(USE_JIT),1)
 ifeq (,$(findstring 86,$(ARCH))$(findstring arm,$(ARCH))$(findstring riscv,$(ARCH)))
@@ -383,6 +389,10 @@ endif
 ifeq ($(USE_TAP_LINUX),1)
 $(info $(WARN_PREFIX) Linux TAP is deprecated in favor of USE_NET due to checksum issues)
 endif
+
+#
+# Useflag automation magic
+#
 
 override USEFLAGS := $(sort $(filter USE_%,$(.VARIABLES)))
 override SRC_CONDITIONAL := $(filter SRC_USE_%,$(.VARIABLES))
@@ -492,7 +502,7 @@ override CC_STD := -std=gnu11 -Wstrict-prototypes -Wold-style-definition
 override CXX_STD := -std=gnu++11
 endif
 
-override CFLAGS := -O2 $(if $(LTO_SUPPORTED),-flto=thin) $(if $(CC_AT_LEAST_4_0),-frounding-math) -fvisibility=hidden -fno-math-errno \
+override CFLAGS := -O2 $(if $(LTO_SUPPORTED),-flto) $(if $(CC_AT_LEAST_4_0),-frounding-math) -fvisibility=hidden -fno-math-errno \
 $(WARN_OPTS) -Wno-unknown-warning-option -Wno-unsupported-floating-point-opt -Wno-ignored-optimization-argument \
 -Wno-missing-braces -Wno-missing-field-initializers -Wno-ignored-pragmas -Wno-atomic-alignment $(CFLAGS)
 
