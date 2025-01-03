@@ -214,76 +214,109 @@ static void rvvm_reset_machine_state(rvvm_machine_t* machine)
     }
 }
 
+static bool rvvm_eventloop_tick(bool manual)
+{
+    bool ret = false;
+    if (vector_size(global_machines) == 0 || global_manual == !manual) {
+        // No running machines left or switched eventloop mode
+        return true;
+    }
+
+    vector_foreach_back(global_machines, m) {
+        rvvm_machine_t* machine = vector_at(global_machines, m);
+        uint32_t power_state = atomic_load_uint32(&machine->power_state);
+
+        if (power_state == RVVM_POWER_ON) {
+            vector_foreach(machine->harts, i) {
+                rvvm_hart_t* vm = vector_at(machine->harts, i);
+                // Сheck hart timer interrupts
+                riscv_hart_check_timer(vector_at(machine->harts, i));
+                if (rvvm_get_opt(machine, RVVM_OPT_MAX_CPU_CENT) < 100) {
+                    uint32_t preempt = 10 - ((10 * rvvm_get_opt(machine, RVVM_OPT_MAX_CPU_CENT) + 9) / 100);
+                    riscv_hart_preempt(vm, preempt);
+                }
+            }
+
+            vector_foreach(machine->mmio_devs, i) {
+                rvvm_mmio_dev_t* dev = vector_at(machine->mmio_devs, i);
+                if (dev->type && dev->type->update) {
+                    // Update device
+                    dev->type->update(dev);
+                }
+            }
+        } else {
+            // The machine was shut down or reset
+            vector_foreach(machine->harts, i) {
+                riscv_hart_pause(vector_at(machine->harts, i));
+            }
+            // Call reset/poweroff handler
+            if (power_state == RVVM_POWER_RESET) {
+                rvvm_info("Machine %p resetting", machine);
+                rvvm_reset_machine_state(machine);
+                vector_foreach(machine->harts, i) {
+                    riscv_hart_spawn(vector_at(machine->harts, i));
+                }
+            } else {
+                rvvm_info("Machine %p shutting down", machine);
+                atomic_store_uint32(&machine->running, false);
+                vector_erase(global_machines, m);
+                if (manual) {
+                    // Return from manual eventloop whenever a machine powers down
+                    ret = true;
+                }
+            }
+        }
+    }
+    return ret;
+}
+
+#ifdef __EMSCRIPTEN__
+
+// Implement proper Emscripten eventloop instead of a built-in one
+#include <emscripten.h>
+
+static void rvvm_eventloop_tick_em(void)
+{
+    rvvm_eventloop_tick(true);
+}
+
+#endif
+
 static void* rvvm_eventloop(void* manual)
 {
+#ifdef __EMSCRIPTEN__
+    if (manual) {
+        emscripten_set_main_loop(rvvm_eventloop_tick_em, 0, true);
+    }
+#else
     if (!manual && !rvvm_has_arg("noisolation")) {
         rvvm_restrict_this_thread();
     }
-    /*
-     * The eventloop runs in a separate thread if needed,
-     * and returns on any machine shutdown if ran manually.
-     */
+
     while (true) {
         spin_lock(&global_lock);
-        if (vector_size(global_machines) == 0 || global_manual == !manual) {
+        if (rvvm_eventloop_tick(!!manual)) {
             spin_unlock(&global_lock);
             break;
-        }
-
-        vector_foreach_back(global_machines, m) {
-            rvvm_machine_t* machine = vector_at(global_machines, m);
-            uint32_t power_state = atomic_load_uint32(&machine->power_state);
-
-            if (power_state == RVVM_POWER_ON) {
-                vector_foreach(machine->harts, i) {
-                    rvvm_hart_t* vm = vector_at(machine->harts, i);
-                    // Сheck hart timer interrupts
-                    riscv_hart_check_timer(vector_at(machine->harts, i));
-                    if (rvvm_get_opt(machine, RVVM_OPT_MAX_CPU_CENT) < 100) {
-                        uint32_t preempt = 10 - ((10 * rvvm_get_opt(machine, RVVM_OPT_MAX_CPU_CENT) + 9) / 100);
-                        riscv_hart_preempt(vm, preempt);
-                    }
-                }
-
-                vector_foreach(machine->mmio_devs, i) {
-                    rvvm_mmio_dev_t* dev = vector_at(machine->mmio_devs, i);
-                    if (dev->type && dev->type->update) {
-                        // Update device
-                        dev->type->update(dev);
-                    }
-                }
-            } else {
-                // The machine was shut down or reset
-                vector_foreach(machine->harts, i) {
-                    riscv_hart_pause(vector_at(machine->harts, i));
-                }
-                // Call reset/poweroff handler
-                if (power_state == RVVM_POWER_RESET) {
-                    rvvm_info("Machine %p resetting", machine);
-                    rvvm_reset_machine_state(machine);
-                    vector_foreach(machine->harts, i) {
-                        riscv_hart_spawn(vector_at(machine->harts, i));
-                    }
-                } else {
-                    rvvm_info("Machine %p shutting down", machine);
-                    atomic_store_uint32(&machine->running, false);
-                    vector_erase(global_machines, m);
-                    if (manual) {
-                        spin_unlock(&global_lock);
-                        return NULL;
-                    }
-                }
-            }
         }
         spin_unlock(&global_lock);
         condvar_wait(eventloop_cond, 16);
     }
-
+#endif
     return NULL;
 }
 
 static void rvvm_reconfigure_eventloop(void)
 {
+#ifdef __EMSCRIPTEN__
+    spin_lock(&eventloop_lock);
+    eventloop_thread = NULL;
+    emscripten_cancel_main_loop();
+    if (!global_manual) {
+        emscripten_set_main_loop(rvvm_eventloop_tick_em, 0, false);
+    }
+    spin_unlock(&eventloop_lock);
+#else
     spin_lock(&global_lock);
     bool needs_cond = global_manual || vector_size(global_machines);
     bool needs_thread = !global_manual && vector_size(global_machines);
@@ -309,6 +342,7 @@ static void rvvm_reconfigure_eventloop(void)
         eventloop_thread = thread_create(rvvm_eventloop, NULL);
     }
     spin_unlock(&eventloop_lock);
+#endif
 }
 
 PUBLIC bool rvvm_check_abi(int abi)
