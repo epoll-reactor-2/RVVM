@@ -3,18 +3,9 @@ pci-bus.c - Peripheral Component Interconnect Bus
 Copyright (C) 2021  LekKit <github.com/LekKit>
                     cerg2010cerg2010 <github.com/cerg2010cerg2010>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "pci-bus.h"
@@ -103,6 +94,7 @@ static pci_func_t* pci_get_func(pci_bus_t* bus, uint8_t bus_id, uint8_t dev_id, 
 static bool pci_bus_read(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, uint8_t size)
 {
     pci_bus_t* bus = mmio_dev->data;
+    uint32_t val = 0;
     uint8_t bus_id = offset >> bus->bus_shift;
     uint8_t dev_id = bit_cut(offset, bus->bus_shift - 5, 5);
     uint8_t fun_id = bit_cut(offset, bus->bus_shift - 8, 3);
@@ -112,27 +104,26 @@ static bool pci_bus_read(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, u
     pci_func_t* func = pci_get_func(bus, bus_id, dev_id, fun_id);
     if (!func) {
         // Nonexistent devices have all 0xFFFF in their conf space
-        write_uint32_le_m(data, 0xFFFFFFFF);
+        write_uint32_le(data, 0xFFFFFFFF);
         return true;
     }
 
-    write_uint32_le_m(data, 0);
     switch (reg) {
         case PCI_REG_DEV_VEN_ID:
-            write_uint32_le_m(data, func->vendor_id | (uint32_t)func->device_id << 16);
+            val = (func->vendor_id | (uint32_t)func->device_id << 16);
             break;
         case PCI_REG_STATUS_CMD:
-            write_uint32_le_m(data, atomic_load_uint32(&func->status) << 16 | atomic_load_uint32(&func->command));
+            val = (atomic_load_uint32(&func->status) << 16 | atomic_load_uint32(&func->command));
             break;
         case PCI_REG_CLASS_REV:
-            write_uint32_le_m(data, func->class_code << 16| (uint32_t)func->prog_if << 8 | func->rev);
+            val = (func->class_code << 16| (uint32_t)func->prog_if << 8 | func->rev);
             break;
         case PCI_REG_BIST_HDR_LATENCY_CACHE:
             // Set (1 << 16) for PCI-PCI bridges (func->class_code == 0x0604)
-            write_uint32_le_m(data, 16);
+            val = 16;
             break;
         case PCI_REG_IRQ_PIN_LINE:
-            write_uint32_le_m(data, atomic_load_uint32(&func->irq_line) | ((uint32_t)func->irq_pin) << 8);
+            val = (atomic_load_uint32(&func->irq_line) | ((uint32_t)func->irq_pin) << 8);
             break;
         case PCI_REG_BAR0:
         case PCI_REG_BAR1:
@@ -143,17 +134,19 @@ static bool pci_bus_read(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, u
             uint8_t bar_num = (reg - PCI_REG_BAR0) >> 2;
             rvvm_mmio_dev_t* bar = func->bar[bar_num];
             if (bar) {
-                write_uint32_le_m(data, bar->addr);
+                val = bar->addr;
             }
             break;
         }
         case PCI_REG_SSID_SVID:
-            write_uint32_le_m(data, 0xeba110dc);
+            val = 0xeba110dc;
             break;
         case PCI_REG_EXPANSION_ROM: // Not needed for now, works as BAR
         case PCI_REG_CAP_PTR:       // Currently no capabilities supported
             break;
     }
+
+    write_uint32_le(data, val);
 
     return true;
 }
@@ -175,7 +168,7 @@ static bool pci_bus_write(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, 
 
     switch (reg) {
         case PCI_REG_STATUS_CMD:
-            atomic_store_uint32(&func->command, read_uint16_le_m(data));
+            atomic_store_uint32(&func->command, read_uint16_le(data));
             break;
         case PCI_REG_BAR0:
         case PCI_REG_BAR1:
@@ -186,7 +179,7 @@ static bool pci_bus_write(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, 
             uint8_t bar_num = (reg - PCI_REG_BAR0) >> 2;
             rvvm_mmio_dev_t* bar = func->bar[bar_num];
             if (bar) {
-                uint32_t addr = read_uint32_le_m(data) & ~(uint32_t)15;
+                uint32_t addr = read_uint32_le(data) & ~(uint32_t)15;
                 if (~(uint32_t)0 - addr < bar->size) {
                     addr = -bar->size;
                 }
