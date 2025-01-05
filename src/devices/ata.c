@@ -3,18 +3,9 @@ ata.c - IDE/ATA disk controller
 Copyright (C) 2021  cerg2010cerg2010 <github.com/cerg2010cerg2010>
                     LekKit <github.com/LekKit>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "ata.h"
@@ -617,8 +608,6 @@ PUBLIC bool ata_init_pio(rvvm_machine_t* machine, rvvm_addr_t data_base_addr, rv
     return true;
 }
 
-#ifdef USE_PCI
-
 static rvvm_mmio_type_t ata_bmdma_dev_type = {
     .name = "ata_bmdma",
     .remove = ata_remove_dummy,
@@ -849,17 +838,8 @@ PUBLIC pci_dev_t* ata_init_pci(pci_bus_t* pci_bus, const char* image_path, bool 
     return pci_dev;
 }
 
-#else
-PUBLIC pci_dev_t* ata_init_pci(pci_bus_t* pci_bus, const char* image_path, bool rw) { UNUSED(pci_bus); UNUSED(image_path); UNUSED(rw); return NULL; }
-#endif
-
 PUBLIC bool ata_init_auto(rvvm_machine_t* machine, const char* image_path, bool rw)
 {
-#ifdef USE_PCI
     pci_bus_t* pci_bus = rvvm_get_pci_bus(machine);
     return pci_bus && ata_init_pci(pci_bus, image_path, rw);
-#else
-    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, ATA_DATA_DEFAULT_MMIO, 0x2000);
-    return ata_init_pio(machine, addr, addr + 0x1000, image_path, rw);
-#endif
 }
