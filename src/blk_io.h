@@ -107,34 +107,44 @@ void      blk_close(blkdev_t* dev);
 
 static inline uint64_t blk_getsize(blkdev_t* dev)
 {
-    if (!dev) return 0;
-    return dev->size;
+    if (dev) {
+        return dev->size;
+    }
+    return 0;
 }
 
 // It's illegal to seek out of device bounds, resizing the device is also impossible
-static inline size_t blk_read(blkdev_t* dev, void* dst, size_t count, uint64_t offset)
+static inline size_t blk_read(blkdev_t* dev, void* dst, size_t size, uint64_t offset)
 {
-    if (!dev) return 0;
-    uint64_t real_pos = (offset == BLKDEV_CUR) ? dev->pos : offset;
-    if (real_pos + count > dev->size) return 0;
-    size_t ret = dev->type->read(dev->data, dst, count, real_pos);
-    if (offset == BLKDEV_CUR) dev->pos += ret;
-    return ret;
+    if (dev) {
+        uint64_t real_pos = (offset == BLKDEV_CUR) ? dev->pos : offset;
+        if (real_pos + size <= dev->size) {
+            size_t ret = dev->type->read(dev->data, dst, size, real_pos);
+            if (offset == BLKDEV_CUR) dev->pos += ret;
+            return ret;
+        }
+    }
+    return 0;
 }
 
-static inline size_t blk_write(blkdev_t* dev, const void* src, size_t count, uint64_t offset)
+static inline size_t blk_write(blkdev_t* dev, const void* src, size_t size, uint64_t offset)
 {
-    if (!dev) return 0;
-    uint64_t real_pos = (offset == BLKDEV_CUR) ? dev->pos : offset;
-    if (real_pos + count > dev->size) return 0;
-    size_t ret = dev->type->write(dev->data, src, count, real_pos);
-    if (offset == BLKDEV_CUR) dev->pos += ret;
-    return ret;
+    if (dev) {
+        uint64_t real_pos = (offset == BLKDEV_CUR) ? dev->pos : offset;
+        if (real_pos + size <= dev->size) {
+            size_t ret = dev->type->write(dev->data, src, size, real_pos);
+            if (offset == BLKDEV_CUR) dev->pos += ret;
+            return ret;
+        }
+    }
+    return 0;
 }
 
 static inline bool blk_seek(blkdev_t* dev, int64_t offset, uint8_t startpos)
 {
-    if (!dev) return false;
+    if (!dev) {
+        return false;
+    }
     if (startpos == BLKDEV_SEEK_CUR) {
         offset = dev->pos + offset;
     } else if (startpos == BLKDEV_SEEK_END) {
@@ -152,22 +162,29 @@ static inline bool blk_seek(blkdev_t* dev, int64_t offset, uint8_t startpos)
 
 static inline uint64_t blk_tell(blkdev_t* dev)
 {
-    if (!dev) return 0;
-    return dev->pos;
+    if (dev) {
+        return dev->pos;
+    }
+    return 0;
 }
 
-static inline bool blk_trim(blkdev_t* dev, uint64_t offset, uint64_t count)
+static inline bool blk_trim(blkdev_t* dev, uint64_t offset, uint64_t size)
 {
-    if (!dev || !dev->type->trim) return false;
-    uint64_t real_pos = (offset == BLKDEV_CUR) ? dev->pos : offset;
-    if (real_pos + count > dev->size) return false;
-    return dev->type->trim(dev->data, real_pos, count);
+    if (dev && dev->type->trim) {
+        uint64_t real_pos = (offset == BLKDEV_CUR) ? dev->pos : offset;
+        if (real_pos + size > dev->size) {
+            return dev->type->trim(dev->data, real_pos, size);
+        }
+    }
+    return false;
 }
 
 static inline bool blk_sync(blkdev_t* dev)
 {
-    if (!dev || !dev->type->sync) return false;
-    return dev->type->sync(dev->data);
+    if (dev && dev->type->sync) {
+        return dev->type->sync(dev->data);
+    }
+    return false;
 }
 
 #endif

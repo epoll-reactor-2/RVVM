@@ -529,14 +529,38 @@ void* rvfile_get_win32_handle(rvfile_t* file)
  * Block device layer
  */
 
+static void blk_raw_close(void* dev)
+{
+    rvfile_t* file = dev;
+    rvclose(file);
+}
+
+static size_t blk_raw_read(void* dev, void* dst, size_t size, uint64_t offset)
+{
+    rvfile_t* file = dev;
+    return rvread(file, dst, size, offset);
+}
+
+static size_t blk_raw_write(void* dev, const void* src, size_t size, uint64_t offset)
+{
+    rvfile_t* file = dev;
+    return rvwrite(file, src, size, offset);
+}
+
+static bool blk_raw_trim(void* dev, uint64_t offset, uint64_t size)
+{
+    rvfile_t* file = dev;
+    return rvtrim(file, offset, size);
+}
+
 // Raw block device implementation
 // Be careful with function prototypes
 static const blkdev_type_t blkdev_type_raw = {
-    .name = "blk-raw",
-    .close = (void*)rvclose,
-    .read = (void*)rvread,
-    .write = (void*)rvwrite,
-    .trim = (void*)rvtrim,
+    .name  = "blk-raw",
+    .close = blk_raw_close,
+    .read  = blk_raw_read,
+    .write = blk_raw_write,
+    .trim  = blk_raw_trim,
 };
 
 static blkdev_t* blk_raw_open(const char* filename, uint8_t filemode)
