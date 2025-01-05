@@ -72,18 +72,14 @@ Argument explanation:
 -h                  Extended help
 ```
 
-See [wiki page](https://github.com/LekKit/RVVM/wiki/Running) for recommended guest firmware/images and full argument explanation. 
+See [wiki page](https://github.com/LekKit/RVVM/wiki/Running) for recommended guest firmware/images and full argument explanation.
 
 ## ⚖️ License
 The **librvvm** library is licensed under non-viral [**MPL 2.0**](https://github.com/LekKit/RVVM/blob/staging/LICENSE-MPL) license.
 
-If you wish to use **librvvm** as a component of a larger, non-GPL compliant project (permissive, etc), you are free<br>
-to do so in any form (Static linkage, binary distribution, modules) as long as you comply with the MPL 2.0 license.
+If you wish to use **librvvm** as a component of a larger, non-GPL compliant project (permissive, etc), you are free to do so in any form (Static linkage, binary distribution, modules) as long as you comply with the MPL 2.0 license. MPL 2.0 licensing applies to Java JNI bindings as well.
 
-The RVVM Manager and Linux userland emulator (**rvvm** and **rvvm-user**) binaries are licensed under the [**GPL 3.0**](https://github.com/LekKit/RVVM/blob/staging/LICENSE-GPL)<br>
-license, since they are intended for end-users. All the heavy lifting is done by **librvvm** anyways.
-
-Source file headers should be gradually fixed to reflect this.
+The RVVM Manager and Linux userland emulator (**rvvm** and **rvvm-user**) binaries are licensed under the copyleft [**GPL 3.0**](https://github.com/LekKit/RVVM/blob/staging/LICENSE-GPL) license, since they are intended for end-users. All the heavy lifting is done by **librvvm** anyways.
 
 ## 🎉 Contributions
 [![PRs are welcome](https://img.shields.io/badge/Pull%20requests-welcome-8957e5?style=for-the-badge&logo=github)](https://github.com/LekKit/RVVM/pulls?q=is%3Apr+is%3Aclosed)
