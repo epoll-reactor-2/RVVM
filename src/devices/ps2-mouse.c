@@ -3,18 +3,9 @@ ps2-mouse.c - PS2 Mouse
 Copyright (C) 2021  LekKit <github.com/LekKit>
                     cerg2010cerg2010 <github.com/cerg2010cerg2010>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "ps2-altera.h"
@@ -68,9 +59,9 @@ struct hid_mouse {
     // Counters' overflow flags
     bool xoverflow;
     bool yoverflow;
-    
+
     int32_t scroll;     // Scroll axis value
-    
+
     uint8_t mode;
     uint8_t state;      // The mouse is a state machine
     uint8_t resolution; // In pow2, e.g. 2 means multiply by 4
@@ -115,12 +106,12 @@ static void ps2_mouse_move_pkt(hid_mouse_t* mice)
                                 | mice->yoverflow << 7);
     ringbuf_put_u8(&mice->cmdbuf, x);
     ringbuf_put_u8(&mice->cmdbuf, y);
-    
+
     if (mice->whl_detect == 3) {
         // Push scroll axis byte
         ringbuf_put_u8(&mice->cmdbuf, mice->scroll);
     }
-    
+
     ps2_mouse_flush(mice);
     chardev_notify(&mice->chardev, CHARDEV_RX);
 }
@@ -280,13 +271,13 @@ PUBLIC hid_mouse_t* hid_mouse_init_auto_ps2(rvvm_machine_t* machine)
     mice->chardev.write = ps2_mouse_write;
     mice->chardev.remove = ps2_mouse_remove;
     mice->chardev.data = mice;
-    
+
     ps2_mouse_defaults(mice);
-    
+
     ringbuf_create(&mice->cmdbuf, 1024);
     ringbuf_put_u8(&mice->cmdbuf, 0xAA);
     ringbuf_put_u8(&mice->cmdbuf, 0x00);
-    
+
     altps2_init(machine, addr, plic, plic_alloc_irq(plic), &mice->chardev);
     return mice;
 }
