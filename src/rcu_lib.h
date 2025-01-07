@@ -57,6 +57,7 @@ void rcu_synchronize(void);
 static forceinline void rcu_read_lock(void)
 {
     uint32_t* self = &rcu_internal_reader_state;
+    atomic_compiler_barrier();
 #if defined(RCU_DUMMY_SHARED_STATE)
     atomic_add_uint32(self, 1);
 #else
@@ -80,6 +81,7 @@ static forceinline void rcu_read_lock(void)
 static forceinline void rcu_read_unlock(void)
 {
     uint32_t* self = &rcu_internal_reader_state;
+    atomic_compiler_barrier();
 #if defined(RCU_DUMMY_SHARED_STATE)
     uint32_t state = atomic_sub_uint32(self, 1);
 #else
