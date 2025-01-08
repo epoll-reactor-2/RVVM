@@ -10,6 +10,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "usb-xhci.h"
 #include "utils.h"
 #include "mem_ops.h"
+#include "bit_ops.h"
 
 /*
  * Register regions
@@ -40,18 +41,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XHCI_REG_RTSOFF               0x18 // Runtime Registers Space Offset
 #define XHCI_REG_HCCPARMS2            0x1C // Capability Parameters 2
 
-/*
- * Capability constants
- */
-
+// Capability constants
 #define XHCI_VERSION 0x0100 // XHCI v1.0.0
 
 #define XHCI_MAX_SLOTS 0x20 // 32 slots max
 #define XHCI_MAX_PORTS 0x20 // 32 ports max
-#define XHCI_MAX_IRQS  0x01 // 1 interrupter
+#define XHCI_MAX_INTRS 0x01 // 1 interrupter
 
 #define XHCI_CAPLEN_HCIVERSION (XHCI_OPERATIONAL_BASE | (XHCI_VERSION << 16))
-#define XHCI_HCSPARAMS1        (XHCI_MAX_SLOTS | (XHCI_MAX_IRQS << 8) | (XHCI_MAX_PORTS << 24))
+#define XHCI_HCSPARAMS1        (XHCI_MAX_SLOTS | (XHCI_MAX_INTRS << 8) | (XHCI_MAX_PORTS << 24))
 
 #define XHCI_HCCPARAMS1 ((XHCI_EXT_CAPS_BASE << 14) | 0x5) // 64-bit addressing, 64-byte context size
 
@@ -66,6 +64,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XHCI_REG_CRCR     0x98 // Command Ring Control
 #define XHCI_REG_CRCR_H   0x9C
 #define XHCI_REG_DCBAAP   0xB0 // Device Context Base Address Array Pointer
+#define XHCI_REG_DCBAAP_H 0xB4 // Upper half of DCBAAP
 #define XHCI_REG_CONFIG   0xB8 // Configure
 
 // USB Command values
@@ -114,11 +113,24 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 // Each interruptor occupies 0x20 bytes at XHCI_RUNTIME_BASE + 0x20
-#define XHCI_REG_IMAN   0x0  // Interrupter Management
-#define XHCI_REG_IMOD   0x4  // Interrupter Moderation
-#define XHCI_REG_ERSTSZ 0x8  // Event Ring Segment Table Size
-#define XHCI_REG_ERSTBA 0x10 // Event Ring Segment Table Base Address
-#define XHCI_REG_ERDP   0x18 // Event Ring Dequeue Pointer
+#define XHCI_REG_IMAN     0x0  // Interrupter Management
+#define XHCI_REG_IMOD     0x4  // Interrupter Moderation
+#define XHCI_REG_ERSTSZ   0x8  // Event Ring Segment Table Size
+#define XHCI_REG_ERSTBA   0x10 // Event Ring Segment Table Base Address
+#define XHCI_REG_ERSTBA_H 0x14 // Upper half of ERSTBA
+#define XHCI_REG_ERDP     0x18 // Event Ring Dequeue Pointer
+#define XHCI_REG_ERDP_H   0x1C // Upper half of ERDP
+
+/*
+ * Transfer Request Block
+ */
+
+// TRB structure fields
+#define XHCI_TRB_PTR  0x0  // Data Buffer Pointer
+#define XHCI_TRB_LEN  0x8  // Data Buffer Length
+#define XHCI_TRB_CTRL 0xC  // Control
+
+#define XHCI_TRB_ENTRY_SIZE 0x10 // Size of a single TRB structure
 
 static const uint32_t xhci_ext_caps[] = {
     0x02000802, // Supported Protocol Capability: USB 2.0
@@ -132,29 +144,110 @@ static const uint32_t xhci_ext_caps[] = {
 
     0x03000002, // Supported Protocol Capability: USB 3.0
     0x20425355, // "USB "
-    0x10000A11, // Compatible ports 0x11 - 0x1A, 1 speed mode
+    0x10001011, // Compatible ports 0x11 - 0x20, 1 speed mode
     0x00000000,
     0x00050134, // Protocol speed 4: 5 Gbps
     0x00000000,
 };
 
 typedef struct {
+    uint32_t iman;
+    uint32_t erstsz;
+    uint64_t erstba;
+    uint64_t erdp;
+} xhci_interruptor_t;
+
+typedef struct {
     pci_dev_t* pci_dev;
 
-    uint32_t usbcmd;
-    uint32_t dnctrl;
+    uint64_t or_crcr;
+    uint32_t or_usbcmd;
+    uint32_t or_dnctrl;
+    uint64_t or_dcbaap;
+    uint32_t or_config;
+
+    xhci_interruptor_t ints[XHCI_MAX_INTRS];
 } xhci_bus_t;
 
-static uint32_t xhci_port_reg_read(xhci_bus_t* xhci, size_t port_id, size_t port_off)
+static uint32_t xhci_port_reg_read(xhci_bus_t* xhci, size_t id, size_t offset)
 {
     UNUSED(xhci);
-    UNUSED(port_id);
-    if (port_id < 1)
-    switch (port_off) {
-        case XHCI_REG_PORTSC:
+    UNUSED(id);
+    if (offset == XHCI_REG_PORTSC) {
+        // NOTE: WIP testing stuff
+        /*if (id == 0x10) {
+            // NOTE: This causes a guest driver hang for now due to unimplemented cmd queue!
             return XHCI_PORTSC_CCS | XHCI_PORTSC_PED | XHCI_PORTSC_PP;
+        }*/
+        return XHCI_PORTSC_PED | XHCI_PORTSC_PP;
+    }
+    // Power management registers do not really matter
+    return 0;
+}
+
+static void xhci_port_reg_write(xhci_bus_t* xhci, size_t id, size_t offset, uint32_t val)
+{
+    UNUSED(xhci);
+    UNUSED(id);
+    UNUSED(offset);
+    UNUSED(val);
+}
+
+static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
+{
+    UNUSED(xhci);
+    UNUSED(id);
+    UNUSED(val);
+    rvvm_warn("xhci doorbell %08x to %02x", val, (uint32_t)id);
+}
+
+static uint32_t xhci_interruptor_read(xhci_bus_t* xhci, size_t id, size_t offset)
+{
+    if (id < XHCI_MAX_INTRS) {
+        xhci_interruptor_t* interruptor = &xhci->ints[id];
+        switch (offset) {
+            case XHCI_REG_IMAN:
+                return interruptor->iman;
+            case XHCI_REG_ERSTSZ:
+                return interruptor->erstsz;
+            case XHCI_REG_ERSTBA:
+                return interruptor->erstba;
+            case XHCI_REG_ERSTBA_H:
+                return interruptor->erstba >> 32;
+            case XHCI_REG_ERDP:
+                return interruptor->erdp;
+            case XHCI_REG_ERDP_H:
+                return interruptor->erdp >> 32;
+        }
     }
     return 0;
+}
+
+static void xhci_interruptor_write(xhci_bus_t* xhci, size_t id, size_t offset, uint32_t val)
+{
+    if (id < XHCI_MAX_INTRS) {
+        xhci_interruptor_t* interruptor = &xhci->ints[id];
+        switch (offset) {
+            case XHCI_REG_IMAN:
+                interruptor->iman = val;
+                return;
+            case XHCI_REG_ERSTSZ:
+                interruptor->erstsz = val;
+                return;
+            case XHCI_REG_ERSTBA:
+                interruptor->erstba = bit_replace(interruptor->erstba, 0, 32, val);
+                return;
+            case XHCI_REG_ERSTBA_H:
+                interruptor->erstba = bit_replace(interruptor->erstba, 32, 32, val);
+                return;
+            case XHCI_REG_ERDP:
+                interruptor->erdp = bit_replace(interruptor->erdp, 0, 32, val);
+                return;
+            case XHCI_REG_ERDP_H:
+                interruptor->erdp = bit_replace(interruptor->erdp, 32, 32, val);
+                return;
+        }
+    }
 }
 
 static bool xhci_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
@@ -164,19 +257,30 @@ static bool xhci_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8
     UNUSED(size);
 
 
-    if ((offset - XHCI_DOORBELL_BASE) < XHCI_DOORBELL_SIZE) {
-        //rvvm_warn("XHCI doorbell read %04x", (uint32_t)offset);
-    } else if ((offset - XHCI_RUNTIME_BASE) < XHCI_RUNTIME_SIZE) {
-        //rvvm_warn("XHCI runtime read %04x", (uint32_t)offset);
+    if ((offset - XHCI_RUNTIME_BASE) < XHCI_RUNTIME_SIZE) {
+        // Runtime registers
+        size_t runtime_off = (offset - XHCI_RUNTIME_BASE);
+        if (runtime_off < 0x20) {
+            // TODO: Microframe index at XHCI_RUNTIME_BASE
+            val = 0;
+        } else {
+            // Interruptor read
+            val = xhci_interruptor_read(xhci, (runtime_off - 0x20) >> 5, runtime_off & 0x1C);
+        }
+
     } else if ((offset - XHCI_PORT_REGS_BASE) < XHCI_PORT_REGS_SIZE) {
+        // Port registers
         size_t port_id = (offset - XHCI_PORT_REGS_BASE) >> 4;
         size_t port_off = (offset & 0xC);
         val = xhci_port_reg_read(xhci, port_id, port_off);
+
     } else if (offset >= XHCI_EXT_CAPS_BASE) {
+        // Extended capabilities
         size_t entry = (offset - XHCI_EXT_CAPS_BASE) >> 2;
         if (entry < STATIC_ARRAY_SIZE(xhci_ext_caps)) {
             val = xhci_ext_caps[entry];
         }
+
     } else switch (offset) {
         // Capability registers
         case XHCI_REG_CAPLENGTH_HCIVERSION:
@@ -184,6 +288,12 @@ static bool xhci_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8
             break;
         case XHCI_REG_HCSPARAMS1:
             val = XHCI_HCSPARAMS1;
+            break;
+        case XHCI_REG_HCSPARAMS2:
+            val = 0;
+            break;
+        case XHCI_REG_HCSPARAMS3:
+            val = 0;
             break;
         case XHCI_REG_HCCPARAMS1:
             val = XHCI_HCCPARAMS1;
@@ -197,20 +307,35 @@ static bool xhci_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8
 
         // Operational registers
         case XHCI_REG_USBCMD:
-            val = xhci->usbcmd;
+            val = xhci->or_usbcmd;
             break;
         case XHCI_REG_USBSTS:
-            val = ((~xhci->usbcmd) & XHCI_USBSTS_HCH);
+            val = ((~xhci->or_usbcmd) & XHCI_USBSTS_HCH);
             break;
         case XHCI_REG_PAGESIZE:
             val = 0x1; // 4k pages
             break;
         case XHCI_REG_DNCTRL:
-            val = xhci->dnctrl;
+            val = xhci->or_dnctrl;
+            break;
+        case XHCI_REG_CRCR:
+            val = xhci->or_crcr;
+            break;
+        case XHCI_REG_CRCR_H:
+            val = xhci->or_crcr >> 32;
+            break;
+        case XHCI_REG_DCBAAP:
+            val = xhci->or_dcbaap;
+            break;
+        case XHCI_REG_DCBAAP_H:
+            val = xhci->or_dcbaap >> 32;
+            break;
+        case XHCI_REG_CONFIG:
+            val = xhci->or_config;
             break;
 
         default:
-            //rvvm_warn("xhci read  %08x from %04x", val, (uint32_t)offset);
+            rvvm_warn("xhci read  %08x from %04x", val, (uint32_t)offset);
             break;
     }
 
@@ -225,21 +350,54 @@ static bool xhci_pci_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint
     uint32_t val = read_uint32_le(data);
     UNUSED(size);
 
-    switch (offset) {
+    if ((offset - XHCI_DOORBELL_BASE) < XHCI_DOORBELL_SIZE) {
+        // Doorbell registers
+        xhci_doorbell_write(xhci, (offset - XHCI_DOORBELL_BASE) >> 2, val);
+
+    } else if ((offset - XHCI_RUNTIME_BASE) < XHCI_RUNTIME_SIZE) {
+        // Runtime registers
+        size_t runtime_off = (offset - XHCI_RUNTIME_BASE);
+        if (runtime_off >= 0x20) {
+            // Interruptor write
+            xhci_interruptor_write(xhci, (runtime_off - 0x20) >> 5, runtime_off & 0x1C, val);
+        }
+
+    } else if ((offset - XHCI_PORT_REGS_BASE) < XHCI_PORT_REGS_SIZE) {
+        // Port registers
+        size_t port_id = (offset - XHCI_PORT_REGS_BASE) >> 4;
+        size_t port_off = (offset & 0xC);
+        xhci_port_reg_write(xhci, port_id, port_off, val);
+
+    } else switch (offset) {
         // Operational registers
         case XHCI_REG_USBCMD:
-            xhci->usbcmd = val;
-            if (xhci->usbcmd & XHCI_USBCMD_HCRST) {
+            xhci->or_usbcmd = val;
+            if (xhci->or_usbcmd & XHCI_USBCMD_HCRST) {
                 // Perform controller reset
-                xhci->usbcmd &= ~XHCI_USBCMD_HCRST;
+                xhci->or_usbcmd &= ~XHCI_USBCMD_HCRST;
             }
             break;
         case XHCI_REG_DNCTRL:
-            xhci->dnctrl = val;
+            xhci->or_dnctrl = val;
+            break;
+        case XHCI_REG_CRCR:
+            xhci->or_crcr = bit_replace(xhci->or_crcr, 0, 32, val);
+            break;
+        case XHCI_REG_CRCR_H:
+            xhci->or_crcr = bit_replace(xhci->or_crcr, 32, 32, val);
+            break;
+        case XHCI_REG_DCBAAP:
+            xhci->or_dcbaap = bit_replace(xhci->or_dcbaap, 0, 32, val);
+            break;
+        case XHCI_REG_DCBAAP_H:
+            xhci->or_dcbaap = bit_replace(xhci->or_dcbaap, 32, 32, val);
+            break;
+        case XHCI_REG_CONFIG:
+            xhci->or_config = EVAL_MAX(val, XHCI_MAX_SLOTS);
             break;
 
         default:
-            //rvvm_warn("xhci write %08x to   %04x", val, (uint32_t)offset);
+            rvvm_warn("xhci write %08x to   %04x", val, (uint32_t)offset);
             break;
     }
     return true;
