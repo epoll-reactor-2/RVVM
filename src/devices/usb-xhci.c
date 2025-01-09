@@ -253,13 +253,13 @@ static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
     if (id == 0) {
         // Command Ring doorbell
         uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, xhci->or_crcr & ~0x3F, XHCI_TRB_SIZE);
-        rvvm_warn("Command ring doorbell rang, CRCR: %lx", xhci->or_crcr);
+        rvvm_warn("Command doorbell rang");
         if (dma) {
             uint64_t ptr = read_uint64_le(dma);
             uint32_t sts = read_uint32_le(dma + 0x8);
             uint32_t ctr = read_uint32_le(dma + 0xC);
 
-            rvvm_warn("Command TRB: ptr %lx, status %x, control %x", ptr, sts, ctr);
+            rvvm_warn("Command TRB: ptr %x, status %x, control %x", (uint32_t)ptr, sts, ctr);
             rvvm_warn("TRB Type: %x", XHCI_TRB_TYPE(ctr));
         } else {
             rvvm_warn("Command DMA failed!");
