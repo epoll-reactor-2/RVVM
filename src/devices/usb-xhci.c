@@ -51,7 +51,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XHCI_CAPLEN_HCIVERSION (XHCI_OPERATIONAL_BASE | (XHCI_VERSION << 16))
 #define XHCI_HCSPARAMS1        (XHCI_MAX_SLOTS | (XHCI_MAX_INTRS << 8) | (XHCI_MAX_PORTS << 24))
 
-#define XHCI_HCCPARAMS1 ((XHCI_EXT_CAPS_BASE << 14) | 0x5) // 64-bit addressing, 64-byte context size
+#define XHCI_HCCPARAMS1 ((XHCI_EXT_CAPS_BASE << 14) | 0x1) // 64-bit addressing
 
 /*
  * Operational registers
@@ -125,12 +125,64 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
  * Transfer Request Block
  */
 
-// TRB structure fields
-#define XHCI_TRB_PTR  0x0  // Data Buffer Pointer
-#define XHCI_TRB_LEN  0x8  // Data Buffer Length
-#define XHCI_TRB_CTRL 0xC  // Control
+#define XHCI_TRB_SIZE 0x10 // Size of a single TRB structure
 
-#define XHCI_TRB_ENTRY_SIZE 0x10 // Size of a single TRB structure
+// TRB structure fields
+#define XHCI_TRB_PTR 0x0 // Data Buffer Pointer (64-bit)
+#define XHCI_TRB_STS 0x8 // Status (32-bit)
+#define XHCI_TRB_CTR 0xC // Control (32-bit)
+
+// Get TRB transfer length from status word
+#define XHCI_TRB_LENGTH(status) ((status) & 0x1FFFF)
+
+// Get TRB interrupter target to send events to
+#define XHCI_TRB_INTERRUPTER(status) (((status) >> 22) & 0x3FF)
+
+// TRB Control word bits
+#define XHCI_TRB_CTR_C   0x1   // Cycle bit
+#define XHCI_TRB_CTR_ENT 0x2   // Evaluate Next TRB
+#define XHCI_TRB_CTR_ISP 0x4   // Interrupt on Short Packet
+#define XHCI_TRB_CTR_NS  0x8   // No Snoop (Cache optimization hint, ignore)
+#define XHCI_TRB_CTR_CH  0x10  // Chain bit
+#define XHCI_TRB_CTR_IOC 0x20  // Interrupt On Completion
+#define XHCI_TRB_CTR_IDT 0x40  // Immediate Data
+#define XHCI_TRB_CTR_BEI 0x200 // Block Event Interrupt
+
+// Get TRB type from a TRB control word
+#define XHCI_TRB_TYPE(ctrl) (((ctrl) >> 10) & 0x3F)
+
+// TRB types
+#define XHCI_TRB_TYPE_NORMAL          0x1  // Normal
+#define XHCI_TRB_TYPE_SETUP           0x2  // Setup Stage
+#define XHCI_TRB_TYPE_DATA            0x3  // Data Stage
+#define XHCI_TRB_TYPE_STATUS          0x4  // Status Stage
+#define XHCI_TRB_TYPE_ISOC            0x5  // Isoch
+#define XHCI_TRB_TYPE_LINK            0x6  // Link
+#define XHCI_TRB_TYPE_EVENT_DATA      0x7  // Event Data
+#define XHCI_TRB_TYPE_NOOP            0x8  // No-Op
+#define XHCI_TRB_TYPE_ENABLE_SLOT     0x9  // Enable Slot Command
+#define XHCI_TRB_TYPE_DISABLE_SLOT    0xA  // Disable Slot Command
+#define XHCI_TRB_TYPE_ADDR_DEV        0xB  // Address Device Command
+#define XHCI_TRB_TYPE_CONFIG_EP       0xC  // Configure Endpoint Command
+#define XHCI_TRB_TYPE_EVAL_CONTEXT    0xD  // Evaluate Context Command
+#define XHCI_TRB_TYPE_RESET_EP        0xE  // Reset Endpoint Command
+#define XHCI_TRB_TYPE_STOP_RING       0xF  // Stop Endpoint Command
+#define XHCI_TRB_TYPE_SET_DEQ         0x10 // Set TR Dequeue Pointer Command
+#define XHCI_TRB_TYPE_RESET_DEV       0x11 // Reset Device Command
+#define XHCI_TRB_TYPE_FORCE_EVENT     0x12 // Force Event Command (Optional, for virtualization only)
+#define XHCI_TRB_TYPE_NEG_BANDWIDTH   0x13 // Negotiate Bandwidth Command (Optional)
+#define XHCI_TRB_TYPE_SET_LT          0x14 // Set Latency Tolerance Value Command (Optional)
+#define XHCI_TRB_TYPE_GET_BW          0x15 // Get Port Bandwidth Command (Optional)
+#define XHCI_TRB_TYPE_FORCE_HEADER    0x16 // Force Header Command
+#define XHCI_TRB_TYPE_CMD_NOOP        0x17 // No Op Command
+#define XHCI_TRB_TYPE_TRANSFER        0x20 // Transfer Event
+#define XHCI_TRB_TYPE_COMPLETION      0x21 // Command Completion Event
+#define XHCI_TRB_TYPE_PORT_STATUS     0x22 // Port Status Change Event
+#define XHCI_TRB_TYPE_BANDWIDTH_EVENT 0x23 // Bandwidth Request Event (Optional)
+#define XHCI_TRB_TYPE_DOORBELL        0x24 // Doorbell Event (Optional, for virtualization only)
+#define XHCI_TRB_TYPE_HC_EVENT        0x25 // Host Controller Event
+#define XHCI_TRB_TYPE_DEV_NOTE        0x26 // Device Notification Event
+#define XHCI_TRB_TYPE_MFINDEX_WRAP    0x27 // MFINDEX Wrap Event
 
 static const uint32_t xhci_ext_caps[] = {
     0x02000802, // Supported Protocol Capability: USB 2.0
@@ -198,7 +250,23 @@ static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
     UNUSED(xhci);
     UNUSED(id);
     UNUSED(val);
-    rvvm_warn("xhci doorbell %08x to %02x", val, (uint32_t)id);
+    if (id == 0) {
+        // Command Ring doorbell
+        uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, xhci->or_crcr & ~0x3F, XHCI_TRB_SIZE);
+        rvvm_warn("Command ring doorbell rang, CRCR: %lx", xhci->or_crcr);
+        if (dma) {
+            uint64_t ptr = read_uint64_le(dma);
+            uint32_t sts = read_uint32_le(dma + 0x8);
+            uint32_t ctr = read_uint32_le(dma + 0xC);
+
+            rvvm_warn("Command TRB: ptr %lx, status %x, control %x", ptr, sts, ctr);
+            rvvm_warn("TRB Type: %x", XHCI_TRB_TYPE(ctr));
+        } else {
+            rvvm_warn("Command DMA failed!");
+        }
+    } else {
+        rvvm_warn("xhci doorbell %08x to %02x", val, (uint32_t)id);
+    }
 }
 
 static uint32_t xhci_interruptor_read(xhci_bus_t* xhci, size_t id, size_t offset)
