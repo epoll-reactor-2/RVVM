@@ -112,7 +112,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
  * Runtime registers
  */
 
-// Each interruptor occupies 0x20 bytes at XHCI_RUNTIME_BASE + 0x20
+// Each interrupter occupies 0x20 bytes at XHCI_RUNTIME_BASE + 0x20
 #define XHCI_REG_IMAN     0x0  // Interrupter Management
 #define XHCI_REG_IMOD     0x4  // Interrupter Moderation
 #define XHCI_REG_ERSTSZ   0x8  // Event Ring Segment Table Size
@@ -120,6 +120,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XHCI_REG_ERSTBA_H 0x14 // Upper half of ERSTBA
 #define XHCI_REG_ERDP     0x18 // Event Ring Dequeue Pointer
 #define XHCI_REG_ERDP_H   0x1C // Upper half of ERDP
+
+#define XHCI_IMAN_IP 0x1 // Interrupt Pending
+#define XHCI_IMAN_IE 0x2 // Interrupt Enable
 
 /*
  * Transfer Request Block
@@ -134,6 +137,40 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Get TRB transfer length from status word
 #define XHCI_TRB_LENGTH(status) ((status) & 0x1FFFF)
+
+// TRB Status word command completion codes
+#define XHCI_TRB_COMP_SUCCESS     0x1  // Success
+#define XHCI_TRB_COMP_DB_ERR      0x2  // Data Buffer Error
+#define XHCI_TRB_COMP_BABBLE      0x3  // Babble Detected Error
+#define XHCI_TRB_COMP_TX_ERR      0x4  // USB Transaction Error
+#define XHCI_TRB_COMP_TRB_ERR     0x5  // TRB Error
+#define XHCI_TRB_COMP_STALL       0x6  // Stall Error
+#define XHCI_TRB_COMP_RESOURCE    0x7  // Resource Error
+#define XHCI_TRB_COMP_NA_SLOTS    0x8  // No Slots Available Error
+#define XHCI_TRB_COMP_STREAM_ERR  0xA  // Stream Error
+#define XHCI_TRB_COMP_SLOT_NE     0xB  // Slot Not Enabled
+#define XHCI_TRB_COMP_ENDPOINT_NE 0xC  // Endpoint Not Enabled
+#define XHCI_TRB_COMP_SHORT_PKT   0xD  // Short Packet
+#define XHCI_TRB_COMP_UNDERRUN    0xE  // Ring Underrun
+#define XHCI_TRB_COMP_OVERRUN     0xF  // Ring Overrun
+#define XHCI_TRB_COMP_EINVAL      0x11 // Parameter Error
+#define XHCI_TRB_COMP_BW_OVER     0x12 // Bandwidth Overrun Error
+#define XHCI_TRB_COMP_CTX_STATE   0x13 // Context State Error
+#define XHCI_TRB_COMP_PING_ERR    0x14 // No Ping Response Error
+#define XHCI_TRB_COMP_ER_FULL     0x15 // Event Ring is full
+#define XHCI_TRB_COMP_DEV_ERR     0x16 // Incompatible Device Error
+#define XHCI_TRB_COMP_MISSED_INT  0x17 // Missed Service Error
+#define XHCI_TRB_COMP_CMD_STOP    0x18 // Stopped command ring
+#define XHCI_TRB_COMP_CMD_ABORT   0x19 // Aborted command and stopped command ring
+#define XHCI_TRB_COMP_STOP        0x1A // Transfer stopped by a stop endpoint command
+#define XHCI_TRB_COMP_STOP_INVAL  0x1B // Same as STOP, but transfer length is invalid
+#define XHCI_TRB_COMP_MEL_ERR     0x1D // Max Exit Latency Too Large Error
+#define XHCI_TRB_COMP_BUFF_OVER   0x1F // Isoch Buffer Overrun
+#define XHCI_TRB_COMP_ISSUES      0x20 // Event Lost Error
+#define XHCI_TRB_COMP_UNKNOWN     0x21 // Undefined Error
+#define XHCI_TRB_COMP_STRID_ERR   0x22 // Invalid Stream ID Error
+#define XHCI_TRB_COMP_2ND_BW_ERR  0x23 // Secondary Bandwidth Error
+#define XHCI_TRB_COMP_SPLIT_ERR   0x24 // Split Transaction Error
 
 // Get TRB interrupter target to send events to
 #define XHCI_TRB_INTERRUPTER(status) (((status) >> 22) & 0x3FF)
@@ -203,11 +240,18 @@ static const uint32_t xhci_ext_caps[] = {
 };
 
 typedef struct {
-    uint32_t iman;
-    uint32_t erstsz;
-    uint64_t erstba;
-    uint64_t erdp;
-} xhci_interruptor_t;
+    // Registers
+    uint32_t iman;   // Interrupt Management
+    uint32_t erstsz; // Event Ring Segment Table Size
+    uint64_t erstba; // Event Ring Segment Base Address
+    uint64_t erdp;   // Event Ring Dequeue Pointer
+
+    // Internal
+    uint64_t crep;   // Current Ring Enqueue Pointer
+    uint64_t crsea;  // Current Ring Segment Entry Address
+    uint64_t crsba;  // Current Ring Segment Base Address
+    uint32_t crssz;  // Current Ring Segment Size
+} xhci_interrupter_t;
 
 typedef struct {
     pci_dev_t* pci_dev;
@@ -218,8 +262,53 @@ typedef struct {
     uint64_t or_dcbaap;
     uint32_t or_config;
 
-    xhci_interruptor_t ints[XHCI_MAX_INTRS];
+    xhci_interrupter_t ints[XHCI_MAX_INTRS];
 } xhci_bus_t;
+
+typedef struct {
+    uint64_t ptr;
+    uint32_t sts;
+    uint32_t ctr;
+    uint32_t interrupter;
+} xhci_event_trb_t;
+
+static void xhci_report_event(xhci_bus_t* xhci, const xhci_event_trb_t* event)
+{
+    if (event->interrupter < XHCI_MAX_INTRS) {
+        xhci_interrupter_t* interrupter = &xhci->ints[event->interrupter];
+        if (interrupter->crep >= (interrupter->crsba + (interrupter->crssz << 4))) {
+            // Reached end of ring segment
+            interrupter->crsea += 0x10;
+            if (interrupter->crsea >= (interrupter->erstba + (interrupter->erstsz << 4))) {
+                // Reached end of ring segment table
+                interrupter->crsea = interrupter->erstba & ~0xF;
+            }
+            uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, interrupter->crsea, 0x10);
+            if (dma) {
+                interrupter->crsba = read_uint64_le(dma) & ~0x3F;
+                interrupter->crssz = read_uint16_le(dma + 0x8);
+            } else {
+                rvvm_warn("xhci ring segment table dma error");
+            }
+            interrupter->crep = interrupter->crsba;
+        }
+
+        uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, interrupter->crep, XHCI_TRB_SIZE);
+        if (dma) {
+            rvvm_warn("xhci event submitted at %x", (uint32_t)interrupter->crep);
+            write_uint64_le(dma + XHCI_TRB_PTR, event->ptr);
+            write_uint32_le(dma + XHCI_TRB_STS, event->sts);
+            write_uint32_le(dma + XHCI_TRB_CTR, event->ctr);
+
+            interrupter->crep += XHCI_TRB_SIZE;
+
+            interrupter->iman |= XHCI_IMAN_IP;
+            if (interrupter->iman & XHCI_IMAN_IE) {
+                pci_send_irq(xhci->pci_dev, 0/*event->interrupter*/);
+            }
+        }
+    }
+}
 
 static uint32_t xhci_port_reg_read(xhci_bus_t* xhci, size_t id, size_t offset)
 {
@@ -227,10 +316,10 @@ static uint32_t xhci_port_reg_read(xhci_bus_t* xhci, size_t id, size_t offset)
     UNUSED(id);
     if (offset == XHCI_REG_PORTSC) {
         // NOTE: WIP testing stuff
-        /*if (id == 0x10) {
+        if (id == 0x10) {
             // NOTE: This causes a guest driver hang for now due to unimplemented cmd queue!
             return XHCI_PORTSC_CCS | XHCI_PORTSC_PED | XHCI_PORTSC_PP;
-        }*/
+        }
         return XHCI_PORTSC_PED | XHCI_PORTSC_PP;
     }
     // Power management registers do not really matter
@@ -252,67 +341,97 @@ static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
     UNUSED(val);
     if (id == 0) {
         // Command Ring doorbell
-        uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, xhci->or_crcr & ~0x3F, XHCI_TRB_SIZE);
-        rvvm_warn("Command doorbell rang");
-        if (dma) {
-            uint64_t ptr = read_uint64_le(dma);
-            uint32_t sts = read_uint32_le(dma + 0x8);
-            uint32_t ctr = read_uint32_le(dma + 0xC);
+        rvvm_warn("xhci command doorbell rang");
+        rvvm_addr_t cr_addr = xhci->or_crcr & ~0x3F;
+        while (true) {
+            uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, cr_addr, XHCI_TRB_SIZE);
+            if (dma) {
+                uint64_t ptr = read_uint64_le(dma);
+                uint32_t sts = read_uint32_le(dma + 0x8);
+                uint32_t ctr = read_uint32_le(dma + 0xC);
+                if ((ctr ^ xhci->or_crcr) & XHCI_TRB_CTR_C) {
+                    // Cycle bit mismatch, stop the ring
+                    rvvm_warn("xhci command ring stopped");
+                    xhci->or_crcr &= 0x3F;
+                    xhci->or_crcr &= ~XHCI_CRCR_CRR;
+                    xhci->or_crcr |= cr_addr;
+                    break;
+                }
 
-            rvvm_warn("Command TRB: ptr %x, status %x, control %x", (uint32_t)ptr, sts, ctr);
-            rvvm_warn("TRB Type: %x", XHCI_TRB_TYPE(ctr));
-        } else {
-            rvvm_warn("Command DMA failed!");
+                rvvm_warn("xhci command TRB: ptr %x, status %x, control %x", (uint32_t)ptr, sts, ctr);
+                rvvm_warn("xhci command TRB Type: %x", XHCI_TRB_TYPE(ctr));
+
+                xhci_event_trb_t event = {
+                    .ptr = cr_addr,
+                    .ctr = (XHCI_TRB_TYPE_COMPLETION << 10) | XHCI_TRB_CTR_C,
+                    .sts = (XHCI_TRB_COMP_SUCCESS << 24),
+                    .interrupter = XHCI_TRB_INTERRUPTER(ctr),
+                };
+                xhci_report_event(xhci, &event);
+
+                if (XHCI_TRB_TYPE(ctr) == XHCI_TRB_TYPE_LINK) {
+                    // Jump to link TRB pointer
+                    cr_addr = ptr & ~0x3F;
+                } else {
+                    // Advance the ring
+                    cr_addr += XHCI_TRB_SIZE;
+                }
+            } else {
+                // DMA error
+                rvvm_warn("xhci command DMA failed!");
+                break;
+            }
         }
     } else {
         rvvm_warn("xhci doorbell %08x to %02x", val, (uint32_t)id);
     }
 }
 
-static uint32_t xhci_interruptor_read(xhci_bus_t* xhci, size_t id, size_t offset)
+static uint32_t xhci_interrupter_read(xhci_bus_t* xhci, size_t id, size_t offset)
 {
     if (id < XHCI_MAX_INTRS) {
-        xhci_interruptor_t* interruptor = &xhci->ints[id];
+        xhci_interrupter_t* interrupter = &xhci->ints[id];
         switch (offset) {
             case XHCI_REG_IMAN:
-                return interruptor->iman;
+                return interrupter->iman;
             case XHCI_REG_ERSTSZ:
-                return interruptor->erstsz;
+                return interrupter->erstsz;
             case XHCI_REG_ERSTBA:
-                return interruptor->erstba;
+                return interrupter->erstba;
             case XHCI_REG_ERSTBA_H:
-                return interruptor->erstba >> 32;
+                return interrupter->erstba >> 32;
             case XHCI_REG_ERDP:
-                return interruptor->erdp;
+                return interrupter->erdp;
             case XHCI_REG_ERDP_H:
-                return interruptor->erdp >> 32;
+                return interrupter->erdp >> 32;
         }
     }
     return 0;
 }
 
-static void xhci_interruptor_write(xhci_bus_t* xhci, size_t id, size_t offset, uint32_t val)
+static void xhci_interrupter_write(xhci_bus_t* xhci, size_t id, size_t offset, uint32_t val)
 {
     if (id < XHCI_MAX_INTRS) {
-        xhci_interruptor_t* interruptor = &xhci->ints[id];
+        xhci_interrupter_t* interrupter = &xhci->ints[id];
         switch (offset) {
             case XHCI_REG_IMAN:
-                interruptor->iman = val;
+                interrupter->iman = val;
                 return;
             case XHCI_REG_ERSTSZ:
-                interruptor->erstsz = val;
+                interrupter->erstsz = val;
                 return;
             case XHCI_REG_ERSTBA:
-                interruptor->erstba = bit_replace(interruptor->erstba, 0, 32, val);
+                interrupter->erstba = bit_replace(interrupter->erstba, 0, 32, val);
                 return;
             case XHCI_REG_ERSTBA_H:
-                interruptor->erstba = bit_replace(interruptor->erstba, 32, 32, val);
+                interrupter->erstba = bit_replace(interrupter->erstba, 32, 32, val);
+                interrupter->crsea = interrupter->erstba;
                 return;
             case XHCI_REG_ERDP:
-                interruptor->erdp = bit_replace(interruptor->erdp, 0, 32, val);
+                interrupter->erdp = bit_replace(interrupter->erdp, 0, 32, val);
                 return;
             case XHCI_REG_ERDP_H:
-                interruptor->erdp = bit_replace(interruptor->erdp, 32, 32, val);
+                interrupter->erdp = bit_replace(interrupter->erdp, 32, 32, val);
                 return;
         }
     }
@@ -332,8 +451,8 @@ static bool xhci_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8
             // TODO: Microframe index at XHCI_RUNTIME_BASE
             val = 0;
         } else {
-            // Interruptor read
-            val = xhci_interruptor_read(xhci, (runtime_off - 0x20) >> 5, runtime_off & 0x1C);
+            // Interrupter read
+            val = xhci_interrupter_read(xhci, (runtime_off - 0x20) >> 5, runtime_off & 0x1C);
         }
 
     } else if ((offset - XHCI_PORT_REGS_BASE) < XHCI_PORT_REGS_SIZE) {
@@ -426,8 +545,8 @@ static bool xhci_pci_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint
         // Runtime registers
         size_t runtime_off = (offset - XHCI_RUNTIME_BASE);
         if (runtime_off >= 0x20) {
-            // Interruptor write
-            xhci_interruptor_write(xhci, (runtime_off - 0x20) >> 5, runtime_off & 0x1C, val);
+            // Interrupter write
+            xhci_interrupter_write(xhci, (runtime_off - 0x20) >> 5, runtime_off & 0x1C, val);
         }
 
     } else if ((offset - XHCI_PORT_REGS_BASE) < XHCI_PORT_REGS_SIZE) {
@@ -443,6 +562,8 @@ static bool xhci_pci_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint
             if (xhci->or_usbcmd & XHCI_USBCMD_HCRST) {
                 // Perform controller reset
                 xhci->or_usbcmd &= ~XHCI_USBCMD_HCRST;
+                xhci->or_crcr = 0;
+                memset(xhci->ints, 0, sizeof(xhci->ints));
             }
             break;
         case XHCI_REG_DNCTRL:
