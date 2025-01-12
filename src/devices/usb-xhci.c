@@ -343,7 +343,8 @@ static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
         // Command Ring doorbell
         rvvm_warn("xhci command doorbell rang");
         rvvm_addr_t cr_addr = xhci->or_crcr & ~0x3F;
-        while (true) {
+        rvvm_addr_t start = cr_addr;
+        do {
             uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, cr_addr, XHCI_TRB_SIZE);
             if (dma) {
                 uint64_t ptr = read_uint64_le(dma);
@@ -363,7 +364,7 @@ static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
 
                 xhci_event_trb_t event = {
                     .ptr = cr_addr,
-                    .ctr = (XHCI_TRB_TYPE_COMPLETION << 10) | XHCI_TRB_CTR_C,
+                    .ctr = (XHCI_TRB_TYPE_COMPLETION << 10) | (xhci->or_crcr & XHCI_CRCR_RCS),
                     .sts = (XHCI_TRB_COMP_SUCCESS << 24),
                     .interrupter = XHCI_TRB_INTERRUPTER(ctr),
                 };
@@ -381,7 +382,7 @@ static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
                 rvvm_warn("xhci command DMA failed!");
                 break;
             }
-        }
+        } while (cr_addr != start);
     } else {
         rvvm_warn("xhci doorbell %08x to %02x", val, (uint32_t)id);
     }
