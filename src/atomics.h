@@ -380,6 +380,16 @@ static forceinline uint32_t atomic_or_uint32_ex(void* addr, uint32_t val, int me
 #endif
 }
 
+static forceinline uint32_t atomic_load_uint32_relax(const void* addr)
+{
+    return atomic_load_uint32_ex(addr, ATOMIC_RELAXED);
+}
+
+static forceinline void atomic_store_uint32_relax(void* addr, uint32_t val)
+{
+    atomic_store_uint32_ex(addr, val, ATOMIC_RELAXED);
+}
+
 static forceinline uint32_t atomic_load_uint32(const void* addr)
 {
     return atomic_load_uint32_ex(addr, ATOMIC_ACQUIRE);
@@ -620,6 +630,16 @@ static forceinline uint64_t atomic_or_uint64_ex(void* addr, uint64_t val, int me
     } while (!atomic_cas_uint64_ex(addr, tmp, tmp | val, false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE));
     return tmp;
 #endif
+}
+
+static forceinline uint64_t atomic_load_uint64_relax(const void* addr)
+{
+    return atomic_load_uint64_ex(addr, ATOMIC_RELAXED);
+}
+
+static forceinline void atomic_store_uint64_relax(void* addr, uint64_t val)
+{
+    atomic_store_uint64_ex(addr, val, ATOMIC_RELAXED);
 }
 
 static forceinline uint64_t atomic_load_uint64(const void* addr)
