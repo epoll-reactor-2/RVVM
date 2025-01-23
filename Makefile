@@ -356,11 +356,6 @@ ifeq ($(OS),emscripten)
 override CFLAGS_USE_SDL := -s USE_SDL=$(USE_SDL)
 endif
 
-# Enable building the lib on lib or install target
-ifeq (,$(findstring lib, $(MAKECMDGOALS))$(findstring install, $(MAKECMDGOALS)))
-override USE_LIB := 0
-endif
-
 # Fix Nix & MacOS brew issues with non-standard library paths
 ifneq (,$(findstring linux,$(OS))$(findstring darwin,$(OS)))
 ifneq ($(USE_SDL),0)
@@ -580,6 +575,19 @@ $(info $(WHITE)Target arch: $(GREEN)$(ARCH)$(RESET))
 $(info $(WHITE)Version:     $(GREEN)RVVM $(VERSION)$(RESET))
 $(info $(EMPTY))
 
+#
+# Make targets
+#
+
+.PHONY: all         # Build everything (Default)
+all: bin lib
+
+.PHONY: bin         # Build the main executable
+bin: $(BINARY)
+
+.PHONY: lib         # Build shared / static libraries based on useflags
+lib: $(if $(findstring 1,$(USE_LIB)),$(SHARED)) $(if $(findstring 1,$(USE_LIB_STATIC)),$(STATIC))
+
 # Ignore deleted header files
 %.h:
 	@:
@@ -608,12 +616,6 @@ $(SHARED): $(LIB_OBJS)
 $(STATIC): $(LIB_OBJS)
 	$(info $(WHITE)[$(GREEN)AR$(WHITE)] $@ $(RESET))
 	@$(AR) -rcs $@ $(LIB_OBJS)
-
-.PHONY: all         # Build the main executable
-all: $(BINARY)
-
-.PHONY: lib         # Build shared & static libraries
-lib: $(if $(findstring 1,$(USE_LIB)),$(SHARED)) $(if $(findstring 1,$(USE_LIB_STATIC)),$(STATIC))
 
 .PHONY: test        # Run RISC-V tests
 test: all
@@ -697,7 +699,7 @@ datarootdir ?= $(prefix)/share
 datadir     ?= $(datarootdir)
 
 .PHONY: install     # Install the package
-install: all lib
+install: all
 ifeq ($(HOST_POSIX),1)
 	$(info $(INFO_PREFIX) Installing to prefix $(DESTDIR)$(prefix)$(RESET))
 	@install -d                            $(DESTDIR)$(bindir)
