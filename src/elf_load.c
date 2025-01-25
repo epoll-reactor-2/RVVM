@@ -113,7 +113,7 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
 
         if (p_type == ELF_PT_LOAD || p_type == ELF_PT_PHDR) {
             // Load ELF program segment or PHDR segment
-            void* vaddr = ((uint8_t*)elf->base) + p_vaddr - elf_loaddr;
+            void* vaddr = ((uint8_t*)elf->base) + (p_vaddr - elf_loaddr);
             WRAP_ERR(p_vaddr + p_memsz <= elf_loaddr + elf->buf_size, "ELF segment does not fit in memory");
             WRAP_ERR(rvread(file, vaddr, p_fsize, p_offset) == p_fsize, "Failed to read ELF segment");
         }
