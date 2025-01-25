@@ -7,27 +7,25 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#ifndef VECTOR_H
-#define VECTOR_H
+#ifndef LEKKIT_VECTOR_H
+#define LEKKIT_VECTOR_H
 
 #include <stddef.h>
 #include <string.h>
 #include "utils.h"
 
-#define vector_t(type) struct {type* data; size_t size; size_t count;}
+#define vector_t(vec_elem_type) struct { vec_elem_type* data; size_t size; size_t count; }
 
-// Empty vectors do not preallocate memory
-// This allows static initialization & conserves memory
-#define VECTOR_INIT {0}
+// Grow the internal vector buffer to fit element at pos, does not initialize memory
+slow_path void vector_grow_internal(void* vec, size_t elem_size, size_t pos);
 
-// Grow factor: 1.5 (Better memory reusage), initial capacity: 2
-#define VECTOR_GROW(vec) \
-    if ((vec).count >= (vec).size) { \
-        (vec).size += (vec).size >> 1; \
-        if ((vec).size == 0) (vec).size = 2; \
-        (vec).data = safe_realloc((vec).data, (vec).size * sizeof(*(vec).data)); \
-    }
+// Emplace new element at pos, zeroing the new element and every preceeding one
+void vector_emplace_internal(void* vec, size_t elem_size, size_t pos);
 
+// Erase element at pos, moving the trailing elements into it's place
+void vector_erase_internal(void* vec, size_t elem_size, size_t pos);
+
+// Initialize vector by zeroing it's fields
 #define vector_init(vec) \
 do { \
     (vec).data = NULL; \
@@ -35,6 +33,7 @@ do { \
     (vec).count = 0; \
 } while(0)
 
+// Free vector buffer
 // May be called multiple times, the vector is empty yet reusable afterwards
 // Semantically identical to clear(), but also frees memory
 #define vector_free(vec) \
@@ -45,51 +44,69 @@ do { \
     (vec).count = 0; \
 } while(0)
 
+// Empty the vector
 #define vector_clear(vec) do { (vec).count = 0; } while(0)
 
+// Get element count
 #define vector_size(vec) (vec).count
 
+// Get underlying buffer capacity
 #define vector_capacity(vec) (vec).size
 
+// Dereference element at specific position
 #define vector_at(vec, pos) (vec).data[pos]
 
+// Resize the vector, zeroing any newly alocated elements
+#define vector_resize(vec, size) \
+do { \
+    if (unlikely((size) > (vec).count)) { \
+        vector_emplace_internal(&(vec), sizeof(*(vec).data), (size) - 1); \
+    } \
+    (vec).count = (size); \
+} while(0)
+
+// Put element at specific position, overwriting previous element there if any
+#define vector_put(vec, pos, val) \
+do { \
+    if (unlikely(pos >= (vec).count)) { \
+        vector_emplace_internal(&(vec), sizeof(*(vec).data), pos); \
+    } \
+    (vec).data[pos] = val; \
+} while(0)
+
+// Insert new element at the end of the vector
 #define vector_push_back(vec, val) \
 do { \
-    VECTOR_GROW(vec); \
+    if (unlikely((vec).count >= (vec).size)) { \
+        vector_grow_internal(&(vec), sizeof(*(vec).data), (vec).count); \
+    } \
     (vec).data[(vec).count++] = val; \
 } while(0)
 
+// Insert element at specific position, move trailing elements forward
 #define vector_insert(vec, pos, val) \
 do { \
-    VECTOR_GROW(vec); \
-    for (size_t _vec_i=(vec).count; _vec_i>pos; --_vec_i) (vec).data[_vec_i] = (vec).data[_vec_i-1]; \
+    vector_emplace_internal(&(vec), sizeof(*(vec).data), pos); \
     (vec).data[pos] = val; \
-    (vec).count++; \
 } while(0)
 
+// Emplace new element at the end of the vector
 #define vector_emplace_back(vec) \
 do { \
-    VECTOR_GROW(vec); \
+    if (unlikely((vec).count >= (vec).size)) { \
+        vector_grow_internal(&(vec), sizeof(*(vec).data), (vec).count); \
+    } \
     memset(&(vec).data[(vec).count++], 0, sizeof(*(vec).data)); \
 } while(0)
 
-#define vector_emplace(vec, pos) \
-do { \
-    VECTOR_GROW(vec); \
-    for (size_t _vec_i=(vec).count; _vec_i>pos; --_vec_i) (vec).data[_vec_i] = (vec).data[_vec_i-1]; \
-    memset(&(vec).data[pos], 0, sizeof(*(vec).data)); \
-    (vec).count++; \
-} while(0)
+// Emplace new element at specific position, move trailing elements forward
+#define vector_emplace(vec, pos) vector_emplace_internal(&(vec), sizeof(*(vec).data), pos)
 
-#define vector_erase(vec, pos) \
-do { \
-    if (pos < (vec).count) { \
-        (vec).count--; \
-        for (size_t _vec_i=pos; _vec_i<(vec).count; ++_vec_i) (vec).data[_vec_i] = (vec).data[_vec_i+1]; \
-    } \
-} while(0)
+// Erase element at specific posision, move trailing elements backward
+#define vector_erase(vec, pos) vector_erase_internal(&(vec), sizeof(*(vec).data), pos)
 
-// Be sure to break loop after vector_erase() since it invalidates forward iterators
+// Iterates the vector in forward order
+// Be sure to break loop after vector_erase(), since it invalidates forward iterators
 #define vector_foreach(vec, iter) \
     for (size_t iter=0; iter<(vec).count; ++iter)
 
