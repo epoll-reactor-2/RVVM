@@ -800,7 +800,7 @@ PUBLIC rvvm_mmio_dev_t* rvvm_attach_mmio(rvvm_machine_t* machine, const rvvm_mmi
         rvvm_mmio_free(dev);
         return NULL;
     }
-    if (dev->mapping && ((dev->addr & 0xFFF) || (((size_t)dev->mapping) & 0xFFF))) {
+    if (dev->mapping && ((dev->addr & 0xFFF) ^ (((size_t)dev->mapping) & 0xFFF))) {
         // Misaligned mappings harm performance when used with KVM or shadow pagetable accel
         rvvm_warn("MMIO device \"%s\" has misaligned mapping, expect lower perf",
                   dev->type ? dev->type->name : "null");
