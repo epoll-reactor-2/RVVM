@@ -21,9 +21,9 @@ jobs:
     - name: Install libX11
       run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends libx11-dev libxext-dev
     - name: Build
-      run: make lib all
+      run: make
     - name: Run RISC-V Tests
-      run: timeout 600 make lib all test
+      run: timeout 600 make test
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4.3.1
       with:
@@ -42,7 +42,7 @@ jobs:
     - name: Set up MinGW
       run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends gcc-mingw-w64-x86-64-win32
     - name: Build
-      run: make CC=x86_64-w64-mingw32-gcc lib all
+      run: make CC=x86_64-w64-mingw32-gcc
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4.3.1
       with:
@@ -65,7 +65,7 @@ jobs:
     - name: Download SDL2 headers
       run: wget ${{env.SDL2_TAR_LINK}} -O - | tar -xzf - && mv ${{env.SDL2_NAME}}/include src/SDL2
     - name: Build
-      run: make lib all
+      run: make
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4.3.1
       with:
@@ -88,7 +88,7 @@ jobs:
     - name: Download SDL2 headers
       run: wget ${{env.SDL2_TAR_LINK}} -O - | tar -xzf - && mv ${{env.SDL2_NAME}}/include src/SDL2
     - name: Build
-      run: make lib all
+      run: make
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4.3.1
       with:
