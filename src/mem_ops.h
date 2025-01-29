@@ -11,7 +11,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define LEKKIT_MEM_OPS_H
 
 #include <stdint.h>
-#include <memory.h>
+#include <string.h>
 
 #include "compiler.h"
 
