@@ -17,388 +17,290 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "threading.h"
 #include "fdtlib.h"
 
+/*
+ * Useful resources:
+ * - https://wiki.osdev.org/ATA_PIO_Mode
+ * - https://wiki.osdev.org/ATA/ATAPI_using_DMA
+ * - https://wiki.osdev.org/ATA_Command_Matrix
+ * - https://www.manualslib.com/manual/574153/Hitachi-Hts548040m9at00.html?page=164#manual
+ */
+
 // Data registers
-#define ATA_REG_DATA   0x00
-#define ATA_REG_ERR    0x01 // or FEATURE
-#define ATA_REG_NSECT  0x02
-#define ATA_REG_LBAL   0x03
-#define ATA_REG_LBAM   0x04
-#define ATA_REG_LBAH   0x05
-#define ATA_REG_DEVICE 0x06
-#define ATA_REG_STATUS 0x07 // or CMD
+#define ATA_REG_DATA    0x00 // PIO Data Register
+#define ATA_REG_ERROR   0x01 // Error Register (RO)
+#define ATA_REG_NSECT   0x02 // Number of sectors to read/write (0 means 256)
+#define ATA_REG_LBAL    0x03 // LBAlow
+#define ATA_REG_LBAM    0x04 // LBAmid
+#define ATA_REG_LBAH    0x05 // LBAhigh
+#define ATA_REG_DEVICE  0x06 // Device control register
+#define ATA_REG_STATUS  0x07 // Status (RO)
+#define ATA_REG_COMMAND 0x07 // Command (WO)
 
 // Control registers
-#define ATA_REG_CTL     0x00 // or alternate STATUS
-#define ATA_REG_DRVADDR 0x01
+#define ATA_REG_ALT_STATUS 0x00 // Alternate Status (RO)
+#define ATA_REG_CONTROL    0x00 // Control (WO)
 
-// 16-bit registers - needed for LBA48
-#define ATA_REG_SHIFT 0
-typedef uint16_t atareg_t;
+// Slave drive selection bit (Slave drives not supported!)
+#define ATA_DEVICE_SLAVE 0x10
 
 // Error flags for ERR register
-#define ATA_ERR_AMNF  (1 << 0)
-#define ATA_ERR_TKZNF (1 << 1)
-#define ATA_ERR_ABRT  (1 << 2)
-#define ATA_ERR_MCR   (1 << 3)
-#define ATA_ERR_IDNF  (1 << 4)
-#define ATA_ERR_MC    (1 << 5)
-#define ATA_ERR_UNC   (1 << 6)
-#define ATA_ERR_BBK   (1 << 7)
+#define ATA_ERROR_AMNF  0x01 // Address mark not found (Actually used to detect drive after soft reset)
+#define ATA_ERROR_ABRT  0x04 // Aborted command
+#define ATA_ERROR_UNC   0x40 // Uncorrectable data error
 
 // Flags for STATUS register
-#define ATA_STATUS_ERR  (1 << 0)
-#define ATA_STATUS_IDX  (1 << 1)
-#define ATA_STATUS_CORR (1 << 2)
-#define ATA_STATUS_DRQ  (1 << 3)
-#define ATA_STATUS_SRV  (1 << 4) // or DSC aka Seek Complete, deprecated
-#define ATA_STATUS_DF   (1 << 5)
-#define ATA_STATUS_RDY  (1 << 6)
-#define ATA_STATUS_BSY  (1 << 7)
-
-// Flags for DRIVE/HEAD register
-#define ATA_DRIVE_DRV (1 << 4)
-#define ATA_DRIVE_LBA (1 << 6)
+#define ATA_STATUS_ERR  0x01 // Error occured
+#define ATA_STATUS_DRQ  0x08 // Data ready
+#define ATA_STATUS_SRV  0x10 // Overlapped Service Request
+#define ATA_STATUS_RDY  0x40 // Always set, except after an error
 
 // Commands
-#define ATA_CMD_IDENTIFY          0xEC
-#define ATA_CMD_INITIALIZE_DEVICE_PARAMS 0x91
-#define ATA_CMD_READ_SECTORS      0x20
-#define ATA_CMD_WRITE_SECTORS     0x30
-#define ATA_CMD_READ_DMA          0xC8
-#define ATA_CMD_WRITE_DMA         0xCA
-#define ATA_CMD_STANDBY_IMMEDIATE 0xE0
-#define ATA_CMD_IDLE_IMMEDIATE    0xE1
-#define ATA_CMD_STANDBY           0xE2
-#define ATA_CMD_IDLE              0xE3
-#define ATA_CMD_CHECK_POWER_MODE  0xE4
-#define ATA_CMD_SLEEP             0xE6
+#define ATA_CMD_NOP               0x00 // No operation
+#define ATA_CMD_READ_SECTORS      0x20 // Read Sectors (PIO)
+#define ATA_CMD_WRITE_SECTORS     0x30 // Write Sectors (PIO)
+#define ATA_CMD_INIT_DEV_PARAMS   0x91 // Set CHS addressing options, CHS not supported!
+#define ATA_CMD_READ_DMA          0xC8 // Prepare to read DMA (Actually just seek)
+#define ATA_CMD_WRITE_DMA         0xCA // Prepare to write DMA (Actually just seek)
+#define ATA_CMD_CHECK_POWER_MODE  0xE4 // Check power mode
+#define ATA_CMD_IDENTIFY          0xEC // Identify drive
 
-// BMDMA registers
-#define ATA_BMDMA_CMD    0x0
-#define ATA_BMDMA_STATUS 0x2
-#define ATA_BMDMA_PRDT   0x4
+// ATA BMDMA registers
+#define ATA_BMDMA_COMMAND 0x0
+#define ATA_BMDMA_STATUS  0x2
+#define ATA_BMDMA_PRDT    0x4
 
-#define SECTOR_SIZE 512
+// ATA BMDMA flags
+#define ATA_BMDMA_COMMAND_DMA  0x01 // Enable DMA mode
+#define ATA_BMDMA_COMMAND_READ 0x08 // Perform DMA read
 
-/* CHS is not supported - it's dead anyway...
-// Limits for C/H/S calculation
-// Max sectors per track: 255, usually 63 because of six bit numberring. Starts from 1
-#define MAX_SPT           63 // Sectors per track
-#define MAX_HPC           16 // Heads per cyllinder/track
-#define MAX_CYLLINDERS 65536 // 16-bit addressing limit
-*/
+#define ATA_BMDMA_STATUS_IRQ 0x04 // DMA mode exited
+#define ATA_BMDMA_STATUS_ERR 0x02 // DMA operation failed
+#define ATA_BMDMA_STATUS_DMA 0x01 // DMA mode enabled
 
-#define DIV_ROUND_UP(x, d) (((x) + (d) - 1) / (d))
+#define ATA_SECTOR_SHIFT 9
+#define ATA_SECTOR_SIZE  512
 
-struct ata_dev
+typedef struct {
+    pci_func_t* pci_func;
+    blkdev_t*   blk;
+    spinlock_t  lock;
+    spinlock_t  dma_lock;
+
+    // Current LBA
+    uint64_t lba;
+
+    // ATA BMDMA
+    uint32_t prdt_addr;
+    uint32_t bmdma_command;
+    uint32_t bmdma_status;
+
+    // ATA generic
+    uint16_t bytes_to_rw;
+    uint16_t sectcount;
+    uint8_t drive;
+    uint8_t error;
+    uint8_t status;
+
+    uint8_t buf[ATA_SECTOR_SIZE];
+    char serial[16];
+} ata_dev_t;
+
+static inline bool ata_drive_valid(ata_dev_t* ata)
 {
-    struct {
-        blkdev_t* blk;
-        size_t size; // In sectors
-        uint16_t bytes_to_rw;
-        uint16_t sectcount;
-        atareg_t lbal;
-        atareg_t lbam;
-        atareg_t lbah;
-        atareg_t drive;
-        atareg_t error;
-        uint8_t status;
-        uint8_t hob_shift;
-        bool nien; // Interrupt disable
-        uint8_t buf[SECTOR_SIZE];
-    } drive[2];
-    struct {
-        rvvm_addr_t prdt_addr;
-        spinlock_t lock;
-        uint8_t cmd;
-        uint8_t status;
-    } dma_info;
-    spinlock_t lock;
-    uint8_t curdrive;
-    pci_dev_t* pci_dev;
-};
-
-static uint64_t ata_get_lba(struct ata_dev *ata, bool is48bit)
-{
-    if (is48bit) {
-        return bit_cut(ata->drive[ata->curdrive].lbal, 0, 8)
-             | bit_cut(ata->drive[ata->curdrive].lbam, 0, 8) << 8
-             | bit_cut(ata->drive[ata->curdrive].lbah, 0, 8) << 16
-             | bit_cut(ata->drive[ata->curdrive].lbal, 8, 8) << 24
-             | (uint64_t)bit_cut(ata->drive[ata->curdrive].lbam, 8, 8) << 32
-             | (uint64_t)bit_cut(ata->drive[ata->curdrive].lbah, 8, 8) << 40;
-    } else {
-        return bit_cut(ata->drive[ata->curdrive].lbal, 0, 8)
-             | bit_cut(ata->drive[ata->curdrive].lbam, 0, 8) << 8
-             | bit_cut(ata->drive[ata->curdrive].lbah, 0, 8) << 16
-             | bit_cut(ata->drive[ata->curdrive].drive, 0, 4) << 24;
-    }
+    return !(ata->drive & ATA_DEVICE_SLAVE) && ata->blk;
 }
 
-static void ata_send_interrupt(struct ata_dev *ata) {
-    pci_send_irq(ata->pci_dev, 0);
+static inline void ata_send_interrupt(ata_dev_t* ata) {
+    pci_send_irq(ata->pci_func, 0);
 }
 
-static void ata_clear_interrupt(struct ata_dev *ata) {
-    pci_clear_irq(ata->pci_dev, 0);
+static inline void ata_report_error(ata_dev_t* ata, uint8_t error)
+{
+    // No interrupt on error
+    ata->error |= error;
+    ata->status = ATA_STATUS_ERR;
+}
+
+static inline uint64_t ata_get_seek(ata_dev_t* ata)
+{
+    return ata->lba << ATA_SECTOR_SHIFT;
 }
 
 static void ata_copy_id_string(uint8_t* buf, const char* str, size_t size)
 {
-    // Reverse each byte pair since they are little-endian words
+    // Reverse each byte pair since they are little-endian words, pad with spaces
     size_t len = rvvm_strnlen(str, size);
-    for (size_t i=0; i<len; ++i) {
+    memset(buf, ' ', size);
+    for (size_t i = 0; i < len; ++i) {
         buf[i ^ 1ULL] = str[i];
     }
 }
 
-static void ata_cmd_identify(struct ata_dev *ata)
+static void ata_cmd_identify(ata_dev_t* ata)
 {
-    uint8_t id_buf[SECTOR_SIZE] = {0};
-    write_uint16_le(id_buf,         0x40); // Non-removable, ATA device
+    uint8_t* id_buf = ata->buf;
+    memset(id_buf, 0, ATA_SECTOR_SIZE);
+
+    write_uint16_le(id_buf,       0x40);   // Non-removable, ATA device
     write_uint16_le(id_buf + 2,   0xFFFF); // Logical cylinders
-    write_uint16_le(id_buf + 6,     0x10); // Sectors per track
-    write_uint16_le(id_buf + 12,    0x3F); // Logical heads
-    write_uint16_le(id_buf + 44,     0x4); // Number of bytes available in READ/WRITE LONG cmds
-    write_uint16_le(id_buf + 98,   0x300); // Capabilities - LBA supported, DMA supported
+    write_uint16_le(id_buf + 6,   0x10);   // Sectors per track
+    write_uint16_le(id_buf + 12,  0x3F);   // Logical heads
+    write_uint16_le(id_buf + 44,  0x4);    // Number of bytes available in READ/WRITE LONG cmds
+    write_uint16_le(id_buf + 98,  0x300);  // Capabilities - LBA supported, DMA supported
     write_uint16_le(id_buf + 100, 0x4000); // Capabilities - bit 14 needs to be set as required by ATA/ATAPI-5 spec
-    write_uint16_le(id_buf + 102,  0x400); // PIO data transfer cycle timing mode
-    write_uint16_le(id_buf + 106,    0x7); // Fields 54-58, 64-70 and 88 are valid
+    write_uint16_le(id_buf + 102, 0x400);  // PIO data transfer cycle timing mode
+    write_uint16_le(id_buf + 106, 0x7);    // Fields 54-58, 64-70 and 88 are valid
     write_uint16_le(id_buf + 108, 0xFFFF); // Logical cylinders
-    write_uint16_le(id_buf + 110,   0x10); // Logical heads
-    write_uint16_le(id_buf + 112,   0x3F); // Sectors per track
+    write_uint16_le(id_buf + 110, 0x10);   // Logical heads
+    write_uint16_le(id_buf + 112, 0x3F);   // Sectors per track
+
     // Capacity in sectors
-    write_uint16_le(id_buf + 114,  ata->drive[ata->curdrive].size);
-    write_uint16_le(id_buf + 116,  ata->drive[ata->curdrive].size >> 16);
-    write_uint16_le(id_buf + 120,  ata->drive[ata->curdrive].size);
-    write_uint16_le(id_buf + 122,  ata->drive[ata->curdrive].size >> 16);
-    write_uint16_le(id_buf + 128,    0x3); // Advanced PIO modes supported
-    write_uint16_le(id_buf + 134,    0x1); // PIO transfer cycle time without flow control
-    write_uint16_le(id_buf + 136,    0x1); // PIO transfer cycle time with IORDY flow control
-    write_uint16_le(id_buf + 160,  0x100); // ATA major version
+    write_uint16_le(id_buf + 114, blk_getsize(ata->blk) >> 9);
+    write_uint16_le(id_buf + 116, blk_getsize(ata->blk) >> 25);
+    write_uint16_le(id_buf + 120, blk_getsize(ata->blk) >> 9);
+    write_uint16_le(id_buf + 122, blk_getsize(ata->blk) >> 25);
+
+    write_uint16_le(id_buf + 128, 0x3);    // Advanced PIO modes supported
+    write_uint16_le(id_buf + 134, 0x1);    // PIO transfer cycle time without flow control
+    write_uint16_le(id_buf + 136, 0x1);    // PIO transfer cycle time with IORDY flow control
+    write_uint16_le(id_buf + 160, 0x100);  // ATA major version
     write_uint16_le(id_buf + 176, 0x80FF); // UDMA mode 7 active, All UDMA modes supported
 
     // Serial Number
-    ata_copy_id_string(id_buf + 20, "DEADBEEF            ", 20);
+    ata_copy_id_string(id_buf + 20, ata->serial, 20);
     // Firmware Revision
-    ata_copy_id_string(id_buf + 46, "R1059   ", 8);
+    ata_copy_id_string(id_buf + 46, "R1847", 8);
     // Model Number
-    ata_copy_id_string(id_buf + 54, "IDE HDD                                 ", 40);
+    ata_copy_id_string(id_buf + 54, "SATA HDD", 40);
 
-    memcpy(ata->drive[ata->curdrive].buf, id_buf, sizeof(id_buf));
-    ata->drive[ata->curdrive].bytes_to_rw = sizeof(id_buf);
-    ata->drive[ata->curdrive].status = ATA_STATUS_RDY | ATA_STATUS_SRV | ATA_STATUS_DRQ;
-    ata->drive[ata->curdrive].sectcount = 1;
+    ata->bytes_to_rw = ATA_SECTOR_SIZE;
+    ata->status = ATA_STATUS_RDY | ATA_STATUS_SRV | ATA_STATUS_DRQ;
+    ata->sectcount = 1;
     ata_send_interrupt(ata);
 }
 
-static void ata_cmd_initialize_device_params(struct ata_dev *ata)
+static void ata_read_sector(ata_dev_t* ata)
 {
-    // CHS translation is not supported
-    ata->drive[ata->curdrive].status |= ATA_STATUS_ERR;
-    ata->drive[ata->curdrive].error |= ATA_ERR_ABRT;
-}
-
-// Reads the data to buffer
-static bool ata_read_buf(struct ata_dev *ata)
-{
-    if (!blk_read(ata->drive[ata->curdrive].blk,
-                  ata->drive[ata->curdrive].buf,
-                  SECTOR_SIZE, BLKDEV_CUR)) {
-        return false;
-    }
-
-    ata->drive[ata->curdrive].bytes_to_rw = SECTOR_SIZE;
-    ata_send_interrupt(ata);
-    return true;
-}
-
-// Writes the data from buffer to drive
-static bool ata_write_buf(struct ata_dev *ata)
-{
-    if (!blk_write(ata->drive[ata->curdrive].blk,
-                   ata->drive[ata->curdrive].buf,
-                   SECTOR_SIZE, BLKDEV_CUR)) {
-        return false;
-    }
-
-    ata_send_interrupt(ata);
-    return true;
-}
-
-static void ata_cmd_read_sectors(struct ata_dev *ata)
-{
-    ata->drive[ata->curdrive].sectcount &= 0xff;
-    // Sector count of 0 means 256
-    if (ata->drive[ata->curdrive].sectcount == 0) {
-        ata->drive[ata->curdrive].sectcount = 256;
-    }
-
-    ata->drive[ata->curdrive].status |= ATA_STATUS_DRQ | ATA_STATUS_RDY;
-    if (!blk_seek(ata->drive[ata->curdrive].blk, ata_get_lba(ata, false) * SECTOR_SIZE, BLKDEV_SEEK_SET)
-     || !ata_read_buf(ata)) {
-        ata->drive[ata->curdrive].status |= ATA_STATUS_ERR;
-        ata->drive[ata->curdrive].error |= ATA_ERR_UNC;
-    }
-}
-
-static void ata_cmd_write_sectors(struct ata_dev *ata)
-{
-    ata->drive[ata->curdrive].sectcount &= 0xff;
-    // Sector count of 0 means 256
-    if (ata->drive[ata->curdrive].sectcount == 0) {
-        ata->drive[ata->curdrive].sectcount = 256;
-    }
-
-    ata->drive[ata->curdrive].status |= ATA_STATUS_DRQ | ATA_STATUS_RDY;
-    if (!blk_seek(ata->drive[ata->curdrive].blk, ata_get_lba(ata, false) * SECTOR_SIZE, BLKDEV_SEEK_SET)) {
-        ata->drive[ata->curdrive].status |= ATA_STATUS_ERR;
-        ata->drive[ata->curdrive].error |= ATA_ERR_UNC;
-    } else {
-        ata->drive[ata->curdrive].bytes_to_rw = SECTOR_SIZE;
-    }
-}
-
-static void ata_cmd_read_dma(struct ata_dev *ata)
-{
-    spin_lock(&ata->dma_info.lock);
-    ata->drive[ata->curdrive].sectcount &= 0xff;
-    // Sector count of 0 means 256
-    if (ata->drive[ata->curdrive].sectcount == 0) {
-        ata->drive[ata->curdrive].sectcount = 256;
-    }
-
-    ata->drive[ata->curdrive].status |= ATA_STATUS_RDY;
-    ata->drive[ata->curdrive].status &=
-            ~(ATA_STATUS_BSY
-            | ATA_STATUS_DF
-            | ATA_STATUS_DRQ
-            | ATA_STATUS_ERR);
-
-    if (!blk_seek(ata->drive[ata->curdrive].blk, ata_get_lba(ata, false) * SECTOR_SIZE, BLKDEV_SEEK_SET)) {
-        ata->drive[ata->curdrive].status |= ATA_STATUS_ERR;
-        ata->drive[ata->curdrive].error |= ATA_ERR_UNC;
-        spin_unlock(&ata->dma_info.lock);
-        // No interrupt on error?
-    } else {
-        spin_unlock(&ata->dma_info.lock);
+    if (blk_read(ata->blk, ata->buf, ATA_SECTOR_SIZE, BLKDEV_CUR)) {
+        ata->bytes_to_rw = ATA_SECTOR_SIZE;
+        ata->status = ATA_STATUS_RDY | ATA_STATUS_DRQ;
         ata_send_interrupt(ata);
-    }
-}
-
-static void ata_cmd_write_dma(struct ata_dev *ata)
-{
-    spin_lock(&ata->dma_info.lock);
-    ata->drive[ata->curdrive].sectcount &= 0xff;
-    // Sector count of 0 means 256
-    if (ata->drive[ata->curdrive].sectcount == 0) {
-        ata->drive[ata->curdrive].sectcount = 256;
-    }
-
-    ata->drive[ata->curdrive].status |= ATA_STATUS_RDY;
-    ata->drive[ata->curdrive].status &=
-            ~(ATA_STATUS_BSY
-            | ATA_STATUS_DF
-            | ATA_STATUS_DRQ
-            | ATA_STATUS_ERR);
-
-    if (!blk_seek(ata->drive[ata->curdrive].blk, ata_get_lba(ata, false) * SECTOR_SIZE, BLKDEV_SEEK_SET)) {
-        ata->drive[ata->curdrive].status |= ATA_STATUS_ERR;
-        ata->drive[ata->curdrive].error |= ATA_ERR_UNC;
-        spin_unlock(&ata->dma_info.lock);
-        // No interrupt on error?
     } else {
-        spin_unlock(&ata->dma_info.lock);
-        ata_send_interrupt(ata);
+        // IO failed
+        ata_report_error(ata, ATA_ERROR_UNC);
     }
 }
 
-static void ata_cmd_dummy_irq(struct ata_dev *ata)
+static void ata_write_sector(ata_dev_t* ata)
 {
-    ata_send_interrupt(ata);
+    if (blk_write(ata->blk, ata->buf, ATA_SECTOR_SIZE, BLKDEV_CUR)) {
+        ata_send_interrupt(ata);
+    } else {
+        // IO failed
+        ata_report_error(ata, ATA_ERROR_UNC);
+    }
 }
 
-static void ata_cmd_check_power_mode(struct ata_dev *ata)
+// Perform PIO read/write sectors
+static void ata_perform_pio_rw(ata_dev_t* ata, bool write)
 {
-    ata->drive[ata->curdrive].sectcount = 0xff; // Always active
-    ata_send_interrupt(ata);
+    if (blk_seek(ata->blk, ata_get_seek(ata), BLKDEV_SEEK_SET)) {
+        if (write) {
+            ata_write_sector(ata);
+        } else {
+            ata_read_sector(ata);
+        }
+    } else {
+        // Seek failed
+        ata_report_error(ata, ATA_ERROR_UNC);
+    }
 }
 
-static void ata_handle_cmd(struct ata_dev *ata, uint8_t cmd)
+static void ata_handle_cmd(ata_dev_t* ata, uint8_t cmd)
 {
     switch (cmd) {
-        case ATA_CMD_IDENTIFY: ata_cmd_identify(ata); break;
-        case ATA_CMD_INITIALIZE_DEVICE_PARAMS: ata_cmd_initialize_device_params(ata); break;
-        case ATA_CMD_READ_SECTORS: ata_cmd_read_sectors(ata); break;
-        case ATA_CMD_WRITE_SECTORS: ata_cmd_write_sectors(ata); break;
-        case ATA_CMD_READ_DMA: ata_cmd_read_dma(ata); break;
-        case ATA_CMD_WRITE_DMA: ata_cmd_write_dma(ata); break;
-        case ATA_CMD_CHECK_POWER_MODE: ata_cmd_check_power_mode(ata); break;
-        case ATA_CMD_SLEEP:
-        case ATA_CMD_IDLE:
-        case ATA_CMD_IDLE_IMMEDIATE:
-        case ATA_CMD_STANDBY:
-        case ATA_CMD_STANDBY_IMMEDIATE: ata_cmd_dummy_irq(ata); break;
-        default: rvvm_info("ATA unknown cmd 0x%02x", cmd); break;
+        case ATA_CMD_READ_SECTORS:
+        case ATA_CMD_WRITE_SECTORS:
+            // Perform PIO IO
+            ata_perform_pio_rw(ata, cmd == ATA_CMD_WRITE_SECTORS);
+            return;
+        case ATA_CMD_READ_DMA:
+        case ATA_CMD_WRITE_DMA:
+            // Perform a seek without doing any IO yet
+            if (blk_seek(ata->blk, ata_get_seek(ata), BLKDEV_SEEK_SET)) {
+                ata_send_interrupt(ata);
+            } else {
+                // Seek failed
+                ata_report_error(ata, ATA_ERROR_UNC);
+            }
+            return;
+        case ATA_CMD_CHECK_POWER_MODE:
+            // Always active
+            ata->sectcount = 0xFF;
+            ata_send_interrupt(ata);
+            return;
+        case ATA_CMD_IDENTIFY:
+            // Report drive information
+            ata_cmd_identify(ata);
+            return;
+        default:
+            // Ignore
+            rvvm_debug("Unknown ATA command 0x%02x", cmd);
+            ata_send_interrupt(ata);
+            return;
     }
 }
 
-static bool ata_data_mmio_read_handler(rvvm_mmio_dev_t* device, void* data, size_t offset, uint8_t size)
+static bool ata_data_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    struct ata_dev* ata = (struct ata_dev*)device->data;
-    offset >>= ATA_REG_SHIFT;
+    ata_dev_t* ata = dev->data;
+    memset(data, 0, size);
+
     spin_lock(&ata->lock);
     switch (offset) {
         case ATA_REG_DATA:
-            if (ata->drive[ata->curdrive].bytes_to_rw >= size) {
-                uint8_t* addr = ata->drive[ata->curdrive].buf + SECTOR_SIZE - ata->drive[ata->curdrive].bytes_to_rw;
-                memcpy(data, addr, size);
+            if (ata_drive_valid(ata)) {
+                if (ata->bytes_to_rw >= size && ata->bytes_to_rw <= ATA_SECTOR_SIZE) {
+                    uint8_t* addr = ata->buf + ATA_SECTOR_SIZE - ata->bytes_to_rw;
+                    memcpy(data, addr, size);
 
-                ata->drive[ata->curdrive].bytes_to_rw -= size;
-                if (ata->drive[ata->curdrive].bytes_to_rw == 0) {
-                    ata->drive[ata->curdrive].status &= ~ATA_STATUS_DRQ;
-                    if (--ata->drive[ata->curdrive].sectcount != 0) {
-                        ata->drive[ata->curdrive].status |= ATA_STATUS_DRQ;
-                        if (!ata_read_buf(ata)) {
-                            ata->drive[ata->curdrive].status |= ATA_STATUS_ERR;
-                            ata->drive[ata->curdrive].error |= ATA_ERR_UNC;
+                    ata->bytes_to_rw -= size;
+                    if (ata->bytes_to_rw == 0) {
+                        // Finished reading a sector
+                        if (--ata->sectcount) {
+                            // Read next sector
+                            ata_read_sector(ata);
+                        } else {
+                            ata->status = ATA_STATUS_RDY;
                         }
                     }
                 }
-            } else {
-                memset(data, 0, size);
             }
             break;
-        case ATA_REG_ERR:
-            // OSDev says that this register is 16-bit,
-            // but there's no address stored so this seems wrong
-            if (size == 2) {
-                write_uint16_le(data, ata->drive[ata->curdrive].error);
-            } else {
-                write_uint8(data, ata->drive[ata->curdrive].error);
+        case ATA_REG_ERROR:
+            if (ata_drive_valid(ata)) {
+                write_uint8(data, ata->error);
             }
             break;
         case ATA_REG_NSECT:
-            write_uint8(data, ata->drive[ata->curdrive].sectcount >> ata->drive[ata->curdrive].hob_shift);
+            write_uint8(data, ata->sectcount);
             break;
         case ATA_REG_LBAL:
-            write_uint8(data, ata->drive[ata->curdrive].lbal >> ata->drive[ata->curdrive].hob_shift);
+            write_uint8(data, ata->lba);
             break;
         case ATA_REG_LBAM:
-            write_uint8(data, ata->drive[ata->curdrive].lbam >> ata->drive[ata->curdrive].hob_shift);
+            write_uint8(data, ata->lba >> 8);
             break;
         case ATA_REG_LBAH:
-            write_uint8(data, ata->drive[ata->curdrive].lbah >> ata->drive[ata->curdrive].hob_shift);
+            write_uint8(data, ata->lba >> 16);
             break;
         case ATA_REG_DEVICE:
-            write_uint8(data, ata->drive[ata->curdrive].drive | (1 << 5) | (1 << 7));
+            write_uint8(data, ata->drive | 0xE0 | bit_cut(ata->lba, 24, 4));
             break;
         case ATA_REG_STATUS:
-            write_uint8(data, ata->drive[ata->curdrive].status);
-            ata_clear_interrupt(ata);
-            break;
-        default:
-            memset(data, 0, size);
+            if (ata_drive_valid(ata)) {
+                write_uint8(data, ata->status);
+            }
             break;
     }
     spin_unlock(&ata->lock);
@@ -406,78 +308,59 @@ static bool ata_data_mmio_read_handler(rvvm_mmio_dev_t* device, void* data, size
     return true;
 }
 
-static bool ata_data_mmio_write_handler(rvvm_mmio_dev_t* device, void* data, size_t offset, uint8_t size)
+static bool ata_data_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    struct ata_dev* ata = (struct ata_dev*)device->data;
-    offset >>= ATA_REG_SHIFT;
+    ata_dev_t* ata = dev->data;
+
     spin_lock(&ata->lock);
     switch (offset) {
         case ATA_REG_DATA:
-            if (ata->drive[ata->curdrive].bytes_to_rw >= size) {
-                uint8_t* addr = ata->drive[ata->curdrive].buf + SECTOR_SIZE - ata->drive[ata->curdrive].bytes_to_rw;
-                memcpy(addr, data, size);
+            if (ata_drive_valid(ata)) {
+                if (ata->bytes_to_rw >= size && ata->bytes_to_rw <= ATA_SECTOR_SIZE) {
+                    uint8_t* addr = ata->buf + ATA_SECTOR_SIZE - ata->bytes_to_rw;
+                    memcpy(addr, data, size);
 
-                ata->drive[ata->curdrive].bytes_to_rw -= size;
-                if (ata->drive[ata->curdrive].bytes_to_rw == 0) {
-                    ata->drive[ata->curdrive].status &= ~ATA_STATUS_DRQ;
-                    if (--ata->drive[ata->curdrive].sectcount != 0) {
-                        ata->drive[ata->curdrive].status |= ATA_STATUS_DRQ;
-                        ata->drive[ata->curdrive].bytes_to_rw = SECTOR_SIZE;
-                    }
-                    if (!ata_write_buf(ata)) {
-                        ata->drive[ata->curdrive].status |= ATA_STATUS_ERR;
-                        ata->drive[ata->curdrive].error |= ATA_ERR_UNC;
+                    ata->bytes_to_rw -= size;
+                    if (ata->bytes_to_rw == 0) {
+                        // Finished writing a sector
+                        if (--ata->sectcount) {
+                            // Prepare for writing next sector
+                            ata->status = ATA_STATUS_RDY | ATA_STATUS_DRQ;
+                            ata->bytes_to_rw = ATA_SECTOR_SIZE;
+                        }
+
+                        // Store buffered sector
+                        ata_write_sector(ata);
                     }
                 }
             }
-            break;
-        case ATA_REG_ERR: // Features - ignore
             break;
         case ATA_REG_NSECT:
-            ata->drive[ata->curdrive].sectcount <<= 8;
-            ata->drive[ata->curdrive].sectcount |= read_uint8(data);
+            ata->sectcount = read_uint8(data);
+            if (!ata->sectcount) {
+                // Byte 0x00 means 256 sectors
+                ata->sectcount = 256;
+            }
             break;
         case ATA_REG_LBAL:
-            ata->drive[ata->curdrive].lbal <<= 8;
-            ata->drive[ata->curdrive].lbal |= read_uint8(data);
+            ata->lba = bit_replace(ata->lba, 0,  8, read_uint8(data));
             break;
         case ATA_REG_LBAM:
-            ata->drive[ata->curdrive].lbam <<= 8;
-            ata->drive[ata->curdrive].lbam |= read_uint8(data);
+            ata->lba = bit_replace(ata->lba, 8,  8, read_uint8(data));
             break;
         case ATA_REG_LBAH:
-            ata->drive[ata->curdrive].lbah <<= 8;
-            ata->drive[ata->curdrive].lbah |= read_uint8(data);
+            ata->lba = bit_replace(ata->lba, 16, 8, read_uint8(data));
             break;
         case ATA_REG_DEVICE:
-            ata->curdrive = bit_check(read_uint8(data), 4) ? 1 : 0;
-            ata->drive[ata->curdrive].drive = read_uint8(data);
+            ata->drive = read_uint8(data) & ATA_DEVICE_SLAVE;
+            ata->lba = bit_replace(ata->lba, 24, 4, read_uint8(data) & 0xF);
             break;
-        case ATA_REG_STATUS: // Command
-            // Not sure when error is cleared.
-            // Spec says that it contains status of the last command executed
-            ata->drive[ata->curdrive].error = 0;
-            ata->drive[ata->curdrive].status &= ~ATA_STATUS_ERR;
-            ata_handle_cmd(ata, read_uint8(data));
-            break;
-    }
-    spin_unlock(&ata->lock);
-
-    return true;
-}
-
-static bool ata_ctl_mmio_read_handler(rvvm_mmio_dev_t* device, void* data, size_t offset, uint8_t size)
-{
-    struct ata_dev* ata = (struct ata_dev*)device->data;
-    UNUSED(size);
-    offset >>= ATA_REG_SHIFT;
-    spin_lock(&ata->lock);
-    switch (offset) {
-        case ATA_REG_CTL: // Alternate STATUS
-            write_uint8(data, ata->drive[ata->curdrive].status);
-            ata_clear_interrupt(ata);
-            break;
-        case ATA_REG_DRVADDR: // TODO: Seems that Linux doesn't use this
+        case ATA_REG_COMMAND:
+            if (ata_drive_valid(ata)) {
+                ata->error = 0;
+                ata->status = ATA_STATUS_RDY;
+                ata_handle_cmd(ata, read_uint8(data));
+            }
             break;
     }
     spin_unlock(&ata->lock);
@@ -485,53 +368,59 @@ static bool ata_ctl_mmio_read_handler(rvvm_mmio_dev_t* device, void* data, size_
     return true;
 }
 
-static bool ata_ctl_mmio_write_handler(rvvm_mmio_dev_t* device, void* data, size_t offset, uint8_t size)
+static bool ata_ctl_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    struct ata_dev* ata = (struct ata_dev*)device->data;
-    UNUSED(size);
-    offset >>= ATA_REG_SHIFT;
+    ata_dev_t* ata = dev->data;
+    memset(data, 0, size);
+
     spin_lock(&ata->lock);
     switch (offset) {
-        case ATA_REG_CTL: // Device control
-            ata->drive[ata->curdrive].nien = bit_check(read_uint8(data), 1);
-            ata->drive[ata->curdrive].hob_shift = bit_check(read_uint8(data), 7) ? 8 : 0;
-            if (bit_check(read_uint8(data), 2)) {
-                // Soft reset
-                ata->drive[ata->curdrive].bytes_to_rw = 0;
-                ata->drive[ata->curdrive].lbal = 1; // Sectors start from 1
-                ata->drive[ata->curdrive].lbah = 0;
-                ata->drive[ata->curdrive].lbam = 0;
-                ata->drive[ata->curdrive].sectcount = 1;
-                ata->drive[ata->curdrive].drive = 0;
-                if (ata->drive[ata->curdrive].blk != NULL) {
-                    ata->drive[ata->curdrive].error = ATA_ERR_AMNF; // AMNF means OK here...
-                    ata->drive[ata->curdrive].status = ATA_STATUS_RDY | ATA_STATUS_SRV;
-                } else {
-                    ata->drive[ata->curdrive].error = 0;
-                    ata->drive[ata->curdrive].status = 0;
+        case ATA_REG_ALT_STATUS:
+            if (ata_drive_valid(ata)) {
+                write_uint8(data, ata->status);
+            }
+            break;
+    }
+    spin_unlock(&ata->lock);
+
+    return true;
+}
+
+static bool ata_ctl_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+{
+    ata_dev_t* ata = dev->data;
+    UNUSED(size);
+
+    spin_lock(&ata->lock);
+    switch (offset) {
+        case ATA_REG_CONTROL:
+            if (ata_drive_valid(ata)) {
+                if (bit_check(read_uint8(data), 2)) {
+                    // Soft reset
+                    ata->bytes_to_rw = 0;
+                    ata->lba = 1; // Sectors start from 1
+                    ata->sectcount = 1;
+                    ata->drive = 0;
+                    ata->error = ATA_ERROR_AMNF; // AMNF means OK here...
+                    ata->status = ATA_STATUS_RDY | ATA_STATUS_SRV;
                 }
             }
             break;
-        case ATA_REG_DRVADDR: // TODO: Seems that Linux doesn't use this
-            break;
     }
     spin_unlock(&ata->lock);
 
     return true;
 }
 
-static void ata_data_remove(rvvm_mmio_dev_t* device)
+static void ata_data_remove(rvvm_mmio_dev_t* dev)
 {
-    struct ata_dev *ata = (struct ata_dev*)device->data;
-    spin_lock(&ata->dma_info.lock);
-    for (size_t i = 0; i < sizeof(ata->drive) / sizeof(ata->drive[0]); ++i) {
-        if (ata->drive[i].blk != NULL) {
-            blk_close(ata->drive[i].blk);
-        }
+    ata_dev_t* ata = dev->data;
+    if (ata) {
+        spin_lock(&ata->dma_lock);
+        blk_close(ata->blk);
+        spin_unlock(&ata->dma_lock);
+        free(ata);
     }
-    spin_unlock(&ata->dma_info.lock);
-
-    free(ata);
 }
 
 static rvvm_mmio_type_t ata_data_dev_type = {
@@ -550,62 +439,84 @@ static rvvm_mmio_type_t ata_ctl_dev_type = {
     .remove = ata_remove_dummy,
 };
 
-static struct ata_dev* ata_create(const char* image_path, bool rw)
+static ata_dev_t* ata_create(const char* image, bool rw)
 {
-    blkdev_t* blk = blk_open(image_path, rw ? BLKDEV_RW : 0);
-    if (blk == NULL) return NULL;
-    struct ata_dev* ata = safe_new_obj(struct ata_dev);
-    ata->drive[0].blk = blk;
-    ata->drive[0].size = DIV_ROUND_UP(blk_getsize(blk), SECTOR_SIZE);
-    // Slave drives aren't supported
+    blkdev_t* blk = NULL;
+    if (image) {
+        blk = blk_open(image, rw ? BLKDEV_RW : 0);
+        if (!blk) {
+            // Failed to open image
+            return NULL;
+        }
+    }
+    ata_dev_t* ata = safe_new_obj(ata_dev_t);
+    rvvm_randomserial(ata->serial, 12);
+    ata->blk = blk;
     return ata;
 }
 
-PUBLIC bool ata_init_pio(rvvm_machine_t* machine, rvvm_addr_t data_base_addr, rvvm_addr_t ctl_base_addr, const char* image_path, bool rw)
+PUBLIC bool ata_pio_init(rvvm_machine_t* machine, rvvm_addr_t ata_data_addr, rvvm_addr_t ata_ctl_addr, const char* image, bool rw)
 {
-    struct ata_dev* ata = ata_create(image_path, rw);
-    if (ata == NULL) return false;
+    ata_dev_t* ata = ata_create(image, rw);
+    if (!ata) {
+        return false;
+    }
 
     rvvm_mmio_dev_t ata_data = {
-        .addr = data_base_addr,
-        .size = ((ATA_REG_STATUS + 1) << ATA_REG_SHIFT),
+        .addr = ata_data_addr,
+        .size = 0x1000,
         .data = ata,
-        .read = ata_data_mmio_read_handler,
-        .write = ata_data_mmio_write_handler,
+        .read = ata_data_read,
+        .write = ata_data_write,
         .type = &ata_data_dev_type,
         .min_op_size = 1,
-        .max_op_size = 2,
+        .max_op_size = 4,
     };
-    rvvm_attach_mmio(machine, &ata_data);
+    if (!rvvm_attach_mmio(machine, &ata_data)) {
+        return false;
+    }
 
     rvvm_mmio_dev_t ata_ctl = {
-        .addr = ctl_base_addr,
-        .size = ((ATA_REG_DRVADDR + 1) << ATA_REG_SHIFT),
+        .addr = ata_ctl_addr,
+        .size = 0x1000,
         .data = ata,
-        .read = ata_ctl_mmio_read_handler,
-        .write = ata_ctl_mmio_write_handler,
+        .read = ata_ctl_read,
+        .write = ata_ctl_write,
         .type = &ata_ctl_dev_type,
         .min_op_size = 1,
         .max_op_size = 1,
     };
-    rvvm_attach_mmio(machine, &ata_ctl);
-#ifdef USE_FDT
-    uint32_t reg_cells[8];
-    reg_cells[0] = ((uint64_t)data_base_addr) >> 32;
-    reg_cells[1] = data_base_addr;
-    reg_cells[4] = ((uint64_t)ctl_base_addr) >> 32;
-    reg_cells[5] = ctl_base_addr;
-    reg_cells[2] = reg_cells[6] = 0;
-    reg_cells[3] = reg_cells[7] = 0x1000;
+    if (!rvvm_attach_mmio(machine, &ata_ctl)) {
+        return false;
+    }
 
-    struct fdt_node* ata_node = fdt_node_create_reg("ata", data_base_addr);
-    fdt_node_add_prop_cells(ata_node, "reg", reg_cells, 8);
-    fdt_node_add_prop_str(ata_node, "compatible", "ata-generic");
-    fdt_node_add_prop_u32(ata_node, "reg-shift", ATA_REG_SHIFT);
-    fdt_node_add_prop_u32(ata_node, "pio-mode", 4);
-    fdt_node_add_child(rvvm_get_fdt_soc(machine), ata_node);
+#ifdef USE_FDT
+    uint32_t reg_cells[8] = {
+        ata_data_addr >> 32,
+        ata_data_addr,
+        0x0,
+        0x1000,
+        ata_ctl_addr >> 32,
+        ata_ctl_addr,
+        0x0,
+        0x1000,
+    };
+
+    struct fdt_node* ata_fdt = fdt_node_create_reg("ata", ata_data_addr);
+    fdt_node_add_prop_cells(ata_fdt, "reg", reg_cells, STATIC_ARRAY_SIZE(reg_cells));
+    fdt_node_add_prop_str(ata_fdt, "compatible", "ata-generic");
+    fdt_node_add_prop_u32(ata_fdt, "reg-shift", 0);
+    fdt_node_add_prop_u32(ata_fdt, "pio-mode", 4);
+    fdt_node_add_child(rvvm_get_fdt_soc(machine), ata_fdt);
 #endif
+
     return true;
+}
+
+PUBLIC bool ata_pio_init_auto(rvvm_machine_t* machine, const char* image, bool rw)
+{
+    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, ATA_DATA_ADDR_DEFAULT, 0x2000);
+    return ata_pio_init(machine, addr, addr + 0x1000, image, rw);
 }
 
 static rvvm_mmio_type_t ata_bmdma_dev_type = {
@@ -613,233 +524,229 @@ static rvvm_mmio_type_t ata_bmdma_dev_type = {
     .remove = ata_remove_dummy,
 };
 
-static void ata_process_prdt(struct ata_dev* ata)
+static void ata_process_prdt(ata_dev_t* ata)
 {
-    blkdev_t* blk = ata->drive[ata->curdrive].blk;
-    bool is_read = bit_check(ata->dma_info.cmd, 3);
-    size_t to_process = ata->drive[ata->curdrive].sectcount * SECTOR_SIZE;
+    rvvm_addr_t prdt_addr = atomic_load_uint32(&ata->prdt_addr);
+    bool is_read = !!(atomic_load_uint32(&ata->bmdma_command) & ATA_BMDMA_COMMAND_READ);
+    size_t to_process = ata->sectcount << ATA_SECTOR_SHIFT;
     size_t processed = 0;
-    // According to spec, maximum amount of PRDT entries is 65536
+
+    // According to spec, maximum amount of PRDT entries is 64k
     // This should prevent malicious guests from hanging up the thread
-    for (size_t i=0; i<65536; ++i) {
+    for (size_t i = 0; i < 0x10000; ++i) {
         // Read PRD
-        uint8_t* buf = pci_get_dma_ptr(ata->pci_dev, ata->dma_info.prdt_addr, 8);
-        if (buf == NULL) break;
-        uint32_t prd_physaddr = read_uint32_le_m(buf);
-        uint32_t prd_sectcount = read_uint32_le_m(buf + 4);
+        const uint8_t* prd = pci_get_dma_ptr(ata->pci_func, prdt_addr, 8);
+        if (!prd) {
+            // DMA error
+            break;
+        }
+        uint32_t prd_physaddr = read_uint32_le_m(prd);
+        uint32_t prd_sectcount = read_uint32_le_m(prd + 4);
 
-        uint32_t buf_size = prd_sectcount & 0xffff;
-        // Value 0 means size of 64K
-        if (buf_size == 0) buf_size = 65536;
+        uint32_t buf_size = prd_sectcount & 0xFFFF;
+        if (buf_size == 0) {
+            // Value 0 means 64K
+            buf_size = 0x10000;
+        }
 
-        buf = pci_get_dma_ptr(ata->pci_dev, prd_physaddr, buf_size);
-        if (buf == NULL) break;
+        void* buffer = pci_get_dma_ptr(ata->pci_func, prd_physaddr, buf_size);
+        if (!buffer) {
+            // DMA error
+            break;
+        }
 
         // Read/write data to/from RAM
         if (is_read) {
-            if (blk_read(blk, buf, buf_size, BLKDEV_CUR) != buf_size) {
+            if (blk_read(ata->blk, buffer, buf_size, BLKDEV_CUR) != buf_size) {
+                // IO error
                 break;
             }
         } else {
-            if (blk_write(blk, buf, buf_size, BLKDEV_CUR) != buf_size) {
+            if (blk_write(ata->blk, buffer, buf_size, BLKDEV_CUR) != buf_size) {
+                // IO error
                 break;
             }
         }
 
         processed += buf_size;
 
-        // If bit 31 is set, this is the last PRD
-        if (bit_check(prd_sectcount, 31)) break;
+        if (bit_check(prd_sectcount, 31)) {
+            // This is the last PRD
+            break;
+        }
 
         // All good, advance the pointer
-        ata->dma_info.prdt_addr += 8;
+        prdt_addr += 8;
     }
+
+    atomic_store_uint32(&ata->bmdma_command, 0);
 
     if (processed == to_process) {
         // Everything OK
-        ata->dma_info.cmd &= ~(1 << 0);
-        ata->dma_info.status |= (1 << 2);
+        atomic_store_uint32(&ata->bmdma_status, ATA_BMDMA_STATUS_IRQ);
     } else {
         // Error
-        ata->dma_info.status |= (1 << 2) | (1 << 1);
+        atomic_store_uint32(&ata->bmdma_status, ATA_BMDMA_STATUS_IRQ | ATA_BMDMA_STATUS_ERR);
     }
+
     ata_send_interrupt(ata);
 }
 
-static void* ata_worker(void* data)
+static void* ata_prdt_io_worker(void* arg)
 {
-    struct ata_dev* ata = (struct ata_dev*)data;
-    spin_lock(&ata->dma_info.lock);
+    ata_dev_t* ata = arg;
+    spin_lock(&ata->dma_lock);
     ata_process_prdt(ata);
-    spin_unlock(&ata->dma_info.lock);
+    spin_unlock(&ata->dma_lock);
     return NULL;
 }
 
-static bool ata_bmdma_mmio_read_handler(rvvm_mmio_dev_t* device, void* data, size_t offset, uint8_t size)
+static bool ata_pci_bmdma_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    struct ata_dev* ata = (struct ata_dev*)device->data;
+    ata_dev_t* ata = dev->data;
+
     switch (offset) {
-        case ATA_BMDMA_CMD:
-            if (size != 1) return false;
-            write_uint8(data, ata->dma_info.cmd);
+        case ATA_BMDMA_COMMAND:
+            write_uint8(data, atomic_load_uint32_relax(&ata->bmdma_command));
             break;
         case ATA_BMDMA_STATUS:
-            if (size != 1) return false;
-            write_uint8(data, ata->dma_info.status
-                           | (ata->drive[0].blk != NULL) << 5
-                           | (ata->drive[1].blk != NULL) << 6);
+            write_uint8(data, atomic_load_uint32_relax(&ata->bmdma_status) | ((ata->blk != NULL) << 5));
             break;
-        case ATA_BMDMA_PRDT:
-            if (size != 4) return false;
-            write_uint32_le(data, ata->dma_info.prdt_addr);
+        case ATA_BMDMA_PRDT: {
+            uint8_t buffer[4] = {0};
+            write_uint32_le(buffer, atomic_load_uint32_relax(&ata->prdt_addr));
+            memcpy(data, buffer, size);
             break;
-        default:
-            // Secondary controller not supported now
-            return false;
-    }
-
-    return true;
-}
-
-static bool ata_bmdma_mmio_write_handler(rvvm_mmio_dev_t* device, void* data, size_t offset, uint8_t size)
-{
-    struct ata_dev* ata = (struct ata_dev*)device->data;
-    bool process_prdt;
-    switch (offset) {
-        case ATA_BMDMA_CMD:
-            if (size != 1) return false;
-            spin_lock(&ata->dma_info.lock);
-            process_prdt = !(ata->dma_info.cmd & 1) && (read_uint8(data) & 1);
-            ata->dma_info.cmd = read_uint8(data);
-            spin_unlock(&ata->dma_info.lock);
-            if (process_prdt) {
-                thread_create_task(ata_worker, ata);
-            }
-            break;
-        case ATA_BMDMA_STATUS:
-            if (size != 1) return false;
-            spin_lock(&ata->dma_info.lock);
-            ata->dma_info.status &= ~(read_uint8(data) & 6);
-            if (!bit_check(ata->dma_info.status, 2)) {
-                ata_clear_interrupt(ata);
-            }
-            spin_unlock(&ata->dma_info.lock);
-            break;
-        case ATA_BMDMA_PRDT:
-            if (size != 4) return false;
-            spin_lock(&ata->dma_info.lock);
-            ata->dma_info.prdt_addr = read_uint32_le(data);
-            spin_unlock(&ata->dma_info.lock);
-            break;
-        default:
-            // Secondary controller not supported
-            return false;
-    }
-
-    return true;
-}
-
-static bool ata_ctl_read_primary(rvvm_mmio_dev_t* device, void* memory_data, size_t offset, uint8_t size)
-{
-    offset -= 2;
-    return ata_ctl_mmio_read_handler(device, memory_data, offset, size);
-}
-
-static bool ata_ctl_write_primary(rvvm_mmio_dev_t* device, void* memory_data, size_t offset, uint8_t size)
-{
-    offset -= 2;
-    return ata_ctl_mmio_write_handler(device, memory_data, offset, size);
-}
-
-/* No support for secondary BAR
-static bool ata_data_read_secondary(rvvm_mmio_dev_t* device, void* memory_data, paddr_t offset, uint8_t size)
-{
-    return ata_data_mmio_read_handler(device, memory_data, offset, size);
-}
-
-static bool ata_data_write_secondary(rvvm_mmio_dev_t* device, void* memory_data, paddr_t offset, uint8_t size)
-{
-    return ata_data_mmio_write_handler(device, memory_data, offset, size);
-}
-
-static bool ata_ctl_read_secondary(rvvm_mmio_dev_t* device, void* memory_data, paddr_t offset, uint8_t size)
-{
-    offset -= 2;
-    return ata_ctl_mmio_read_handler(device, memory_data, offset, size);
-}
-
-static bool ata_ctl_write_secondary(rvvm_mmio_dev_t* device, void* memory_data, paddr_t offset, uint8_t size)
-{
-    offset -= 2;
-    return ata_ctl_mmio_write_handler(device, memory_data, offset, size);
-}
-*/
-
-PUBLIC pci_dev_t* ata_init_pci(pci_bus_t* pci_bus, const char* image_path, bool rw)
-{
-    struct ata_dev* ata = ata_create(image_path, rw);
-    if (ata == NULL) return NULL;
-
-    pci_dev_desc_t ata_desc = {
-        .func[0] = {
-            .vendor_id = 0x8086,  // Intel (ata-generic kernel driver refuses to load with other vendors)
-            .device_id = 0x8c88,  // 9 Series Series Chipset Family SATA Controller [IDE Mode]
-            .class_code = 0x0101, // Mass Storage, IDE
-            .prog_if = 0x85,      // PCI native mode-only controller, supports bus mastering
-            .irq_pin = PCI_IRQ_PIN_INTA,
-            .bar[0] = {
-                .size = 4096,
-                .min_op_size = 1,
-                .max_op_size = 2,
-                .read = ata_data_mmio_read_handler,
-                .write = ata_data_mmio_write_handler,
-                .data = ata,
-                .type = &ata_data_dev_type,
-            },
-            .bar[1] = {
-                .size = 4096,
-                .min_op_size = 1,
-                .max_op_size = 1,
-                .read = ata_ctl_read_primary,
-                .write = ata_ctl_write_primary,
-                .data = ata,
-                .type = &ata_ctl_dev_type,
-            },
-/* No support for secondary BAR
-            .bar[2] = {
-                .size = 4096,
-                .min_op_size = 1,
-                .max_op_size = 2,
-                .read = ata_data_read_secondary,
-                .write = ata_data_write_secondary,
-            },
-            .bar[3] = {
-                .size = 4096,
-                .min_op_size = 1,
-                .max_op_size = 1,
-                .read = ata_ctl_read_secondary,
-                .write = ata_ctl_write_secondary,
-            },
-*/
-            .bar[4] = {
-                .size = 16,
-                .min_op_size = 1,
-                .max_op_size = 4,
-                .read = ata_bmdma_mmio_read_handler,
-                .write = ata_bmdma_mmio_write_handler,
-                .data = ata,
-                .type = &ata_bmdma_dev_type,
-            }
         }
+    }
+
+    return true;
+}
+
+static bool ata_pci_bmdma_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+{
+    ata_dev_t* ata = dev->data;
+
+    switch (offset) {
+        case ATA_BMDMA_COMMAND: {
+            uint8_t cmd = read_uint8(data);
+            atomic_and_uint32(&ata->bmdma_command, ATA_BMDMA_COMMAND_DMA);
+            uint8_t prev_cmd = atomic_or_uint32(&ata->bmdma_command, cmd);
+            if (!!(cmd & ATA_BMDMA_COMMAND_DMA) && !(prev_cmd & ATA_BMDMA_COMMAND_DMA)) {
+                thread_create_task(ata_prdt_io_worker, ata);
+            }
+            break;
+        }
+        case ATA_BMDMA_STATUS:
+            atomic_and_uint32(&ata->bmdma_status, ~(read_uint8(data) & (ATA_BMDMA_STATUS_DMA | ATA_BMDMA_STATUS_IRQ)));
+            break;
+        case ATA_BMDMA_PRDT: {
+            uint8_t buffer[4] = {0};
+            memcpy(buffer, data, size);
+            atomic_store_uint32_relax(&ata->prdt_addr, read_uint32_le(buffer));
+            break;
+        }
+    }
+
+    return true;
+}
+
+static bool ata_pci_ctl_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+{
+    return ata_ctl_read(dev, data, offset - 2, size);
+}
+
+static bool ata_pci_ctl_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+{
+    return ata_ctl_write(dev, data, offset - 2, size);
+}
+
+PUBLIC pci_dev_t* ata_pci_init(pci_bus_t* pci_bus, const char* image, bool rw)
+{
+    ata_dev_t* ata = ata_create(image, rw);
+    if (ata == NULL) {
+        return NULL;
+    }
+
+    ata_dev_t* ata_secondary = ata_create(NULL, false);
+
+    pci_func_desc_t ata_desc = {
+        .vendor_id = 0x1179,  // Toshiba
+        .device_id = 0x0102,  // Extended IDE Controller
+        .class_code = 0x0101, // Mass Storage, IDE
+        .prog_if = 0x85,      // PCI native mode-only controller, supports bus mastering
+        .irq_pin = PCI_IRQ_PIN_INTA,
+
+        // Primary channel data/ctl BARs
+        .bar[0] = {
+            .size = 0x1000,
+            .min_op_size = 1,
+            .max_op_size = 4,
+            .read = ata_data_read,
+            .write = ata_data_write,
+            .data = ata,
+            .type = &ata_data_dev_type,
+        },
+        .bar[1] = {
+            .size = 0x1000,
+            .min_op_size = 1,
+            .max_op_size = 1,
+            .read = ata_pci_ctl_read,
+            .write = ata_pci_ctl_write,
+            .data = ata,
+            .type = &ata_ctl_dev_type,
+        },
+
+        // Dummy secondary channel data/ctl BARs
+        .bar[2] = {
+            .size = 0x1000,
+            .min_op_size = 1,
+            .max_op_size = 4,
+            .read = ata_data_read,
+            .write = ata_data_write,
+            .data = ata_secondary,
+            .type = &ata_data_dev_type,
+        },
+        .bar[3] = {
+            .size = 0x1000,
+            .min_op_size = 1,
+            .max_op_size = 1,
+            .read = ata_pci_ctl_read,
+            .write = ata_pci_ctl_write,
+            .data = ata_secondary,
+            .type = &ata_ctl_dev_type,
+        },
+
+        // ATA BMDMA
+        .bar[4] = {
+            .size = 0x1000,
+            .min_op_size = 1,
+            .max_op_size = 4,
+            .read = ata_pci_bmdma_read,
+            .write = ata_pci_bmdma_write,
+            .data = ata,
+            .type = &ata_bmdma_dev_type,
+        },
     };
 
-    pci_dev_t* pci_dev = pci_bus_add_device(pci_bus, &ata_desc);
-    if (pci_dev) ata->pci_dev = pci_dev;
+    pci_dev_t* pci_dev = pci_attach_func(pci_bus, &ata_desc);
+    if (pci_dev) {
+        // Successfully plugged in
+        ata->pci_func = pci_get_device_func(pci_dev, 0);
+    }
     return pci_dev;
 }
 
-PUBLIC bool ata_init_auto(rvvm_machine_t* machine, const char* image_path, bool rw)
+PUBLIC pci_dev_t* ata_pci_init_auto(rvvm_machine_t* machine, const char* image, bool rw)
 {
     pci_bus_t* pci_bus = rvvm_get_pci_bus(machine);
-    return pci_bus && ata_init_pci(pci_bus, image_path, rw);
+    if (pci_bus) {
+        return ata_pci_init(pci_bus, image, rw);
+    }
+    return NULL;
+}
+
+PUBLIC bool ata_init_auto(rvvm_machine_t* machine, const char* image, bool rw)
+{
+    return ata_pci_init_auto(machine, image, rw) || ata_pio_init_auto(machine, image, rw);
 }
