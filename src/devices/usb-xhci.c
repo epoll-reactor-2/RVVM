@@ -254,7 +254,7 @@ typedef struct {
 } xhci_interrupter_t;
 
 typedef struct {
-    pci_dev_t* pci_dev;
+    pci_func_t* pci_func;
 
     uint64_t or_crcr;
     uint32_t or_usbcmd;
@@ -283,7 +283,7 @@ static void xhci_report_event(xhci_bus_t* xhci, const xhci_event_trb_t* event)
                 // Reached end of ring segment table
                 interrupter->crsea = interrupter->erstba & ~0xF;
             }
-            uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, interrupter->crsea, 0x10);
+            uint8_t* dma = pci_get_dma_ptr(xhci->pci_func, interrupter->crsea, 0x10);
             if (dma) {
                 interrupter->crsba = read_uint64_le(dma) & ~0x3F;
                 interrupter->crssz = read_uint16_le(dma + 0x8);
@@ -293,7 +293,7 @@ static void xhci_report_event(xhci_bus_t* xhci, const xhci_event_trb_t* event)
             interrupter->crep = interrupter->crsba;
         }
 
-        uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, interrupter->crep, XHCI_TRB_SIZE);
+        uint8_t* dma = pci_get_dma_ptr(xhci->pci_func, interrupter->crep, XHCI_TRB_SIZE);
         if (dma) {
             rvvm_warn("xhci event submitted at %x", (uint32_t)interrupter->crep);
             write_uint64_le(dma + XHCI_TRB_PTR, event->ptr);
@@ -304,7 +304,7 @@ static void xhci_report_event(xhci_bus_t* xhci, const xhci_event_trb_t* event)
 
             interrupter->iman |= XHCI_IMAN_IP;
             if (interrupter->iman & XHCI_IMAN_IE) {
-                pci_send_irq(xhci->pci_dev, 0/*event->interrupter*/);
+                pci_send_irq(xhci->pci_func, 0/*event->interrupter*/);
             }
         }
     }
@@ -345,7 +345,7 @@ static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
         rvvm_addr_t cr_addr = xhci->or_crcr & ~0x3F;
         rvvm_addr_t start = cr_addr;
         do {
-            uint8_t* dma = pci_get_dma_ptr(xhci->pci_dev, cr_addr, XHCI_TRB_SIZE);
+            uint8_t* dma = pci_get_dma_ptr(xhci->pci_func, cr_addr, XHCI_TRB_SIZE);
             if (dma) {
                 uint64_t ptr = read_uint64_le(dma);
                 uint32_t sts = read_uint32_le(dma + 0x8);
@@ -600,27 +600,27 @@ static rvvm_mmio_type_t xhci_type = {
 PUBLIC pci_dev_t* usb_xhci_init(pci_bus_t* pci_bus)
 {
     xhci_bus_t* xhci = safe_new_obj(xhci_bus_t);
-    pci_dev_desc_t xhci_desc = {
-        .func[0] = {
-            .vendor_id = 0x100b,  // National Semiconductor Corporation
-            .device_id = 0x0012,  // USB Controller
-            .class_code = 0x0C03, // Serial bus controller, USB controller
-            .prog_if = 0x30,      // XHCI
-            .irq_pin = PCI_IRQ_PIN_INTA,
-            .bar[0] = {
-                .addr = PCI_BAR_ADDR_64,
-                .size = XHCI_BAR_SIZE,
-                .min_op_size = 4,
-                .max_op_size = 4,
-                .read = xhci_pci_read,
-                .write = xhci_pci_write,
-                .data = xhci,
-                .type = &xhci_type,
-            }
-        }
+    pci_func_desc_t xhci_desc = {
+        .vendor_id = 0x100b,  // National Semiconductor Corporation
+        .device_id = 0x0012,  // USB Controller
+        .class_code = 0x0C03, // Serial bus controller, USB controller
+        .prog_if = 0x30,      // XHCI
+        .irq_pin = PCI_IRQ_PIN_INTA,
+        .bar[0] = {
+            .size = XHCI_BAR_SIZE,
+            .min_op_size = 4,
+            .max_op_size = 4,
+            .read = xhci_pci_read,
+            .write = xhci_pci_write,
+            .data = xhci,
+            .type = &xhci_type,
+        },
     };
 
-    pci_dev_t* pci_dev = pci_bus_add_device(pci_bus, &xhci_desc);
-    if (pci_dev) xhci->pci_dev = pci_dev;
+    pci_dev_t* pci_dev = pci_attach_func(pci_bus, &xhci_desc);
+    if (pci_dev) {
+        // Successfully plugged in
+        xhci->pci_func = pci_get_device_func(pci_dev, 0);
+    }
     return pci_dev;
 }
