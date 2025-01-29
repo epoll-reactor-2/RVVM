@@ -95,9 +95,9 @@ typedef struct {
 } nvme_queue_t;
 
 typedef struct {
-    blkdev_t* blk;
-    pci_dev_t* pci_dev;
-    spinlock_t lock;
+    pci_func_t* pci_func;
+    blkdev_t*   blk;
+    spinlock_t  lock;
     uint32_t threads;
     uint32_t conf;
     uint32_t irq_mask;
@@ -159,7 +159,7 @@ static void nvme_complete_cmd(nvme_dev_t* nvme, nvme_cmd_t* cmd, uint32_t sf)
     if (queue->tail++ >= queue->size) queue->tail = 0;
     spin_unlock(&queue->lock);
 
-    uint8_t* ptr = pci_get_dma_ptr(nvme->pci_dev, addr, 16);
+    uint8_t* ptr = pci_get_dma_ptr(nvme->pci_func, addr, 16);
     if (ptr) {
         uint8_t phase = (~read_uint16_le(ptr + 14)) & 1;
         write_uint32_le(ptr,      sf >> 8);                  // Command Specific
@@ -170,7 +170,7 @@ static void nvme_complete_cmd(nvme_dev_t* nvme, nvme_cmd_t* cmd, uint32_t sf)
         atomic_fence();
         write_uint16_le(ptr + 14, (sf & 0xFF) << 1 | phase); // Phase Bit, Status Field
     }
-    if (!(nvme->irq_mask & 1)) pci_send_irq(nvme->pci_dev, 0);
+    if (!(nvme->irq_mask & 1)) pci_send_irq(nvme->pci_func, 0);
 }
 
 static size_t nvme_process_prp_chunk(nvme_dev_t* nvme, nvme_cmd_t* cmd)
@@ -204,7 +204,7 @@ static size_t nvme_process_prp_chunk(nvme_dev_t* nvme, nvme_cmd_t* cmd)
     while ((prp->cur + len) < prp->size) {
         // Process PRP2 entries until we reach end of transfer
         if (prp->prp2_dma == NULL) {
-            prp->prp2_dma = pci_get_dma_ptr(nvme->pci_dev, prp->prp2, NVME_PAGE_SIZE);
+            prp->prp2_dma = pci_get_dma_ptr(nvme->pci_func, prp->prp2, NVME_PAGE_SIZE);
         }
         if (prp->prp2_dma) {
             prp->prp1 = read_uint64_le_m(prp->prp2_dma + prp->prp2_off);
@@ -212,7 +212,7 @@ static size_t nvme_process_prp_chunk(nvme_dev_t* nvme, nvme_cmd_t* cmd)
             if (prp->prp2_off >= NVME_PRP2_END) {
                 prp->prp2 = read_uint64_le_m(prp->prp2_dma + NVME_PRP2_END);
                 prp->prp2_off = 0;
-                prp->prp2_dma = pci_get_dma_ptr(nvme->pci_dev, prp->prp2, NVME_PAGE_SIZE);
+                prp->prp2_dma = pci_get_dma_ptr(nvme->pci_func, prp->prp2, NVME_PAGE_SIZE);
             }
         } else {
             // DMA error
@@ -239,7 +239,7 @@ static void* nvme_get_prp_chunk(nvme_dev_t* nvme, nvme_cmd_t* cmd, size_t* size)
     rvvm_addr_t addr = cmd->prp.prp1;
     *size = nvme_process_prp_chunk(nvme, cmd);
     if (*size == 0) return NULL;
-    void* ret = pci_get_dma_ptr(nvme->pci_dev, addr, *size);
+    void* ret = pci_get_dma_ptr(nvme->pci_func, addr, *size);
     if (ret == NULL) nvme_complete_cmd(nvme, cmd, SC_DT_ERR);
     return ret;
 }
@@ -428,7 +428,7 @@ static void* nvme_cmd_worker(void** data)
         .sq_id = queue_id >> 1,
         .sq_head = (size_t)data[2],
     };
-    cmd.ptr = pci_get_dma_ptr(nvme->pci_dev, queue->addr + (cmd.sq_head << 6), 64);
+    cmd.ptr = pci_get_dma_ptr(nvme->pci_func, queue->addr + (cmd.sq_head << 6), 64);
     if (cmd.ptr) {
         // Parse & process NVMe command
         cmd.opcode = cmd.ptr[0];
@@ -458,9 +458,6 @@ static void nvme_doorbell(nvme_dev_t* nvme, size_t queue_id, uint16_t val)
     if (queue_id & 1) {
         // Update completion queue head
         queue->head = val;
-        if (queue->tail == val) {
-            pci_clear_irq(nvme->pci_dev, 0);
-        }
     } else {
         queue->tail = val;
         while (queue->head != queue->tail) {
@@ -574,28 +571,28 @@ PUBLIC pci_dev_t* nvme_init_blk(pci_bus_t* pci_bus, void* blk_dev)
     nvme->blk = blk_dev;
     rvvm_randomserial(nvme->serial, sizeof(nvme->serial));
 
-    pci_dev_desc_t nvme_desc = {
-        .func[0] = {
-            .vendor_id = 0x144d,  // Samsung Electronics Co Ltd
-            .device_id = 0xa809,  // NVMe SSD Controller 980
-            .class_code = 0x0108, // Mass Storage, Non-Volatile memory controller
-            .prog_if = 0x02,      // NVMe
-            .irq_pin = PCI_IRQ_PIN_INTA,
-            .bar[0] = {
-                .addr = PCI_BAR_ADDR_64,
-                .size = 0x4000,
-                .min_op_size = 4,
-                .max_op_size = 4,
-                .read = nvme_pci_read,
-                .write = nvme_pci_write,
-                .data = nvme,
-                .type = &nvme_type,
-            }
-        }
+    pci_func_desc_t nvme_desc = {
+        .vendor_id = 0x1F31,  // Nextorage
+        .device_id = 0x4512,  // Nextorage NE1N NVMe SSD
+        .class_code = 0x0108, // Mass Storage, Non-Volatile memory controller
+        .prog_if = 0x02,      // NVMe
+        .irq_pin = PCI_IRQ_PIN_INTA,
+        .bar[0] = {
+            .size = 0x4000,
+            .min_op_size = 4,
+            .max_op_size = 4,
+            .read = nvme_pci_read,
+            .write = nvme_pci_write,
+            .data = nvme,
+            .type = &nvme_type,
+        },
     };
 
-    pci_dev_t* pci_dev = pci_bus_add_device(pci_bus, &nvme_desc);
-    if (pci_dev) nvme->pci_dev = pci_dev;
+    pci_dev_t* pci_dev = pci_attach_func(pci_bus, &nvme_desc);
+    if (pci_dev) {
+        // Successfully plugged in
+        nvme->pci_func = pci_get_device_func(pci_dev, 0);
+    }
     return pci_dev;
 }
 
