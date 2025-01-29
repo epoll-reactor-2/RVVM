@@ -127,8 +127,8 @@ typedef struct {
 } at93c56_state_t;
 
 typedef struct {
-    pci_dev_t* pci_dev;
-    tap_dev_t* tap;
+    pci_func_t* pci_func;
+    tap_dev_t*  tap;
     at93c56_state_t eeprom;
     rtl8169_ring_t rx;
     rtl8169_ring_t tx;
@@ -163,7 +163,7 @@ static void rtl8169_interrupt(rtl8169_dev_t* rtl8169, size_t irq)
     uint32_t irqs = 1U << irq;
     atomic_or_uint32(&rtl8169->isr, irqs);
     if (irqs & atomic_load_uint32_relax(&rtl8169->imr)) {
-        pci_send_irq(rtl8169->pci_dev, 0);
+        pci_send_irq(rtl8169->pci_func, 0);
     }
 }
 
@@ -262,7 +262,7 @@ static bool rtl8169_feed_rx(void* net_dev, const void* data, size_t size)
     if (likely(atomic_load_uint32_relax(&rtl8169->cr) & RTL8169_CR_RE)) {
         // Receiver enabled
         spin_lock(&rtl8169->rx_lock);
-        uint8_t* cmd = pci_get_dma_ptr(rtl8169->pci_dev, rtl8169->rx.addr + (rtl8169->rx.index << 4), 16);
+        uint8_t* cmd = pci_get_dma_ptr(rtl8169->pci_func, rtl8169->rx.addr + (rtl8169->rx.index << 4), 16);
         if (cmd == NULL) {
             // FIFO DMA error
             spin_unlock(&rtl8169->rx_lock);
@@ -280,7 +280,7 @@ static bool rtl8169_feed_rx(void* net_dev, const void* data, size_t size)
 
         rvvm_addr_t packet_addr = read_uint64_le(cmd + 8);
         size_t packet_size = flags & 0x3FFF;
-        uint8_t* packet_ptr = pci_get_dma_ptr(rtl8169->pci_dev, packet_addr, packet_size);
+        uint8_t* packet_ptr = pci_get_dma_ptr(rtl8169->pci_func, packet_addr, packet_size);
         if (packet_ptr == NULL || packet_size < size + 4) {
             // Packet DMA error
             spin_unlock(&rtl8169->rx_lock);
@@ -313,7 +313,7 @@ static void rtl8169_handle_tx(rtl8169_dev_t* rtl8169, rtl8169_ring_t* ring)
         size_t tx_id = ring->index;
         bool tx_irq = false;
         do {
-            uint8_t* cmd = pci_get_dma_ptr(rtl8169->pci_dev, ring->addr + (ring->index << 4), 16);
+            uint8_t* cmd = pci_get_dma_ptr(rtl8169->pci_func, ring->addr + (ring->index << 4), 16);
             if (!cmd) {
                 // FIFO DMA error
                 rvvm_debug("rtl8169 TX FIFO DMA error");
@@ -329,7 +329,7 @@ static void rtl8169_handle_tx(rtl8169_dev_t* rtl8169, rtl8169_ring_t* ring)
 
             rvvm_addr_t packet_addr = read_uint64_le(cmd + 8);
             size_t packet_size = flags & 0x3FFF;
-            void* packet_ptr = pci_get_dma_ptr(rtl8169->pci_dev, packet_addr, packet_size);
+            void* packet_ptr = pci_get_dma_ptr(rtl8169->pci_func, packet_addr, packet_size);
 
             if (packet_ptr) {
                 if ((flags & RTL8169_DESC_FS) && (flags & RTL8169_DESC_LS)) {
@@ -460,7 +460,7 @@ static bool rtl8169_pci_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, u
         case RTL8169_REG_IMR:
             atomic_store_uint32_relax(&rtl8169->imr, (uint16_t)val);
             if (atomic_load_uint32_relax(&rtl8169->isr) & val) {
-                pci_send_irq(rtl8169->pci_dev, 0);
+                pci_send_irq(rtl8169->pci_func, 0);
             }
             break;
         case RTL8169_REG_ISR:
@@ -535,26 +535,27 @@ PUBLIC pci_dev_t* rtl8169_init(pci_bus_t* pci_bus, tap_dev_t* tap)
         return NULL;
     }
 
-    pci_dev_desc_t rtl8169_desc = {
-        .func[0] = {
-            .vendor_id = 0x10EC,  // Realtek
-            .device_id = 0x8169,  // RTL8169 Gigabit NIC
-            .class_code = 0x0200, // Ethernet
-            .irq_pin = PCI_IRQ_PIN_INTA,
-            .bar[1] = {
-                .size = 0x100,
-                .min_op_size = 1,
-                .max_op_size = 4,
-                .read = rtl8169_pci_read,
-                .write = rtl8169_pci_write,
-                .data = rtl8169,
-                .type = &rtl8169_type,
-            },
-        }
+    pci_func_desc_t rtl8169_desc = {
+        .vendor_id = 0x10EC,  // Realtek
+        .device_id = 0x8169,  // RTL8169 Gigabit NIC
+        .class_code = 0x0200, // Ethernet
+        .irq_pin = PCI_IRQ_PIN_INTA,
+        .bar[1] = {
+            .size = 0x1000,
+            .min_op_size = 1,
+            .max_op_size = 4,
+            .read = rtl8169_pci_read,
+            .write = rtl8169_pci_write,
+            .data = rtl8169,
+            .type = &rtl8169_type,
+        },
     };
 
-    pci_dev_t* pci_dev = pci_bus_add_device(pci_bus, &rtl8169_desc);
-    if (pci_dev) rtl8169->pci_dev = pci_dev;
+    pci_dev_t* pci_dev = pci_attach_func(pci_bus, &rtl8169_desc);
+    if (pci_dev) {
+        // Successfully plugged in
+        rtl8169->pci_func = pci_get_device_func(pci_dev, 0);
+    }
     return pci_dev;
 }
 
