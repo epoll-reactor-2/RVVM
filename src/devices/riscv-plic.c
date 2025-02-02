@@ -1,5 +1,5 @@
 /*
-plic.c - Platform-Level Interrupt Controller
+riscv-plic.c - RISC-V Platform-Level Interrupt Controller
 Copyright (C) 2023  LekKit <github.com/LekKit>
               2021  cerg2010cerg2010 <github.com/cerg2010cerg2010>
 
@@ -8,35 +8,47 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#include "plic.h"
+#include "riscv-plic.h"
 #include "riscv_hart.h"
 #include "bit_ops.h"
 #include "mem_ops.h"
 #include "atomics.h"
 
+#define PLIC_MMIO_SIZE 0x4000000
+
 #define PLIC_CTXFLAG_THRESHOLD     0x0
 #define PLIC_CTXFLAG_CLAIMCOMPLETE 0x1
 
-#define PLIC_SOURCE_MAX 64 // Max 1024
+// Limit on PLIC interrupt identities, maximum 64
+#define PLIC_SRC_LIMIT 64
 
-#define PLIC_SRC_REG_COUNT ((PLIC_SOURCE_MAX + 0x1F) >> 5)
+// Number of PLIC source bitset registers
+#define PLIC_SRC_REGS (PLIC_SRC_LIMIT >> 5)
 
-#define CTX_HARTID(ctx) ((ctx) >> 1)
-
-// In QEMU, those are reversed for whatever reason, but on most actual
-// boards it's done this way. Should we ever do 1:1 QEMU compat, swap those...
-#define CTX_IRQ_PRIO(ctx) (((ctx) & 1) ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL)
-
-struct plic {
+typedef struct {
+    rvvm_intc_t intc;
     rvvm_machine_t* machine;
-    uint32_t alloc_irq;
+
     uint32_t phandle;
-    uint32_t prio[PLIC_SOURCE_MAX];
-    uint32_t pending[PLIC_SRC_REG_COUNT];
-    uint32_t raised[PLIC_SRC_REG_COUNT];
+    uint32_t prio[PLIC_SRC_LIMIT];
+    uint32_t pending[PLIC_SRC_REGS];
+    uint32_t raised[PLIC_SRC_REGS];
     uint32_t** enable;    // [CTX][SRC_REG]
     uint32_t*  threshold; // [CTX]
-};
+} plic_ctx_t;
+
+static inline uint32_t plic_ctx_prio(uint32_t ctx)
+{
+    // In QEMU, those are reversed for whatever reason, but on most actual
+    // boards it's done this way. Should we ever do 1:1 QEMU compat, swap those...
+    return (ctx & 1) ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL;
+}
+
+
+static inline uint32_t plic_ctx_hartid(uint32_t ctx)
+{
+    return ctx >> 1;
+}
 
 static inline uint32_t plic_ctx_count(plic_ctx_t* plic)
 {
@@ -66,7 +78,7 @@ static bool plic_notify_ctx_irq(plic_ctx_t* plic, uint32_t ctx, uint32_t irq)
         return false;
     }
 
-    riscv_interrupt(vector_at(plic->machine->harts, CTX_HARTID(ctx)), CTX_IRQ_PRIO(ctx));
+    riscv_interrupt(vector_at(plic->machine->harts, plic_ctx_hartid(ctx)), plic_ctx_prio(ctx));
     return true;
 }
 
@@ -105,9 +117,9 @@ static uint32_t plic_update_ctx(plic_ctx_t* plic, uint32_t ctx, bool claim)
     uint32_t highest_prio_irq = 0;
     uint32_t max_prio = 0;
 
-    riscv_interrupt_clear(vector_at(plic->machine->harts, CTX_HARTID(ctx)), CTX_IRQ_PRIO(ctx));
+    riscv_interrupt_clear(vector_at(plic->machine->harts, plic_ctx_hartid(ctx)), plic_ctx_prio(ctx));
 
-    for (size_t i=0; i<PLIC_SRC_REG_COUNT; ++i) {
+    for (size_t i = 0; i < PLIC_SRC_REGS; ++i) {
         uint32_t irqs = atomic_load_uint32(&plic->pending[i]) & atomic_load_uint32(&plic->enable[ctx][i]);
         if (irqs) {
             for (size_t j=0; j<32; ++j) {
@@ -134,7 +146,7 @@ static uint32_t plic_update_ctx(plic_ctx_t* plic, uint32_t ctx, bool claim)
     }
 
     if (notifying_irqs) {
-        riscv_interrupt(vector_at(plic->machine->harts, CTX_HARTID(ctx)), CTX_IRQ_PRIO(ctx));
+        riscv_interrupt(vector_at(plic->machine->harts, plic_ctx_hartid(ctx)), plic_ctx_prio(ctx));
     }
 
     return highest_prio_irq;
@@ -149,7 +161,7 @@ static uint32_t plic_update_ctx(plic_ctx_t* plic, uint32_t ctx, bool claim)
  */
 static void plic_full_update(plic_ctx_t* plic)
 {
-    for (size_t ctx=0; ctx<plic_ctx_count(plic); ++ctx) {
+    for (size_t ctx = 0; ctx < plic_ctx_count(plic); ++ctx) {
         plic_update_ctx(plic, ctx, false);
     }
 }
@@ -225,13 +237,13 @@ static bool plic_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint
     if (offset < 0x1000) {
         // Interrupt priority
         uint32_t irq = offset >> 2;
-        if (irq > 0 && irq < PLIC_SOURCE_MAX) {
+        if (irq > 0 && irq < PLIC_SRC_LIMIT) {
             write_uint32_le(data, atomic_load_uint32(&plic->prio[irq]));
         }
     } else if (offset < 0x1080) {
         // Interrupt pending
         uint32_t reg = (offset - 0x1000) >> 2;
-        if (reg < PLIC_SRC_REG_COUNT) {
+        if (reg < PLIC_SRC_REGS) {
             write_uint32_le(data, atomic_load_uint32(&plic->pending[reg]));
         }
     } else if (offset < 0x2000) {
@@ -240,7 +252,7 @@ static bool plic_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint
         // Enable bits
         uint32_t reg = ((offset - 0x2000) >> 2) & 0x1F;
         uint32_t ctx = (offset - 0x2000) >> 7;
-        if (reg < PLIC_SRC_REG_COUNT && ctx < plic_ctx_count(plic)) {
+        if (reg < PLIC_SRC_REGS && ctx < plic_ctx_count(plic)) {
             write_uint32_le(data, atomic_load_uint32(&plic->enable[ctx][reg]));
         }
     } else if (offset < 0x200000) {
@@ -268,7 +280,7 @@ static bool plic_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uin
     if (offset < 0x1000) {
         // Interrupt priority
         uint32_t irq = offset >> 2;
-        if (irq > 0 && irq < PLIC_SOURCE_MAX) {
+        if (irq > 0 && irq < PLIC_SRC_LIMIT) {
             plic_set_irq_prio(plic, irq, read_uint32_le_m(data));
         }
     } else if (offset < 0x1080) {
@@ -279,7 +291,7 @@ static bool plic_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uin
         // Enable bits
         uint32_t reg = ((offset - 0x2000) >> 2) & 0x1F;
         uint32_t ctx = (offset - 0x2000) >> 7;
-        if (reg < PLIC_SRC_REG_COUNT && ctx < plic_ctx_count(plic)) {
+        if (reg < PLIC_SRC_REGS && ctx < plic_ctx_count(plic)) {
             plic_set_enable_bits(plic, ctx, reg, read_uint32_le_m(data));
         }
     } else if (offset < 0x200000) {
@@ -316,9 +328,9 @@ static void plic_reset(rvvm_mmio_dev_t* dev)
 {
     plic_ctx_t* plic = dev->data;
 
-    for (size_t ctx=0; ctx<plic_ctx_count(plic); ++ctx){
-        riscv_interrupt_clear(vector_at(plic->machine->harts, CTX_HARTID(ctx)), CTX_IRQ_PRIO(ctx));
-        memset(plic->enable[ctx], 0, PLIC_SRC_REG_COUNT << 2);
+    for (size_t ctx = 0; ctx < plic_ctx_count(plic); ++ctx){
+        riscv_interrupt_clear(vector_at(plic->machine->harts, plic_ctx_hartid(ctx)), plic_ctx_prio(ctx));
+        memset(plic->enable[ctx], 0, PLIC_SRC_REGS << 2);
     }
     memset(plic->prio, 0, sizeof(plic->prio));
     memset(plic->pending, 0, sizeof(plic->pending));
@@ -327,131 +339,145 @@ static void plic_reset(rvvm_mmio_dev_t* dev)
 }
 
 static rvvm_mmio_type_t plic_dev_type = {
-    .name = "plic",
+    .name = "riscv_plic",
     .remove = plic_remove,
     .reset = plic_reset,
 };
 
-// Create PLIC device
-PUBLIC plic_ctx_t* plic_init(rvvm_machine_t* machine, rvvm_addr_t base_addr)
+/*
+ * PLIC Interrupt Interface
+ */
+
+static bool plic_send_irq(rvvm_intc_t* intc, rvvm_irq_t irq)
+{
+    plic_ctx_t* plic = intc->data;
+    if (irq > 0 && irq < PLIC_SRC_LIMIT) {
+        // Mark the IRQ pending
+        uint32_t mask = 1U << (irq & 0x1F);
+        if (!(atomic_or_uint32(&plic->pending[irq >> 5], mask) & mask)) {
+            plic_notify_irq(plic, irq);
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool plic_raise_irq(rvvm_intc_t* intc, rvvm_irq_t irq)
+{
+    plic_ctx_t* plic = intc->data;
+    if (irq > 0 && irq < PLIC_SRC_LIMIT) {
+        uint32_t mask = 1U << (irq & 0x1F);
+        if (!(atomic_or_uint32(&plic->raised[irq >> 5], mask) & mask)
+         && !(atomic_or_uint32(&plic->pending[irq >> 5], mask) & mask)) {
+            plic_notify_irq(plic, irq);
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool plic_lower_irq(rvvm_intc_t* intc, rvvm_irq_t irq)
+{
+    plic_ctx_t* plic = intc->data;
+    if (irq > 0 && irq < PLIC_SRC_LIMIT) {
+        atomic_and_uint32(&plic->raised[irq >> 5], ~(1U << (irq & 0x1F)));
+        return true;
+    }
+    return false;
+}
+
+static uint32_t plic_fdt_phandle(rvvm_intc_t* intc)
+{
+    plic_ctx_t* plic = intc->data;
+    return plic->phandle;
+}
+
+static size_t plic_fdt_irq_cells(rvvm_intc_t* intc, rvvm_irq_t irq, uint32_t* cells, size_t size)
+{
+    UNUSED(intc);
+    if (cells && size) {
+        cells[0] = irq;
+        return 1;
+    }
+    return 0;
+}
+
+PUBLIC rvvm_intc_t* riscv_plic_init(rvvm_machine_t* machine, rvvm_addr_t addr)
 {
     plic_ctx_t* plic = safe_new_obj(plic_ctx_t);
     plic->machine = machine;
     plic->enable = safe_new_arr(uint32_t*, plic_ctx_count(plic));
-    for (size_t ctx=0; ctx<plic_ctx_count(plic); ++ctx){
-        plic->enable[ctx] = safe_new_arr(uint32_t, PLIC_SRC_REG_COUNT);
-    }
     plic->threshold = safe_new_arr(uint32_t, plic_ctx_count(plic));
+    for (size_t ctx = 0; ctx < plic_ctx_count(plic); ++ctx){
+        plic->enable[ctx] = safe_new_arr(uint32_t, PLIC_SRC_REGS);
+    }
+
+    rvvm_intc_t plic_intc_desc = {
+        .data = plic,
+        .send_irq = plic_send_irq,
+        .raise_irq = plic_raise_irq,
+        .lower_irq = plic_lower_irq,
+        .fdt_phandle = plic_fdt_phandle,
+        .fdt_irq_cells = plic_fdt_irq_cells,
+    };
 
     rvvm_mmio_dev_t plic_mmio = {
-        .addr = base_addr,
-        .size = 0x4000000,
-        .min_op_size = 4,
-        .max_op_size = 4,
-        .read = plic_mmio_read,
-        .write = plic_mmio_write,
+        .addr = addr,
+        .size = PLIC_MMIO_SIZE,
         .data = plic,
         .type = &plic_dev_type,
+        .read = plic_mmio_read,
+        .write = plic_mmio_write,
+        .min_op_size = 4,
+        .max_op_size = 4,
     };
+
+    plic->intc = plic_intc_desc;
+
     if (!rvvm_attach_mmio(machine, &plic_mmio)) {
-        // Failed to attach PLIC
+        rvvm_error("Failed to attach RISC-V PLIC!");
         return NULL;
     }
 
-    rvvm_set_plic(machine, plic);
+    rvvm_set_intc(machine, &plic->intc);
 
 #ifdef USE_FDT
     struct fdt_node* cpus = fdt_node_find(rvvm_get_fdt_root(machine), "cpus");
-    if (cpus == NULL) {
-        rvvm_warn("Missing /cpus node in FDT!");
-        return plic;
-    }
-
-    uint32_t* irq_ext = safe_new_arr(uint32_t, vector_size(machine->harts) * 4);
+    vector_t(uint32_t) irq_ext = {0};
     vector_foreach(machine->harts, i) {
         struct fdt_node* cpu = fdt_node_find_reg(cpus, "cpu", i);
         struct fdt_node* cpu_irq = fdt_node_find(cpu, "interrupt-controller");
-
         uint32_t irq_phandle = fdt_node_get_phandle(cpu_irq);
-        irq_ext[(i * 4)] = irq_ext[(i * 4) + 2] = irq_phandle;
-        irq_ext[(i * 4) + 1] = CTX_IRQ_PRIO(0);
-        irq_ext[(i * 4) + 3] = CTX_IRQ_PRIO(1);
+
+        if (irq_phandle) {
+            vector_push_back(irq_ext, irq_phandle);
+            vector_push_back(irq_ext, plic_ctx_prio(0));
+            vector_push_back(irq_ext, irq_phandle);
+            vector_push_back(irq_ext, plic_ctx_prio(1));
+        } else {
+            rvvm_warn("Missing /cpus/cpu/interrupt-controller node in FDT!");
+        }
     }
 
-    struct fdt_node* plic_node = fdt_node_create_reg("plic", base_addr);
-    fdt_node_add_prop_u32(plic_node, "#address-cells", 0);
-    fdt_node_add_prop_u32(plic_node, "#interrupt-cells", 1);
-    fdt_node_add_prop_reg(plic_node, "reg", base_addr, 0x4000000);
-    fdt_node_add_prop_str(plic_node, "compatible", "sifive,plic-1.0.0");
-    fdt_node_add_prop_u32(plic_node, "riscv,ndev", PLIC_SOURCE_MAX - 1);
-    fdt_node_add_prop(plic_node, "interrupt-controller", NULL, 0);
-    fdt_node_add_prop_cells(plic_node, "interrupts-extended", irq_ext, vector_size(machine->harts) * 4);
-    free(irq_ext);
+    struct fdt_node* plic_fdt = fdt_node_create_reg("plic", plic_mmio.addr);
+    fdt_node_add_prop_reg(plic_fdt, "reg", plic_mmio.addr, plic_mmio.size);
+    fdt_node_add_prop_str(plic_fdt, "compatible", "sifive,plic-1.0.0");
+    fdt_node_add_prop(plic_fdt, "interrupt-controller", NULL, 0);
+    fdt_node_add_prop_u32(plic_fdt, "#interrupt-cells", 1);
+    fdt_node_add_prop_u32(plic_fdt, "#address-cells", 0);
+    fdt_node_add_prop_cells(plic_fdt, "interrupts-extended", vector_buffer(irq_ext), vector_size(irq_ext));
+    fdt_node_add_prop_u32(plic_fdt, "riscv,ndev", PLIC_SRC_LIMIT - 1);
+    vector_free(irq_ext);
 
-    fdt_node_add_child(rvvm_get_fdt_soc(machine), plic_node);
+    fdt_node_add_child(rvvm_get_fdt_soc(machine), plic_fdt);
 
-    plic->phandle = fdt_node_get_phandle(plic_node);
+    plic->phandle = fdt_node_get_phandle(plic_fdt);
 #endif
-    return plic;
+    return &plic->intc;
 }
 
-PUBLIC plic_ctx_t* plic_init_auto(rvvm_machine_t* machine)
+PUBLIC rvvm_intc_t* riscv_plic_init_auto(rvvm_machine_t* machine)
 {
-    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, PLIC_DEFAULT_MMIO, 0x4000000);
-    return plic_init(machine, addr);
-}
-
-// Allocate new IRQ
-PUBLIC uint32_t plic_alloc_irq(plic_ctx_t* plic)
-{
-    if (plic == NULL) return 0;
-    uint32_t irq = atomic_add_uint32(&plic->alloc_irq, 1) + 1;
-    if (irq >= PLIC_SOURCE_MAX) {
-        rvvm_warn("Ran out of PLIC interrupt IDs");
-        irq = 0;
-    }
-    return irq;
-}
-
-// Get FDT phandle of the PLIC
-PUBLIC uint32_t plic_get_phandle(plic_ctx_t* plic)
-{
-    if (plic == NULL) return 0;
-    return plic->phandle;
-}
-
-// Send IRQ through PLIC
-PUBLIC bool plic_send_irq(plic_ctx_t* plic, uint32_t irq)
-{
-    if (plic == NULL || irq == 0 || irq >= PLIC_SOURCE_MAX) {
-        return false;
-    }
-    // Mark the IRQ pending
-    uint32_t mask = 1U << (irq & 0x1F);
-    if (!(atomic_or_uint32(&plic->pending[irq >> 5], mask) & mask)) {
-        plic_notify_irq(plic, irq);
-    }
-    return true;
-}
-
-// Assert IRQ line level
-PUBLIC bool plic_raise_irq(plic_ctx_t* plic, uint32_t irq)
-{
-    if (plic == NULL || irq == 0 || irq >= PLIC_SOURCE_MAX) {
-        return false;
-    }
-    uint32_t mask = 1U << (irq & 0x1F);
-    if (!(atomic_or_uint32(&plic->raised[irq >> 5], mask) & mask)) {
-        plic_send_irq(plic, irq);
-    }
-    return true;
-}
-
-PUBLIC bool plic_lower_irq(plic_ctx_t* plic, uint32_t irq)
-{
-    if (plic == NULL || irq == 0 || irq >= PLIC_SOURCE_MAX) {
-        return false;
-    }
-    atomic_and_uint32(&plic->raised[irq >> 5], ~(1U << (irq & 0x1F)));
-    return true;
+    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, PLIC_ADDR_DEFAULT, PLIC_MMIO_SIZE);
+    return riscv_plic_init(machine, addr);
 }
