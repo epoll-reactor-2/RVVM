@@ -12,7 +12,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include "rvvmlib.h"
 
-#define I2C_OC_DEFAULT_MMIO 0x10030000
+#define I2C_OC_ADDR_DEFAULT 0x10030000
 
 #define I2C_AUTO_ADDR 0x0 // Auto-pick I2C device address
 
@@ -33,7 +33,7 @@ typedef struct {
     void (*remove)(void* dev);
 } i2c_dev_t;
 
-PUBLIC i2c_bus_t* i2c_oc_init(rvvm_machine_t* machine, rvvm_addr_t base_addr, plic_ctx_t* plic, uint32_t irq);
+PUBLIC i2c_bus_t* i2c_oc_init(rvvm_machine_t* machine, rvvm_addr_t addr, rvvm_intc_t* intc, rvvm_irq_t irq);
 PUBLIC i2c_bus_t* i2c_oc_init_auto(rvvm_machine_t* machine);
 
 // Returns assigned device address or zero on error

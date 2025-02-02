@@ -8,21 +8,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "i2c-oc.h"
-#include "plic.h"
+#include "fdtlib.h"
 #include "spinlock.h"
 #include "vector.h"
 #include "mem_ops.h"
 #include "utils.h"
 
-#ifdef USE_FDT
-#include "fdtlib.h"
-#endif
-
-struct i2c_bus {
+struct rvvm_i2c_bus {
     vector_t(i2c_dev_t) devices;
-    plic_ctx_t* plic;
     struct fdt_node* fdt_node;
-    uint32_t irq;
+    rvvm_intc_t* intc;
+    rvvm_irq_t irq;
     spinlock_t lock;
     uint16_t sel_addr;
     uint16_t clock;
@@ -32,7 +28,7 @@ struct i2c_bus {
     uint8_t  rx_byte;
 };
 
-#define I2C_OC_REG_SIZE 0x14
+#define I2C_OC_MMIO_SIZE 0x1000
 
 // OpenCores I2C registers
 #define I2C_OC_CLKLO    0x00 // Clock prescale low byte
@@ -62,7 +58,9 @@ struct i2c_bus {
 static void i2c_oc_interrupt(i2c_bus_t* bus)
 {
     bus->status |= I2C_OC_SR_IF;
-    if (bus->control & I2C_OC_CTR_IEN) plic_send_irq(bus->plic, bus->irq);
+    if (bus->control & I2C_OC_CTR_IEN) {
+        rvvm_send_irq(bus->intc, bus->irq);
+    }
 }
 
 static i2c_dev_t* i2c_oc_get_dev(i2c_bus_t* bus, uint16_t addr)
@@ -187,15 +185,15 @@ static rvvm_mmio_type_t i2c_oc_dev_type = {
     .remove = i2c_oc_remove,
 };
 
-PUBLIC i2c_bus_t* i2c_oc_init(rvvm_machine_t* machine, rvvm_addr_t base_addr, plic_ctx_t* plic, uint32_t irq)
+PUBLIC i2c_bus_t* i2c_oc_init(rvvm_machine_t* machine, rvvm_addr_t addr, rvvm_intc_t* intc, rvvm_irq_t irq)
 {
     i2c_bus_t* bus = safe_new_obj(i2c_bus_t);
-    bus->plic = plic;
+    bus->intc = intc;
     bus->irq = irq;
 
     rvvm_mmio_dev_t i2c_oc = {
-        .addr = base_addr,
-        .size = I2C_OC_REG_SIZE,
+        .addr = addr,
+        .size = I2C_OC_MMIO_SIZE,
         .data = bus,
         .read = i2c_oc_mmio_read,
         .write = i2c_oc_mmio_write,
@@ -203,24 +201,26 @@ PUBLIC i2c_bus_t* i2c_oc_init(rvvm_machine_t* machine, rvvm_addr_t base_addr, pl
         .min_op_size = 1,
         .max_op_size = 4,
     };
-    if (rvvm_attach_mmio(machine, &i2c_oc) == NULL) return NULL;
+    if (!rvvm_attach_mmio(machine, &i2c_oc)) {
+        rvvm_error("Failed to attach OpenCores I2C controller!");
+        return NULL;
+    }
 
 #ifdef USE_FDT
-    struct fdt_node* i2c_clock = fdt_node_find(rvvm_get_fdt_soc(machine), "i2c_oc_osc");
+    struct fdt_node* i2c_clock = fdt_node_find(rvvm_get_fdt_root(machine), "i2c_oc_osc");
     if (i2c_clock == NULL) {
         i2c_clock = fdt_node_create("i2c_oc_osc");
         fdt_node_add_prop_str(i2c_clock, "compatible", "fixed-clock");
         fdt_node_add_prop_u32(i2c_clock, "#clock-cells", 0);
         fdt_node_add_prop_u32(i2c_clock, "clock-frequency", 20000000);
         fdt_node_add_prop_str(i2c_clock, "clock-output-names", "clk");
-        fdt_node_add_child(rvvm_get_fdt_soc(machine), i2c_clock);
+        fdt_node_add_child(rvvm_get_fdt_root(machine), i2c_clock);
     }
 
-    struct fdt_node* i2c_fdt = fdt_node_create_reg("i2c", base_addr);
-    fdt_node_add_prop_reg(i2c_fdt, "reg", base_addr, I2C_OC_REG_SIZE);
+    struct fdt_node* i2c_fdt = fdt_node_create_reg("i2c", i2c_oc.addr);
+    fdt_node_add_prop_reg(i2c_fdt, "reg", i2c_oc.addr, i2c_oc.size);
     fdt_node_add_prop_str(i2c_fdt, "compatible", "opencores,i2c-ocores");
-    fdt_node_add_prop_u32(i2c_fdt, "interrupt-parent", plic_get_phandle(plic));
-    fdt_node_add_prop_u32(i2c_fdt, "interrupts", irq);
+    rvvm_fdt_describe_irq(i2c_fdt, intc, irq);
     fdt_node_add_prop_u32(i2c_fdt, "clocks", fdt_node_get_phandle(i2c_clock));
     fdt_node_add_prop_str(i2c_fdt, "clock-names", "clk");
     fdt_node_add_prop_u32(i2c_fdt, "reg-shift", 2);
@@ -238,9 +238,9 @@ PUBLIC i2c_bus_t* i2c_oc_init(rvvm_machine_t* machine, rvvm_addr_t base_addr, pl
 
 PUBLIC i2c_bus_t* i2c_oc_init_auto(rvvm_machine_t* machine)
 {
-    plic_ctx_t* plic = rvvm_get_plic(machine);
-    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, I2C_OC_DEFAULT_MMIO, I2C_OC_REG_SIZE);
-    return i2c_oc_init(machine, addr, plic, plic_alloc_irq(plic));
+    rvvm_intc_t* intc = rvvm_get_intc(machine);
+    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, I2C_OC_ADDR_DEFAULT, I2C_OC_MMIO_SIZE);
+    return i2c_oc_init(machine, addr, intc, rvvm_alloc_irq(intc));
 }
 
 PUBLIC uint16_t i2c_attach_dev(i2c_bus_t* bus, const i2c_dev_t* dev_desc)
