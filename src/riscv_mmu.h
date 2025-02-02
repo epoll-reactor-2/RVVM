@@ -56,7 +56,6 @@ void riscv_jit_tlb_flush(rvvm_hart_t* vm);
 // Used for GDB stub
 #define RISCV_MMU_ATTR_DEBUG   (RISCV_MMU_ATTR_NO_TRAP | RISCV_MMU_ATTR_NO_PROT)
 
-
 no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint32_t attr);
 
 static forceinline void* riscv_mmu_op_helper(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint32_t attr, uint8_t size, uint8_t access)
