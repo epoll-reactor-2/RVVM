@@ -58,14 +58,14 @@ PUBLIC rvvm_mmio_dev_t* syscon_init(rvvm_machine_t* machine, rvvm_addr_t base_ad
     fdt_node_add_prop_u32(poweroff, "value", SYSCON_POWEROFF);
     fdt_node_add_prop_u32(poweroff, "offset", 0);
     fdt_node_add_prop_u32(poweroff, "regmap", fdt_node_get_phandle(test));
-    fdt_node_add_child(rvvm_get_fdt_soc(machine), poweroff);
+    fdt_node_add_child(rvvm_get_fdt_root(machine), poweroff);
 
     struct fdt_node* reboot = fdt_node_create("reboot");
     fdt_node_add_prop_str(reboot, "compatible", "syscon-reboot");
     fdt_node_add_prop_u32(reboot, "value", SYSCON_RESET);
     fdt_node_add_prop_u32(reboot, "offset", 0);
     fdt_node_add_prop_u32(reboot, "regmap", fdt_node_get_phandle(test));
-    fdt_node_add_child(rvvm_get_fdt_soc(machine), reboot);
+    fdt_node_add_child(rvvm_get_fdt_root(machine), reboot);
 #endif
     return mmio;
 }
