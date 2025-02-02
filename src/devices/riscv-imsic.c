@@ -15,8 +15,13 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define IMSIC_REG_SETEIPNUM_LE 0x00
 #define IMSIC_REG_SETEIPNUM_BE 0x04
 
-static bool riscv_imsic_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+typedef struct {
+    bool smode;
+} imsic_ctx_t;
+
+static bool imsic_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
+    imsic_ctx_t* imsic = dev->data;
     size_t hartid = offset >> 12;
     UNUSED(size);
 
@@ -24,17 +29,11 @@ static bool riscv_imsic_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, u
         rvvm_hart_t* hart = vector_at(dev->machine->harts, hartid);
         switch (offset & 0xFFC) {
             case IMSIC_REG_SETEIPNUM_LE: {
-                uint32_t identity = read_uint32_le(data);
-                // TODO: Actual MSI interrupt injection
-                UNUSED(hart);
-                UNUSED(identity);
+                riscv_send_aia_irq(hart, imsic->smode, read_uint32_le(data));
                 break;
             }
             case IMSIC_REG_SETEIPNUM_BE: {
-                uint32_t identity = read_uint32_be_m(data);
-                // TODO: Actual MSI interrupt injection
-                UNUSED(hart);
-                UNUSED(identity);
+                riscv_send_aia_irq(hart, imsic->smode, read_uint32_be_m(data));
                 break;
             }
         }
@@ -43,56 +42,71 @@ static bool riscv_imsic_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, u
     return true;
 }
 
-static rvvm_mmio_type_t riscv_imsic_dev_type = {
+static rvvm_mmio_type_t imsic_dev_type = {
     .name = "riscv_imsic",
 };
 
 PUBLIC void riscv_imsic_init(rvvm_machine_t* machine, rvvm_addr_t addr, bool smode)
 {
-    rvvm_mmio_dev_t riscv_imsic = {
+    if (rvvm_machine_running(machine)) {
+        rvvm_error("Can't enable AIA on already running machine!");
+        return;
+    }
+
+    vector_foreach(machine->harts, i) {
+        riscv_hart_aia_init(vector_at(machine->harts, i));
+    }
+
+    rvvm_append_isa_string(machine, "_smaia_ssaia");
+
+    imsic_ctx_t* imsic = safe_new_obj(imsic_ctx_t);
+
+    rvvm_mmio_dev_t imsic_mmio = {
         .addr = addr,
         .size = vector_size(machine->harts) << 12,
+        .data = imsic,
         .min_op_size = 4,
         .max_op_size = 4,
         .read = rvvm_mmio_none,
-        .write = riscv_imsic_write,
-        .type = &riscv_imsic_dev_type,
+        .write = imsic_mmio_write,
+        .type = &imsic_dev_type,
     };
 
-    if (!rvvm_attach_mmio(machine, &riscv_imsic)) {
-        rvvm_error("Failed to attach IMSIC!");
+    imsic->smode = smode;
+
+    if (!rvvm_attach_msi_target(machine, &imsic_mmio)) {
+        rvvm_error("Failed to attach RISC-V IMSIC!");
         return;
     }
 
 #ifdef USE_FDT
-    struct fdt_node* imsic_fdt = fdt_node_create_reg(smode ? "imsics_s" : "imsics_m", addr);
+    struct fdt_node* imsic_fdt = fdt_node_create_reg(smode ? "imsics_s" : "imsics_m", imsic_mmio.addr);
     struct fdt_node* cpus = fdt_node_find(rvvm_get_fdt_root(machine), "cpus");
-    size_t irq_ext_cells = vector_size(machine->harts) << 1;
-    uint32_t* irq_ext = safe_new_arr(uint32_t, irq_ext_cells);
+    vector_t(uint32_t) irq_ext = {0};
 
+    fdt_node_add_prop_reg(imsic_fdt, "reg", imsic_mmio.addr, imsic_mmio.size);
     fdt_node_add_prop_str(imsic_fdt, "compatible", "riscv,imsics");
-    fdt_node_add_prop_reg(imsic_fdt, "reg", riscv_imsic.addr, riscv_imsic.size);
-    fdt_node_add_prop(imsic_fdt, "msi-controller", NULL, 0);
     fdt_node_add_prop(imsic_fdt, "interrupt-controller", NULL, 0);
     fdt_node_add_prop_u32(imsic_fdt, "#interrupt-cells", 0);
-    fdt_node_add_prop_u32(imsic_fdt, "riscv,num-ids", 64);
+    fdt_node_add_prop(imsic_fdt, "msi-controller", NULL, 0);
+    fdt_node_add_prop_u32(imsic_fdt, "#msi-cells", 0);
+    fdt_node_add_prop_u32(imsic_fdt, "riscv,num-ids", RVVM_AIA_IRQ_LIMIT - 1);
 
     vector_foreach(machine->harts, i) {
         struct fdt_node* cpu = fdt_node_find_reg(cpus, "cpu", i);
         struct fdt_node* cpu_irq = fdt_node_find(cpu, "interrupt-controller");
 
         if (cpu_irq) {
-            uint32_t irq_phandle = fdt_node_get_phandle(cpu_irq);
-            irq_ext[(i << 1)] = irq_phandle;
-            irq_ext[(i << 1) + 1] = smode ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL;
+            vector_push_back(irq_ext, fdt_node_get_phandle(cpu_irq));
+            vector_push_back(irq_ext, smode ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL);
         } else {
             rvvm_warn("Missing CPU IRQ nodes in FDT!");
         }
     }
 
-    fdt_node_add_prop_cells(imsic_fdt, "interrupts-extended", irq_ext, irq_ext_cells);
+    fdt_node_add_prop_cells(imsic_fdt, "interrupts-extended", vector_buffer(irq_ext), vector_size(irq_ext));
     fdt_node_add_child(rvvm_get_fdt_soc(machine), imsic_fdt);
-    free(irq_ext);
+    vector_free(irq_ext);
 #endif
 }
 
