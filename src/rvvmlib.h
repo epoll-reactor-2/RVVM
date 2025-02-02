@@ -45,7 +45,7 @@ RVVM_EXTERN_C_BEGIN
 #endif
 
 //! Increments on each API/ABI breakage, equal to -1 in unstable staging builds
-#define RVVM_ABI_VERSION 8
+#define RVVM_ABI_VERSION 9
 
 //! \brief  Check librvvm ABI compatibility via rvvm_check_abi(RVVM_ABI_VERSION)
 //! \return True if librvvm supports the header ABI
@@ -152,6 +152,9 @@ PUBLIC void rvvm_run_eventloop(void);
  * @{
  */
 
+//! FDT node for Device Tree generation
+struct fdt_node;
+
 //! MMIO device handle
 typedef struct rvvm_mmio_dev_t rvvm_mmio_dev_t;
 
@@ -161,20 +164,20 @@ typedef bool (*rvvm_mmio_handler_t)(rvvm_mmio_dev_t* dev, void* dest, size_t off
 //! Dummy MMIO read/write: Reads zeros, ignores writes, never faults
 PUBLIC bool rvvm_mmio_none(rvvm_mmio_dev_t* dev, void* dest, size_t offset, uint8_t size);
 
-//! FDT node for Device Tree generation
-struct fdt_node;
+//! Interrupt controller handle
+typedef struct rvvm_intc_t rvvm_intc_t;
 
-//! PLIC interrupt controller handle
-typedef struct plic    plic_ctx_t;
-
-//! PCI Bus (root complex) handle
-typedef struct pci_bus pci_bus_t;
+//! PCI Bus (PCI Express Root Complex) handle
+typedef struct rvvm_pci_bus pci_bus_t;
 
 //! I2C Bus handle
-typedef struct i2c_bus i2c_bus_t;
+typedef struct rvvm_i2c_bus i2c_bus_t;
 
 //! MMIO device type-specific information and handlers (Cleanup, reset, serialize)
 typedef struct {
+    //! Human-readable device name
+    const char* name;
+
     //! Called to free device state (LIFO order), dev->data is simply freed if this is NULL
     void (*remove)(rvvm_mmio_dev_t* dev);
 
@@ -190,8 +193,6 @@ typedef struct {
      * void (*resume)(rvvm_mmio_dev_t* dev, rvvm_state_t* state);
      */
 
-    //! Human-readable device name
-    const char* name;
 } rvvm_mmio_type_t;
 
 //! MMIO region description
@@ -241,25 +242,71 @@ PUBLIC void rvvm_remove_mmio(rvvm_mmio_dev_t* mmio_dev);
 //! \brief Clean up MMIO device state if it's not attached to any machine
 PUBLIC void rvvm_cleanup_mmio_desc(const rvvm_mmio_dev_t* mmio_desc);
 
-/*
- * Get/Set default PLIC, PCI bus for this machine
- * Newly attached ones should set themselves automatically
- */
+//! \brief Get wired interrupt controller handle of this machine or NULL
+PUBLIC rvvm_intc_t* rvvm_get_intc(rvvm_machine_t* machine);
+PUBLIC void         rvvm_set_intc(rvvm_machine_t* machine, rvvm_intc_t* intc);
 
-PUBLIC plic_ctx_t* rvvm_get_plic(rvvm_machine_t* machine);
-PUBLIC void        rvvm_set_plic(rvvm_machine_t* machine, plic_ctx_t* plic);
+//! \brief Get PCI rooot complex handle of this machine or NULL
+PUBLIC pci_bus_t* rvvm_get_pci_bus(rvvm_machine_t* machine);
+PUBLIC void       rvvm_set_pci_bus(rvvm_machine_t* machine, pci_bus_t* pci_bus);
 
-PUBLIC pci_bus_t*  rvvm_get_pci_bus(rvvm_machine_t* machine);
-PUBLIC void        rvvm_set_pci_bus(rvvm_machine_t* machine, pci_bus_t* pci_bus);
-
-PUBLIC i2c_bus_t*  rvvm_get_i2c_bus(rvvm_machine_t* machine);
-PUBLIC void        rvvm_set_i2c_bus(rvvm_machine_t* machine, i2c_bus_t* i2c_bus);
+//! \brief Get I2C bus handle of this machine, or NULL
+PUBLIC i2c_bus_t* rvvm_get_i2c_bus(rvvm_machine_t* machine);
+PUBLIC void       rvvm_set_i2c_bus(rvvm_machine_t* machine, i2c_bus_t* i2c_bus);
 
 //! \brief Get root FDT node (For custom FDT generation)
 PUBLIC struct fdt_node* rvvm_get_fdt_root(rvvm_machine_t* machine);
 
 //! \brief Get /soc FDT node (For custom FDT generation)
 PUBLIC struct fdt_node* rvvm_get_fdt_soc(rvvm_machine_t* machine);
+
+/** @}*/
+
+/**
+ * @defgroup rvvm_irq_api RVVM Interrupt API
+ * @addtogroup rvvm_irq_api
+ * @{
+ */
+
+//! \brief Sends an MSI IRQ by issuing a 32-bit little-endian memory write
+PUBLIC bool rvvm_send_msi_irq(rvvm_machine_t* machine, rvvm_addr_t addr, uint32_t val);
+
+//! \brief Attach an MSI IRQ controller, semantically almost same as rvvm_attach_mmio()
+PUBLIC bool rvvm_attach_msi_target(rvvm_machine_t* machine, const rvvm_mmio_dev_t* mmio_desc);
+
+//! Interrupt line identifier
+typedef uint32_t rvvm_irq_t;
+
+//! Interrupt controller description
+struct rvvm_intc_t {
+    void* data;
+    uint32_t last_irq;
+    bool (*send_irq)(rvvm_intc_t* intc, rvvm_irq_t irq);
+    bool (*raise_irq)(rvvm_intc_t* intc, rvvm_irq_t irq);
+    bool (*lower_irq)(rvvm_intc_t* intc, rvvm_irq_t irq);
+    rvvm_irq_t (*alloc_irq)(rvvm_intc_t* intc);
+    uint32_t (*fdt_phandle)(rvvm_intc_t* intc);
+    size_t (*fdt_irq_cells)(rvvm_intc_t* intc, rvvm_irq_t irq, uint32_t* cells, size_t size);
+};
+
+//! \brief Allocate a new IRQ pin on the IRQ controller
+PUBLIC rvvm_irq_t rvvm_alloc_irq(rvvm_intc_t* intc);
+
+//! \brief Send an edge-triggered IRQ through IRQ controller pin
+PUBLIC bool rvvm_send_irq(rvvm_intc_t* intc, rvvm_irq_t irq);
+
+//! \brief Assert/lower an IRQ pin on the IRQ controller
+PUBLIC bool rvvm_raise_irq(rvvm_intc_t* intc, rvvm_irq_t irq);
+PUBLIC bool rvvm_lower_irq(rvvm_intc_t* intc, rvvm_irq_t irq);
+
+//! \brief Add interrupt-parent & interrupts fields to device FDT node
+PUBLIC bool rvvm_fdt_describe_irq(struct fdt_node* node, rvvm_intc_t* intc, rvvm_irq_t irq);
+
+//! \brief Get interrupt-parent FDT phandle of an interrupt controller
+PUBLIC uint32_t rvvm_fdt_intc_phandle(rvvm_intc_t* intc);
+
+//! \brief Get interrupts-extended FDT cells for an IRQ
+PUBLIC size_t rvvm_fdt_irq_cells(rvvm_intc_t* intc, rvvm_irq_t irq, uint32_t* cells, size_t size);
 
 /** @}*/
 
