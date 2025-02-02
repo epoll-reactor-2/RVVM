@@ -8,21 +8,18 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "ns16550a.h"
+#include "fdtlib.h"
 #include "chardev.h"
 #include "spinlock.h"
 #include "utils.h"
 #include "mem_ops.h"
 
-#ifdef USE_FDT
-#include "fdtlib.h"
-#endif
-
-#define NS16550A_MMIO_SIZE 0x8
+#define NS16550A_MMIO_SIZE 0x1000
 
 typedef struct {
     chardev_t* chardev;
-    plic_ctx_t* plic;
-    uint32_t irq;
+    rvvm_intc_t* intc;
+    rvvm_irq_t irq;
 
     uint32_t ier;
     uint32_t lcr;
@@ -66,10 +63,10 @@ typedef struct {
 static void ns16550a_notify(void* io_dev, uint32_t flags)
 {
     ns16550a_dev_t* uart = io_dev;
-    uint32_t ier = atomic_load_uint32(&uart->ier);
+    uint32_t ier = atomic_load_uint32_relax(&uart->ier);
     if (((flags & CHARDEV_RX) && (ier & NS16550A_IER_RECV))
      || ((flags & CHARDEV_TX) && (ier & NS16550A_IER_THR))) {
-        plic_send_irq(uart->plic, uart->irq);
+        rvvm_send_irq(uart->intc, uart->irq);
     }
 }
 
@@ -80,22 +77,22 @@ static bool ns16550a_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, 
 
     switch (offset) {
         case NS16550A_REG_RBR_DLL:
-            if (atomic_load_uint32(&uart->lcr) & NS16550A_LCR_DLAB) {
-                write_uint8(data, atomic_load_uint32(&uart->dll));
+            if (atomic_load_uint32_relax(&uart->lcr) & NS16550A_LCR_DLAB) {
+                write_uint8(data, atomic_load_uint32_relax(&uart->dll));
             } else if (chardev_poll(uart->chardev) & CHARDEV_RX) {
                 chardev_read(uart->chardev, data, 1);
             }
             break;
         case NS16550A_REG_IER_DLM:
-            if (atomic_load_uint32(&uart->lcr) & NS16550A_LCR_DLAB) {
-                write_uint8(data, atomic_load_uint32(&uart->dlm));
+            if (atomic_load_uint32_relax(&uart->lcr) & NS16550A_LCR_DLAB) {
+                write_uint8(data, atomic_load_uint32_relax(&uart->dlm));
             } else {
-                write_uint8(data, atomic_load_uint32(&uart->ier));
+                write_uint8(data, atomic_load_uint32_relax(&uart->ier));
             }
             break;
         case NS16550A_REG_IIR: {
             uint32_t flags = chardev_poll(uart->chardev);
-            uint32_t ier = atomic_load_uint32(&uart->ier);
+            uint32_t ier = atomic_load_uint32_relax(&uart->ier);
             if ((flags & CHARDEV_RX) && (ier & NS16550A_IER_RECV)) {
                 write_uint8(data, NS16550A_IIR_RECV | NS16550A_IIR_FIFO);
             } else if ((flags & CHARDEV_TX) && (ier & NS16550A_IER_THR)) {
@@ -106,10 +103,10 @@ static bool ns16550a_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, 
             break;
         }
         case NS16550A_REG_LCR:
-            write_uint8(data, atomic_load_uint32(&uart->lcr));
+            write_uint8(data, atomic_load_uint32_relax(&uart->lcr));
             break;
         case NS16550A_REG_MCR:
-            write_uint8(data, atomic_load_uint32(&uart->mcr));
+            write_uint8(data, atomic_load_uint32_relax(&uart->mcr));
             break;
         case NS16550A_REG_LSR: {
             uint32_t flags = chardev_poll(uart->chardev);
@@ -121,7 +118,7 @@ static bool ns16550a_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, 
             write_uint8(data, 0xF0);
             break;
         case NS16550A_REG_SCR:
-            write_uint8(data, atomic_load_uint32(&uart->scr));
+            write_uint8(data, atomic_load_uint32_relax(&uart->scr));
             break;
         default:
             write_uint8(data, 0);
@@ -137,29 +134,29 @@ static bool ns16550a_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset,
 
     switch (offset) {
         case NS16550A_REG_THR_DLL:
-            if (atomic_load_uint32(&uart->lcr) & NS16550A_LCR_DLAB) {
-                atomic_store_uint32(&uart->dll, read_uint8(data));
+            if (atomic_load_uint32_relax(&uart->lcr) & NS16550A_LCR_DLAB) {
+                atomic_store_uint32_relax(&uart->dll, read_uint8(data));
             } else {
                 chardev_write(uart->chardev, data, 1);
             }
             break;
         case NS16550A_REG_IER_DLM:
-            if (atomic_load_uint32(&uart->lcr) & NS16550A_LCR_DLAB) {
-                atomic_store_uint32(&uart->dlm, read_uint8(data));
+            if (atomic_load_uint32_relax(&uart->lcr) & NS16550A_LCR_DLAB) {
+                atomic_store_uint32_relax(&uart->dlm, read_uint8(data));
             } else {
-                atomic_store_uint32(&uart->ier, read_uint8(data));
+                atomic_store_uint32_relax(&uart->ier, read_uint8(data));
                 // Trigger re-enabled interrupts, if any
                 ns16550a_notify(uart, chardev_poll(uart->chardev));
             }
             break;
         case NS16550A_REG_LCR:
-            atomic_store_uint32(&uart->lcr, read_uint8(data));
+            atomic_store_uint32_relax(&uart->lcr, read_uint8(data));
             break;
         case NS16550A_REG_MCR:
-            atomic_store_uint32(&uart->mcr, read_uint8(data));
+            atomic_store_uint32_relax(&uart->mcr, read_uint8(data));
             break;
         case NS16550A_REG_SCR:
-            atomic_store_uint32(&uart->scr, read_uint8(data));
+            atomic_store_uint32_relax(&uart->scr, read_uint8(data));
             break;
         default:
             break;
@@ -187,11 +184,11 @@ static rvvm_mmio_type_t ns16550a_dev_type = {
 };
 
 PUBLIC rvvm_mmio_dev_t* ns16550a_init(rvvm_machine_t* machine, chardev_t* chardev,
-                                      rvvm_addr_t base_addr, plic_ctx_t* plic, uint32_t irq)
+                                      rvvm_addr_t addr, rvvm_intc_t* intc, rvvm_irq_t irq)
 {
     ns16550a_dev_t* uart = safe_new_obj(ns16550a_dev_t);
     uart->chardev = chardev;
-    uart->plic = plic;
+    uart->intc = intc;
     uart->irq = irq;
 
     if (chardev) {
@@ -200,28 +197,27 @@ PUBLIC rvvm_mmio_dev_t* ns16550a_init(rvvm_machine_t* machine, chardev_t* charde
     }
 
     rvvm_mmio_dev_t ns16550a = {
-        .addr = base_addr,
+        .addr = addr,
         .size = NS16550A_MMIO_SIZE,
-        .min_op_size = 1,
-        .max_op_size = 1,
-        .read = ns16550a_mmio_read,
-        .write = ns16550a_mmio_write,
         .data = uart,
         .type = &ns16550a_dev_type,
+        .read = ns16550a_mmio_read,
+        .write = ns16550a_mmio_write,
+        .min_op_size = 1,
+        .max_op_size = 1,
     };
+
     rvvm_mmio_dev_t* mmio = rvvm_attach_mmio(machine, &ns16550a);
     if (mmio == NULL) return mmio;
+
 #ifdef USE_FDT
     struct fdt_node* uart_fdt = fdt_node_create_reg("uart", ns16550a.addr);
     fdt_node_add_prop_reg(uart_fdt, "reg", ns16550a.addr, ns16550a.size);
     fdt_node_add_prop_str(uart_fdt, "compatible", "ns16550a");
-    fdt_node_add_prop_u32(uart_fdt, "clock-frequency", 0x2625a00);
+    fdt_node_add_prop_u32(uart_fdt, "clock-frequency", 4000000);
     fdt_node_add_prop_u32(uart_fdt, "fifo-size", 16);
     fdt_node_add_prop_str(uart_fdt, "status", "okay");
-    if (plic) {
-        fdt_node_add_prop_u32(uart_fdt, "interrupt-parent", plic_get_phandle(plic));
-        fdt_node_add_prop_u32(uart_fdt, "interrupts", irq);
-    }
+    rvvm_fdt_describe_irq(uart_fdt, intc, irq);
     fdt_node_add_child(rvvm_get_fdt_soc(machine), uart_fdt);
 #endif
     return mmio;
@@ -229,10 +225,10 @@ PUBLIC rvvm_mmio_dev_t* ns16550a_init(rvvm_machine_t* machine, chardev_t* charde
 
 PUBLIC rvvm_mmio_dev_t* ns16550a_init_auto(rvvm_machine_t* machine, chardev_t* chardev)
 {
-    plic_ctx_t* plic = rvvm_get_plic(machine);
-    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, NS16550A_DEFAULT_MMIO, NS16550A_MMIO_SIZE);
-    rvvm_mmio_dev_t* mmio = ns16550a_init(machine, chardev, addr, plic, plic_alloc_irq(plic));
-    if (addr == NS16550A_DEFAULT_MMIO && mmio != NULL) {
+    rvvm_intc_t* intc = rvvm_get_intc(machine);
+    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, NS16550A_ADDR_DEFAULT, NS16550A_MMIO_SIZE);
+    rvvm_mmio_dev_t* mmio = ns16550a_init(machine, chardev, addr, intc, rvvm_alloc_irq(intc));
+    if (addr == NS16550A_ADDR_DEFAULT && mmio) {
         rvvm_append_cmdline(machine, "console=ttyS");
 #ifdef USE_FDT
         struct fdt_node* chosen = fdt_node_find(rvvm_get_fdt_root(machine), "chosen");

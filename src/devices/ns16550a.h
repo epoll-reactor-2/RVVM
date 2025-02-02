@@ -11,14 +11,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RVVM_NS16550A_H
 
 #include "rvvmlib.h"
-#include "plic.h"
 #include "chardev.h"
 
-#define NS16550A_DEFAULT_MMIO 0x10000000
+#define NS16550A_ADDR_DEFAULT 0x10000000
 
 PUBLIC rvvm_mmio_dev_t* ns16550a_init(rvvm_machine_t* machine, chardev_t* chardev,
-                                      rvvm_addr_t base_addr, plic_ctx_t* plic, uint32_t irq);
+                                      rvvm_addr_t addr, rvvm_intc_t* intc, rvvm_irq_t irq);
+
 PUBLIC rvvm_mmio_dev_t* ns16550a_init_auto(rvvm_machine_t* machine, chardev_t* chardev);
+
 PUBLIC rvvm_mmio_dev_t* ns16550a_init_term_auto(rvvm_machine_t* machine);
 
 #endif
