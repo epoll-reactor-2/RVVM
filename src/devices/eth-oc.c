@@ -11,11 +11,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #ifdef USE_NET
 
 #include "eth-oc.h"
-#include "tap_api.h"
-#include "mem_ops.h"
+#include "fdtlib.h"
 #include "spinlock.h"
 #include "utils.h"
-#include "fdtlib.h"
+#include "mem_ops.h"
 
 // Device registers
 #define ETHOC_MODER         0x00 // Mode
@@ -130,22 +129,21 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define MII_REG_PHYIDR2 3
 
 // Buffer Descriptor
-struct ethoc_bd
-{
+typedef struct {
     uint32_t data;
     uint32_t ptr;
-};
+} ethoc_bd_t;
 
-struct ethoc_dev
-{
-    struct ethoc_bd bdbuf[ETHOC_BD_COUNT];
+typedef struct {
+    ethoc_bd_t bdbuf[ETHOC_BD_COUNT];
     tap_dev_t* tap;
     spinlock_t lock;
     spinlock_t rx_lock;
 
     rvvm_machine_t* machine;
-    plic_ctx_t* plic;
-    uint32_t irq;
+    rvvm_intc_t* intc;
+    rvvm_irq_t irq;
+
     uint32_t cur_txbd;
     uint32_t cur_rxbd;
 
@@ -166,19 +164,22 @@ struct ethoc_dev
     uint32_t hash[2];
     uint32_t txctrl;
     uint8_t macaddr[6];
-};
+} ethoc_dev_t;
 
-static void ethoc_interrupt(struct ethoc_dev *eth, uint8_t int_num)
+static void ethoc_interrupt(ethoc_dev_t* eth, uint8_t int_num)
 {
-    uint32_t irqs = atomic_or_uint32(&eth->int_src, (1 << int_num)) | (1 << int_num);
-    if (irqs & atomic_load_uint32(&eth->int_mask)) plic_send_irq(eth->plic, eth->irq);
+    uint32_t mask = (1U << int_num);
+    uint32_t irqs = atomic_or_uint32(&eth->int_src, mask);
+    if (!(irqs & mask) && (mask & atomic_load_uint32_relax(&eth->int_mask))) {
+        rvvm_send_irq(eth->intc, eth->irq);
+    }
 }
 
-static void ethoc_process_tx(struct ethoc_dev *eth)
+static void ethoc_process_tx(ethoc_dev_t* eth)
 {
     // Loop until the queue is drained
-    for (size_t i=0; i<ETHOC_BD_COUNT; ++i) {
-        struct ethoc_bd* txbd = &eth->bdbuf[eth->cur_txbd];
+    for (size_t i = 0; i < ETHOC_BD_COUNT; ++i) {
+        ethoc_bd_t* txbd = &eth->bdbuf[eth->cur_txbd];
         if (!(eth->moder & ETHOC_MODER_TXEN) || !(txbd->data & ETHOC_TXBD_RD)) {
             // Nothing to send
             return;
@@ -213,13 +214,13 @@ static void ethoc_process_tx(struct ethoc_dev *eth)
 
 static bool ethoc_feed_rx(void* net_dev, const void* data, size_t size)
 {
-    struct ethoc_dev* eth = (struct ethoc_dev*)net_dev;
+    ethoc_dev_t* eth = net_dev;
 
     // Receiver disabled
     if (!(atomic_load_uint32(&eth->moder) & ETHOC_MODER_RXEN)) return false;
 
     spin_lock(&eth->rx_lock);
-    struct ethoc_bd* rxbd = &eth->bdbuf[eth->cur_rxbd];
+    ethoc_bd_t* rxbd = &eth->bdbuf[eth->cur_rxbd];
     uint32_t flags = atomic_load_uint32(&rxbd->data);
     if (!(flags & ETHOC_RXBD_E)) {
         // Ring overrun
@@ -250,118 +251,115 @@ static bool ethoc_feed_rx(void* net_dev, const void* data, size_t size)
     }
 
     spin_unlock(&eth->rx_lock);
-    if (flags & ETHOC_BD_IRQ) ethoc_interrupt(eth, ETHOC_INT_RXB);
+    if (flags & ETHOC_BD_IRQ) {
+        ethoc_interrupt(eth, ETHOC_INT_RXB);
+    }
     return true;
 }
 
 static bool ethoc_data_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    struct ethoc_dev* eth = (struct ethoc_dev*)dev->data;
+    ethoc_dev_t* eth = dev->data;
+    uint32_t val = 0;
     UNUSED(size);
 
     spin_lock(&eth->lock);
     switch (offset) {
         case ETHOC_MODER:
-            write_uint32_le_m(data, atomic_load_uint32(&eth->moder));
+            val = atomic_load_uint32_relax(&eth->moder);
             break;
         case ETHOC_INT_SRC:
-            write_uint32_le_m(data, atomic_load_uint32(&eth->int_src));
+            val = atomic_load_uint32_relax(&eth->int_src);
             break;
         case ETHOC_INT_MASK:
-            write_uint32_le_m(data, atomic_load_uint32(&eth->int_mask));
-            break;
-        case ETHOC_IPGT:
-        case ETHOC_IPGR1:
-        case ETHOC_IPGR2:
-            // ignore
-            write_uint32_le_m(data, 0);
+            val = atomic_load_uint32_relax(&eth->int_mask);
             break;
         case ETHOC_PACKETLEN:
-            write_uint32_le_m(data, atomic_load_uint32(&eth->packetlen));
+            val = atomic_load_uint32_relax(&eth->packetlen);
             break;
         case ETHOC_COLLCONF:
-            write_uint32_le_m(data, eth->collconf);
+            val = eth->collconf;
             break;
         case ETHOC_TX_BD_NUM:
-            write_uint32_le_m(data, eth->tx_bd_num);
+            val = eth->tx_bd_num;
             break;
         case ETHOC_CTRLMODER:
-            write_uint32_le_m(data, eth->ctrlmoder);
+            val = eth->ctrlmoder;
             break;
         case ETHOC_MIIMODER:
-            write_uint32_le_m(data, eth->miimoder);
-            break;
-        case ETHOC_MIICOMMAND:
-            write_uint32_le_m(data, 0);
+            val = eth->miimoder;
             break;
         case ETHOC_MIIADDRESS:
-            write_uint32_le_m(data, eth->miiaddress);
+            val = eth->miiaddress;
             break;
         case ETHOC_MIITX_DATA:
-            write_uint32_le_m(data, eth->miitx_data);
+            val = eth->miitx_data;
             break;
         case ETHOC_MIIRX_DATA:
-            write_uint32_le_m(data, eth->miirx_data);
+            val = eth->miirx_data;
             break;
         case ETHOC_MIISTATUS:
-            write_uint32_le_m(data, eth->miistatus);
+            val = eth->miistatus;
             break;
         case ETHOC_MAC_ADDR0:
             tap_get_mac(eth->tap, eth->macaddr);
-            write_uint32_le_m(data, read_uint32_be_m(eth->macaddr + 2));
+            val = read_uint32_be_m(eth->macaddr + 2);
             break;
         case ETHOC_MAC_ADDR1:
             tap_get_mac(eth->tap, eth->macaddr);
-            write_uint32_le_m(data, read_uint16_be_m(eth->macaddr));
+            val = read_uint16_be_m(eth->macaddr);
             break;
         case ETHOC_ETH_HASH0_ADR:
-            write_uint32_le_m(data, eth->hash[0]);
+            val = eth->hash[0];
             break;
         case ETHOC_ETH_HASH1_ADR:
-            write_uint32_le_m(data, eth->hash[1]);
+            val = eth->hash[1];
             break;
         case ETHOC_TXCTRL:
-            write_uint32_le_m(data, eth->txctrl);
+            val = eth->txctrl;
             break;
         default:
             if (offset >= ETHOC_BD_ADDR && offset < ETHOC_BD_ADDR + ETHOC_BD_BUFSIZ) {
                 size_t bdid = (offset - ETHOC_BD_ADDR) >> 3;
-                struct ethoc_bd* bd = &eth->bdbuf[bdid];
+                ethoc_bd_t* bd = &eth->bdbuf[bdid];
                 if (offset & 4) {
-                    write_uint32_le_m(data, atomic_load_uint32(&bd->ptr));
+                    val = atomic_load_uint32_relax(&bd->ptr);
                 } else {
-                    write_uint32_le_m(data, atomic_load_uint32(&bd->data));
+                    val = atomic_load_uint32_relax(&bd->data);
                 }
-            } else {
-                write_uint32_le_m(data, 0);
             }
             break;
     }
-
     spin_unlock(&eth->lock);
+
+    write_uint32_le(data, val);
     return true;
 }
 
 static bool ethoc_data_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    struct ethoc_dev* eth = (struct ethoc_dev*)dev->data;
+    ethoc_dev_t* eth = dev->data;
+    uint32_t val = read_uint32_le(data);
     UNUSED(size);
 
     spin_lock(&eth->lock);
     switch (offset) {
         case ETHOC_MODER: {
-                uint32_t new_moder = read_uint32_le_m(data);
-                if (eth->tx_bd_num == 0) new_moder &= ~ETHOC_MODER_TXEN;
-                if (eth->tx_bd_num >= ETHOC_BD_COUNT) new_moder &= ~ETHOC_MODER_RXEN;
-                uint32_t prev_moder = atomic_swap_uint32(&eth->moder, new_moder);
-                if ((prev_moder ^ new_moder) & ETHOC_MODER_RXEN) {
+                if (eth->tx_bd_num == 0) {
+                    val &= ~ETHOC_MODER_TXEN;
+                }
+                if (eth->tx_bd_num >= ETHOC_BD_COUNT) {
+                    val &= ~ETHOC_MODER_RXEN;
+                }
+                uint32_t prev_moder = atomic_swap_uint32(&eth->moder, val);
+                if ((prev_moder ^ val) & ETHOC_MODER_RXEN) {
                     // Toggled RX
                     spin_lock(&eth->rx_lock);
                     eth->cur_rxbd = eth->tx_bd_num;
                     spin_unlock(&eth->rx_lock);
                 }
 
-                if ((prev_moder ^ new_moder) & ETHOC_MODER_TXEN) {
+                if ((prev_moder ^ val) & ETHOC_MODER_TXEN) {
                     // Toggled TX
                     eth->cur_txbd = 0;
                     ethoc_process_tx(eth);
@@ -370,37 +368,32 @@ static bool ethoc_data_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offse
             }
         case ETHOC_INT_SRC:
             // Bits are cleared by writing 1 to them
-            atomic_and_uint32(&eth->int_src, ~read_uint32_le_m(data));
+            atomic_and_uint32(&eth->int_src, ~val);
             break;
         case ETHOC_INT_MASK:
-            atomic_store_uint32(&eth->int_mask, read_uint32_le_m(data));
+            atomic_store_uint32_relax(&eth->int_mask, val);
 
-            if (atomic_load_uint32(&eth->int_src) & read_uint32_le_m(data)) {
-                plic_send_irq(eth->plic, eth->irq);
+            if (atomic_load_uint32_relax(&eth->int_src) & val) {
+                rvvm_send_irq(eth->intc, eth->irq);
             }
             break;
-        case ETHOC_IPGT:
-        case ETHOC_IPGR1:
-        case ETHOC_IPGR2:
-            // Ignore
-            break;
         case ETHOC_PACKETLEN:
-            atomic_store_uint32(&eth->packetlen, read_uint32_le_m(data));
+            atomic_store_uint32_relax(&eth->packetlen, val);
             break;
         case ETHOC_COLLCONF:
-            eth->collconf = read_uint32_le_m(data);
+            eth->collconf = val;
             break;
         case ETHOC_TX_BD_NUM:
-            eth->tx_bd_num = EVAL_MIN(read_uint32_le_m(data), ETHOC_BD_COUNT);
+            eth->tx_bd_num = EVAL_MIN(val, ETHOC_BD_COUNT);
             break;
         case ETHOC_CTRLMODER:
-            eth->ctrlmoder = read_uint32_le_m(data);
+            eth->ctrlmoder = val;
             break;
         case ETHOC_MIIMODER:
-            eth->miimoder = read_uint32_le_m(data);
+            eth->miimoder = val;
             break;
         case ETHOC_MIICOMMAND:
-            if (read_uint32_le_m(data) & ETHOC_MIICOMMAND_RSTAT) {
+            if (val & ETHOC_MIICOMMAND_RSTAT) {
                 if ((eth->miiaddress & 0x1f) == 0                     // PHY id 0
                 && ((eth->miiaddress >> 8) & 0x1f) == MII_REG_BMSR) { // Link is up
                     eth->miirx_data = (1 << 2);
@@ -410,43 +403,39 @@ static bool ethoc_data_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offse
             }
             break;
         case ETHOC_MIIADDRESS:
-            eth->miiaddress = read_uint32_le_m(data);
+            eth->miiaddress = val;
             break;
         case ETHOC_MIITX_DATA:
-            eth->miitx_data = read_uint32_le_m(data);
-            break;
-        case ETHOC_MIIRX_DATA:
-            // RO, but was RW in older spec
-            // eth->miirx_data = read_uint32_le_m(data);
+            eth->miitx_data = val;
             break;
         case ETHOC_MIISTATUS:
-            eth->miistatus = read_uint32_le_m(data);
+            eth->miistatus = val;
             break;
         case ETHOC_MAC_ADDR0:
-            write_uint32_be_m(eth->macaddr + 2, read_uint32_le_m(data));
+            write_uint32_be_m(eth->macaddr + 2, val);
             tap_set_mac(eth->tap, eth->macaddr);
             break;
         case ETHOC_MAC_ADDR1:
-            write_uint16_be_m(eth->macaddr, read_uint32_le_m(data));
+            write_uint16_be_m(eth->macaddr, val);
             tap_set_mac(eth->tap, eth->macaddr);
             break;
         case ETHOC_ETH_HASH0_ADR:
-            eth->hash[0] = read_uint32_le_m(data);
+            eth->hash[0] = val;
             break;
         case ETHOC_ETH_HASH1_ADR:
-            eth->hash[1] = read_uint32_le_m(data);
+            eth->hash[1] = val;
             break;
         case ETHOC_TXCTRL:
-            eth->txctrl = read_uint32_le_m(data);
+            eth->txctrl = val;
             break;
         default:
             if (offset >= ETHOC_BD_ADDR && offset < ETHOC_BD_ADDR + ETHOC_BD_BUFSIZ) {
                 size_t bdid = (offset - ETHOC_BD_ADDR) >> 3;
-                struct ethoc_bd* bd = &eth->bdbuf[bdid];
+                ethoc_bd_t* bd = &eth->bdbuf[bdid];
                 if (offset & 4) {
-                    atomic_store_uint32(&bd->ptr, read_uint32_le_m(data));
+                    atomic_store_uint32_relax(&bd->ptr, val);
                 } else {
-                    atomic_store_uint32(&bd->data, read_uint32_le_m(data));
+                    atomic_store_uint32_relax(&bd->data, val);
                 }
 
                 // TX BD might be modified
@@ -463,7 +452,7 @@ static bool ethoc_data_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offse
 
 static void ethoc_reset(rvvm_mmio_dev_t* dev)
 {
-    struct ethoc_dev* eth = dev->data;
+    ethoc_dev_t* eth = dev->data;
     spin_lock(&eth->lock);
     memset(&eth->bdbuf, 0, sizeof(eth->bdbuf));
     eth->moder = ETHOC_MODER_PAD | ETHOC_MODER_CRCEN;
@@ -485,9 +474,9 @@ static void ethoc_reset(rvvm_mmio_dev_t* dev)
     spin_unlock(&eth->lock);
 }
 
-static void ethoc_remove(rvvm_mmio_dev_t* device)
+static void ethoc_remove(rvvm_mmio_dev_t* dev)
 {
-    struct ethoc_dev *eth = (struct ethoc_dev *) device->data;
+    ethoc_dev_t* eth = dev->data;
     tap_close(eth->tap);
     free(eth);
 }
@@ -499,30 +488,30 @@ static rvvm_mmio_type_t ethoc_dev_type = {
 };
 
 PUBLIC rvvm_mmio_dev_t* ethoc_init(rvvm_machine_t* machine, tap_dev_t* tap,
-                                   rvvm_addr_t base_addr, plic_ctx_t* plic, uint32_t irq)
+                                   rvvm_addr_t base_addr, rvvm_intc_t* intc, rvvm_irq_t irq)
 {
-    struct ethoc_dev* eth = safe_new_obj(struct ethoc_dev);
+    ethoc_dev_t* eth = safe_new_obj(ethoc_dev_t);
     tap_net_dev_t nic = {
         .net_dev = eth,
         .feed_rx = ethoc_feed_rx,
     };
 
-    eth->plic = plic;
-    eth->irq = irq;
     eth->machine = machine;
+    eth->intc = intc;
+    eth->irq = irq;
 
     eth->tap = tap;
     tap_attach(tap, &nic);
 
     rvvm_mmio_dev_t ethoc_dev = {
-        .min_op_size = 4,
-        .max_op_size = 4,
-        .read = ethoc_data_mmio_read,
-        .write = ethoc_data_mmio_write,
-        .type = &ethoc_dev_type,
         .addr = base_addr,
         .size = 0x800,
         .data = eth,
+        .type = &ethoc_dev_type,
+        .read = ethoc_data_mmio_read,
+        .write = ethoc_data_mmio_write,
+        .min_op_size = 4,
+        .max_op_size = 4,
     };
     rvvm_mmio_dev_t* mmio = rvvm_attach_mmio(machine, &ethoc_dev);
     if (mmio == NULL) return mmio;
@@ -530,8 +519,7 @@ PUBLIC rvvm_mmio_dev_t* ethoc_init(rvvm_machine_t* machine, tap_dev_t* tap,
     struct fdt_node* ethoc = fdt_node_create_reg("ethernet", base_addr);
     fdt_node_add_prop_reg(ethoc, "reg", base_addr, 0x800);
     fdt_node_add_prop_str(ethoc, "compatible", "opencores,ethoc");
-    fdt_node_add_prop_u32(ethoc, "interrupt-parent", plic_get_phandle(plic));
-    fdt_node_add_prop_u32(ethoc, "interrupts", irq);
+    rvvm_fdt_describe_irq(ethoc, intc, irq);
     fdt_node_add_child(rvvm_get_fdt_soc(machine), ethoc);
 #endif
     return mmio;
@@ -544,9 +532,9 @@ PUBLIC rvvm_mmio_dev_t* ethoc_init_auto(rvvm_machine_t* machine)
         rvvm_error("Failed to create TAP device!");
         return NULL;
     }
-    plic_ctx_t* plic = rvvm_get_plic(machine);
-    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, ETHOC_DEFAULT_MMIO, 0x800);
-    return ethoc_init(machine, tap, addr, plic, plic_alloc_irq(plic));
+    rvvm_intc_t* intc = rvvm_get_intc(machine);
+    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, ETH_OC_ADDR_DEFAULT, 0x800);
+    return ethoc_init(machine, tap, addr, intc, rvvm_alloc_irq(intc));
 }
 
 #endif
