@@ -56,6 +56,9 @@ do { \
 // Dereference element at specific position
 #define vector_at(vec, pos) (vec).data[pos]
 
+// Get vector elements buffer
+#define vector_buffer(vec) (vec).data
+
 // Resize the vector, zeroing any newly alocated elements
 #define vector_resize(vec, size) \
 do { \
