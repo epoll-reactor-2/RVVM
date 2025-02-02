@@ -15,10 +15,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define GPIO_SIFIVE_PINS 32
 
-#define GPIO_SIFIVE_DEFAULT_MMIO 0x10060000
+#define GPIO_SIFIVE_ADDR_DEFAULT 0x10060000
 
 PUBLIC rvvm_mmio_dev_t* gpio_sifive_init(rvvm_machine_t* machine, rvvm_gpio_dev_t* gpio,
-                                         rvvm_addr_t base_addr, plic_ctx_t* plic, uint32_t* irqs);
+                                         rvvm_addr_t base_addr, rvvm_intc_t* intc, const rvvm_irq_t* irqs);
 
 PUBLIC rvvm_mmio_dev_t* gpio_sifive_init_auto(rvvm_machine_t* machine, rvvm_gpio_dev_t* gpio);
 
