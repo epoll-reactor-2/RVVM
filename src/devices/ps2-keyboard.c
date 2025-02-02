@@ -324,8 +324,6 @@ static void ps2_keyboard_update(chardev_t* dev)
 
 PUBLIC hid_keyboard_t* hid_keyboard_init_auto_ps2(rvvm_machine_t* machine)
 {
-    plic_ctx_t* plic = rvvm_get_plic(machine);
-    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, 0x20001000, ALTPS2_MMIO_SIZE);
     hid_keyboard_t* kb = safe_new_obj(hid_keyboard_t);
 
     kb->chardev.read = ps2_keyboard_read;
@@ -337,7 +335,7 @@ PUBLIC hid_keyboard_t* hid_keyboard_init_auto_ps2(rvvm_machine_t* machine)
     ringbuf_create(&kb->cmdbuf, 1024);
     ringbuf_put_u8(&kb->cmdbuf, 0xAA);
 
-    altps2_init(machine, addr, plic, plic_alloc_irq(plic), &kb->chardev);
+    ps2_altera_init_auto(machine, &kb->chardev);
     return kb;
 }
 
