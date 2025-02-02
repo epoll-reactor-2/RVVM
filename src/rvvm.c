@@ -503,7 +503,7 @@ PUBLIC void rvvm_append_cmdline(rvvm_machine_t* machine, const char* str)
 #ifdef USE_FDT
     struct fdt_node* chosen = fdt_node_find(machine->fdt, "chosen");
     char* cmdline = fdt_node_get_prop_data(chosen, "bootargs");
-    char* tmp = rvvm_merge_strings_internal(cmdline, " ");
+    char* tmp = cmdline ? rvvm_merge_strings_internal(cmdline, " ") : NULL;
     char* new = rvvm_merge_strings_internal(tmp, str);
     fdt_node_add_prop_str(chosen, "bootargs", new);
     free(tmp);
