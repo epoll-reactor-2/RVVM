@@ -277,6 +277,30 @@ static inline bool riscv_csr_ip(rvvm_hart_t* vm, rvvm_uxlen_t* dest, rvvm_uxlen_
     return true;
 }
 
+static inline bool riscv_csr_topi(rvvm_hart_t* vm, rvvm_uxlen_t* dest, rvvm_uxlen_t mask, uint8_t op)
+{
+    if (vm->aia) {
+        uint32_t pending = (riscv_interrupts_pending(vm) & mask);
+        uint32_t irq = pending ? (bit_clz32(pending) ^ 31) : 0;
+        *dest = (!!irq) | (irq << 16);
+        UNUSED(op);
+        return true;
+    }
+    return false;
+}
+
+static inline bool riscv_csr_topei(rvvm_hart_t* vm, uint8_t priv_mode, rvvm_uxlen_t* dest, uint8_t op)
+{
+    if (vm->aia) {
+        bool smode = priv_mode == RISCV_PRIV_SUPERVISOR;
+        bool claim = op == CSR_SWAP || *dest != 0;
+        uint32_t irq = riscv_get_aia_irq(vm, smode, claim);
+        *dest = irq | (irq << 16);
+        return true;
+    }
+    return false;
+}
+
 static void riscv_csr_stimecmp_set(rvvm_hart_t* vm, uint64_t stimecmp)
 {
     rvtimecmp_set(&vm->stimecmp, stimecmp);
@@ -454,6 +478,74 @@ static bool riscv_csr_fcsr(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint8_t op)
 
 #endif
 
+static inline bool riscv_csr_atomic_helper(uint32_t* val, rvvm_uxlen_t* dest, uint8_t op)
+{
+    switch (op) {
+        case CSR_SWAP:
+            *dest = atomic_swap_uint32(val, *dest);
+            return true;
+        case CSR_SETBITS:
+            *dest = atomic_or_uint32(val, *dest);
+            return true;
+        case CSR_CLEARBITS:
+            *dest = atomic_swap_uint32(val, ~(*dest));
+            return true;
+    }
+    return false;
+}
+
+static bool riscv_csr_aia_helper(rvvm_hart_t* vm, uint32_t reg, uint32_t* arr, rvvm_uxlen_t* dest, uint8_t op)
+{
+    if (vm->rv64 && (reg & 1)) {
+        // Only even eip/eie are accessible in 64 bit mode
+        return false;
+    }
+    if (reg < RVVM_AIA_ARR_LEN) {
+        rvvm_uxlen_t top = ((uint64_t)*dest) >> 32;
+        riscv_csr_atomic_helper(&arr[reg], dest, op);
+        if (vm->rv64 && reg + 1 < RVVM_AIA_ARR_LEN) {
+            riscv_csr_atomic_helper(&arr[reg + 1], &top, op);
+            *dest |= ((uint64_t)top) << 32;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool riscv_csr_indirect(rvvm_hart_t* vm, uint8_t priv_mode, uint32_t csri, rvvm_uxlen_t* dest, uint8_t op)
+{
+    bool smode = priv_mode == RISCV_PRIV_SUPERVISOR;
+    switch (csri) {
+        case CSRI_EIDELIVERY:
+            if (vm->aia) {
+                *dest &= 1;
+                return riscv_csr_atomic_helper(&vm->aia[smode].eidelivery, dest, op);
+            }
+            break;
+        case CSRI_EITHRESHOLD:
+            if (vm->aia) {
+                return riscv_csr_atomic_helper(&vm->aia[smode].eithreshold, dest, op);
+            }
+            break;
+        default:
+            if (vm->aia) {
+                if (csri >= CSRI_MIPRIO_0 && csri <= CSRI_MIPRIO_15) {
+                    // Ignore, all major priorities hardwired to zero
+                    return riscv_csr_zero(dest);
+                } else if (csri >= CSRI_EIP0 && csri <= CSRI_EIP63) {
+                    uint32_t reg = csri - CSRI_EIP0;
+                    return riscv_csr_aia_helper(vm, reg, vm->aia[smode].eip, dest, op);
+                } else if (csri >= CSRI_EIE0 && csri <= CSRI_EIE63) {
+                    uint32_t reg = csri - CSRI_EIE0;
+                    return riscv_csr_aia_helper(vm, reg, vm->aia[smode].eie, dest, op);
+                }
+            }
+            break;
+    }
+
+    return false;
+}
+
 static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, rvvm_uxlen_t* dest, uint8_t op)
 {
     switch (csr_id) {
@@ -490,6 +582,8 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
             return riscv_csr_status(vm, dest, CSR_SSTATUS_MASK, op);
         case CSR_SIE:
             return riscv_csr_ie(vm, dest, CSR_SEIP_MASK, op);
+        case CSR_SIEH:
+            return riscv_csr_zero_h(vm, dest);
         case CSR_STVEC:
             return riscv_csr_helper(vm, &vm->csr.tvec[RISCV_PRIV_SUPERVISOR], dest, op);
         case CSR_SCOUNTEREN:
@@ -498,6 +592,12 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
         // Supervisor Configuration
         case CSR_SENVCFG:
             return riscv_csr_helper_l(vm, &vm->csr.envcfg[RISCV_PRIV_SUPERVISOR], dest, CSR_SENVCFG_MASK, op);
+
+        // Supervisor Indirect CSR Access (Sscsrind)
+        case CSR_SISELECT:
+            return riscv_csr_helper(vm, &vm->csr.iselect[RISCV_PRIV_SUPERVISOR], dest, op);
+        case CSR_SIREG:
+            return riscv_csr_indirect(vm, RISCV_PRIV_SUPERVISOR, vm->csr.iselect[RISCV_PRIV_SUPERVISOR], dest, op);
 
         // Supervisor Trap Handling
         case CSR_SSCRATCH:
@@ -510,6 +610,12 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
             return riscv_csr_helper(vm, &vm->csr.tval[RISCV_PRIV_SUPERVISOR], dest, op);
         case CSR_SIP:
             return riscv_csr_ip(vm, dest, CSR_SEIP_MASK, op);
+        case CSR_SIPH:
+            return riscv_csr_zero_h(vm, dest);
+        case CSR_STOPEI:
+            return riscv_csr_topei(vm, RISCV_PRIV_SUPERVISOR, dest, op);
+        case CSR_STOPI:
+            return riscv_csr_topi(vm, dest, CSR_SEIP_MASK, op);
         case CSR_STIMECMP:
             return riscv_csr_stimecmp(vm, dest, op);
         case CSR_STIMECMPH:
@@ -540,12 +646,17 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
             return riscv_csr_helper_masked(vm, &vm->csr.edeleg[RISCV_PRIV_MACHINE], dest, CSR_MEDELEG_MASK, op);
         case CSR_MIDELEG:
             return riscv_csr_helper_masked(vm, &vm->csr.ideleg[RISCV_PRIV_MACHINE], dest, CSR_MIDELEG_MASK, op);
+        case CSR_MIDELEGH:
+            return riscv_csr_zero_h(vm, dest);
         case CSR_MIE:
             return riscv_csr_ie(vm, dest, CSR_MEIP_MASK, op);
+        case CSR_MIEH:
+            return riscv_csr_zero_h(vm, dest);
         case CSR_MTVEC:
             return riscv_csr_helper(vm, &vm->csr.tvec[RISCV_PRIV_MACHINE], dest, op);
         case CSR_MCOUNTEREN:
             return riscv_csr_helper_masked(vm, &vm->csr.counteren[RISCV_PRIV_MACHINE], dest, CSR_COUNTEREN_MASK, op);
+        // TODO: mvien, mvip
 
         // Machine Trap Handling
         case CSR_MSCRATCH:
@@ -558,6 +669,12 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
             return riscv_csr_helper(vm, &vm->csr.tval[RISCV_PRIV_MACHINE], dest, op);
         case CSR_MIP:
             return riscv_csr_ip(vm, dest, CSR_MEIP_MASK, op);
+        case CSR_MIPH:
+            return riscv_csr_zero_h(vm, dest);
+        case CSR_MTOPEI:
+            return riscv_csr_topei(vm, RISCV_PRIV_MACHINE, dest, op);
+        case CSR_MTOPI:
+            return riscv_csr_topi(vm, dest, CSR_MEIP_MASK, op);
 
         // Machine Configuration
         case CSR_MENVCFG:
@@ -662,6 +779,13 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
         // Machine Counter Setup
         case CSR_MCOUNTINHIBIT:
             return riscv_csr_zero(dest);
+
+        // Machine Indirect CSR Access (Sscsrind)
+        case CSR_MISELECT:
+            return riscv_csr_helper(vm, &vm->csr.iselect[RISCV_PRIV_MACHINE], dest, op);
+        case CSR_MIREG:
+            return riscv_csr_indirect(vm, RISCV_PRIV_MACHINE, vm->csr.iselect[RISCV_PRIV_MACHINE], dest, op);
+
     }
 
     return false;
