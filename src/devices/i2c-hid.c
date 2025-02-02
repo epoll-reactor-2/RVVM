@@ -7,19 +7,13 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#include "i2c-hid.h"
 #include "hid_api.h"
+#include "i2c-hid.h"
 #include "i2c-oc.h"
-#include "plic.h"
+#include "fdtlib.h"
 #include "spinlock.h"
 #include "utils.h"
 #include "bit_ops.h"
-
-#include <stdio.h>
-
-#ifdef USE_FDT
-#include "fdtlib.h"
-#endif
 
 #define I2C_HID_DESC_REG    1
 #define I2C_HID_REPORT_REG  2
@@ -66,8 +60,8 @@ typedef struct {
     spinlock_t  lock;
 
     // IRQ data
-    plic_ctx_t* plic;
-    uint32_t irq;
+    rvvm_intc_t* intc;
+    rvvm_irq_t irq;
 
     struct report_id_queue report_id_queue;
 
@@ -135,7 +129,7 @@ static void i2c_hid_reset(i2c_hid_t* i2c_hid, bool is_init)
     if (i2c_hid->hid_dev->reset) i2c_hid->hid_dev->reset(i2c_hid->hid_dev->dev);
 
     if (!is_init)
-        plic_raise_irq(i2c_hid->plic, i2c_hid->irq);
+        rvvm_raise_irq(i2c_hid->intc, i2c_hid->irq);
 }
 
 static void i2c_hid_input_available(void* host, uint8_t report_id)
@@ -144,7 +138,7 @@ static void i2c_hid_input_available(void* host, uint8_t report_id)
     spin_lock(&i2c_hid->lock);
     if (!i2c_hid->is_reset) {
         report_id_queue_insert(&i2c_hid->report_id_queue, report_id);
-        plic_raise_irq(i2c_hid->plic, i2c_hid->irq);
+        rvvm_raise_irq(i2c_hid->intc, i2c_hid->irq);
     }
     spin_unlock(&i2c_hid->lock);
 }
@@ -166,9 +160,9 @@ static void i2c_hid_read_report(i2c_hid_t* i2c_hid, uint8_t report_type, uint8_t
     if (report_type == REPORT_TYPE_INPUT && offset >= 1 && offset == (uint32_t)(i2c_hid->data_size > 2 ? i2c_hid->data_size - 1 : 1)) {
         report_id_queue_remove_at(&i2c_hid->report_id_queue, report_id);
         if (report_id_queue_get(&i2c_hid->report_id_queue) >= 0)
-            plic_raise_irq(i2c_hid->plic, i2c_hid->irq);
+            rvvm_raise_irq(i2c_hid->intc, i2c_hid->irq);
         else
-            plic_lower_irq(i2c_hid->plic, i2c_hid->irq);
+            rvvm_lower_irq(i2c_hid->intc, i2c_hid->irq);
     }
 }
 
@@ -210,7 +204,7 @@ static uint8_t i2c_hid_read_reg(i2c_hid_t* i2c_hid, uint16_t reg, uint32_t offse
     case I2C_HID_INPUT_REG: {
         int16_t report_id = report_id_queue_get(&i2c_hid->report_id_queue);
         if (report_id < 0) {
-            plic_lower_irq(i2c_hid->plic, i2c_hid->irq);
+            rvvm_lower_irq(i2c_hid->intc, i2c_hid->irq);
             return 0;
         }
         uint8_t val = 0;
@@ -370,12 +364,11 @@ static void i2c_hid_remove(void* dev)
     free(i2c_hid);
 }
 
-static void i2c_hid_init(rvvm_machine_t* machine, i2c_bus_t* bus, uint16_t addr, plic_ctx_t* plic, uint32_t irq, hid_dev_t* hid_dev)
+static void i2c_hid_init(rvvm_machine_t* machine, i2c_bus_t* bus, uint16_t addr,
+                         rvvm_intc_t* intc, rvvm_irq_t irq, hid_dev_t* hid_dev)
 {
     UNUSED(machine);
     i2c_hid_t* i2c_hid = safe_new_obj(i2c_hid_t);
-
-    spin_init(&i2c_hid->lock);
 
     i2c_dev_t i2c_dev = {
         .addr = addr,
@@ -386,9 +379,9 @@ static void i2c_hid_init(rvvm_machine_t* machine, i2c_bus_t* bus, uint16_t addr,
         .stop = i2c_hid_stop,
         .remove = i2c_hid_remove
     };
-    addr = i2c_attach_dev(bus, &i2c_dev);
+    i2c_dev.addr = i2c_attach_dev(bus, &i2c_dev);
 
-    i2c_hid->plic = plic;
+    i2c_hid->intc = intc;
     i2c_hid->irq = irq;
 
     i2c_hid->hid_dev = hid_dev;
@@ -398,12 +391,11 @@ static void i2c_hid_init(rvvm_machine_t* machine, i2c_bus_t* bus, uint16_t addr,
     i2c_hid_reset(i2c_hid, true);
 
 #ifdef USE_FDT
-    struct fdt_node* i2c_fdt = fdt_node_create_reg("i2c", addr);
+    struct fdt_node* i2c_fdt = fdt_node_create_reg("i2c", i2c_dev.addr);
+    fdt_node_add_prop_u32(i2c_fdt, "reg", i2c_dev.addr);
     fdt_node_add_prop_str(i2c_fdt, "compatible", "hid-over-i2c");
-    fdt_node_add_prop_u32(i2c_fdt, "reg", addr);
     fdt_node_add_prop_u32(i2c_fdt, "hid-descr-addr", I2C_HID_DESC_REG);
-    fdt_node_add_prop_u32(i2c_fdt, "interrupt-parent", plic_get_phandle(plic));
-    fdt_node_add_prop_u32(i2c_fdt, "interrupts", irq);
+    rvvm_fdt_describe_irq(i2c_fdt, intc, irq);
     fdt_node_add_child(i2c_bus_fdt_node(bus), i2c_fdt);
 #endif
 }
@@ -411,6 +403,6 @@ static void i2c_hid_init(rvvm_machine_t* machine, i2c_bus_t* bus, uint16_t addr,
 PUBLIC void i2c_hid_init_auto(rvvm_machine_t* machine, hid_dev_t* hid_dev)
 {
     i2c_bus_t* bus = rvvm_get_i2c_bus(machine);
-    plic_ctx_t* plic = rvvm_get_plic(machine);
-    i2c_hid_init(machine, bus, I2C_AUTO_ADDR, plic, plic_alloc_irq(plic), hid_dev);
+    rvvm_intc_t* intc = rvvm_get_intc(machine);
+    i2c_hid_init(machine, bus, I2C_AUTO_ADDR, intc, rvvm_alloc_irq(intc), hid_dev);
 }
