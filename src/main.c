@@ -27,19 +27,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "dlib.h"
 #include "gdbstub.h"
 
-#include "devices/clint.h"
-#include "devices/plic.h"
-#include "devices/ns16550a.h"
-#include "devices/gui_window.h"
+#include "devices/riscv-imsic.h"
+#include "devices/riscv-aplic.h"
+#include "devices/riscv-aclint.h"
+#include "devices/riscv-plic.h"
 #include "devices/syscon.h"
 #include "devices/rtc-goldfish.h"
+#include "devices/ns16550a.h"
+#include "devices/gui_window.h"
 #include "devices/pci-bus.h"
 #include "devices/pci-vfio.h"
 #include "devices/nvme.h"
 #include "devices/ata.h"
-#include "devices/eth-oc.h"
 #include "devices/rtl8169.h"
 #include "devices/i2c-oc.h"
+#include "devices/usb-xhci.h"
 
 #include <stdio.h>
 #include <inttypes.h>
@@ -212,11 +214,22 @@ static int rvvm_cli_main(int argc, char** argv)
         return -1;
     }
 
-    // Initialize basic peripherals (Interrupt controller, PCI bus, clocks, power management)
-    clint_init_auto(machine);
-    plic_init_auto(machine);
+    // Initialize basic peripherals (Interrupt controllers, PCI bus, clocks, power management)
+    riscv_clint_init_auto(machine);
+
+    if (rvvm_has_arg("riscv_aia")) {
+        // Use RISC-V Advanced Interrupt Architecture (IMSIC + APLIC)
+        riscv_imsic_init_auto(machine);
+        riscv_aplic_init_auto(machine);
+    } else {
+        // Use SiFive PLIC
+        riscv_plic_init_auto(machine);
+    }
+
     pci_bus_init_auto(machine);
     i2c_oc_init_auto(machine);
+
+    //usb_xhci_init(rvvm_get_pci_bus(machine));
 
     rtc_goldfish_init_auto(machine);
     syscon_init_auto(machine);
