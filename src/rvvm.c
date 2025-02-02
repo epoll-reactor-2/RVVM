@@ -28,6 +28,33 @@ static spinlock_t eventloop_lock = SPINLOCK_INIT;
 static cond_var_t* eventloop_cond = NULL;
 static thread_ctx_t* eventloop_thread = NULL;
 
+static inline char* rvvm_merge_strings_internal(const char* str1, const char* str2)
+{
+    size_t str1_len = str1 ? rvvm_strlen(str1) : 0;
+    size_t str2_len = str2 ? rvvm_strlen(str2) : 0;
+    char* ret = safe_new_arr(char, str1_len + str2_len + 1);
+    memcpy(ret, str1, str1_len);
+    memcpy(ret + str1_len, str2, str2_len);
+    return ret;
+}
+
+void rvvm_append_isa_string(rvvm_machine_t* machine, const char* str)
+{
+#ifdef USE_FDT
+    vector_foreach(machine->harts, i) {
+        struct fdt_node* cpus = fdt_node_find(rvvm_get_fdt_root(machine), "cpus");
+        struct fdt_node* cpu = fdt_node_find_reg(cpus, "cpu", i);
+        char* isa = fdt_node_get_prop_data(cpu, "riscv,isa");
+        char* new = rvvm_merge_strings_internal(isa, str);
+        fdt_node_add_prop_str(cpu, "riscv,isa", new);
+        free(new);
+    }
+#else
+    UNUSED(machine);
+    UNUSED(str);
+#endif
+}
+
 #ifdef USE_FDT
 
 static void rvvm_init_fdt(rvvm_machine_t* machine)
@@ -38,27 +65,29 @@ static void rvvm_init_fdt(rvvm_machine_t* machine)
     fdt_node_add_prop_str(machine->fdt, "model", "RVVM v"RVVM_VERSION);
     fdt_node_add_prop(machine->fdt, "compatible", "lekkit,rvvm\0riscv-virtio\0", 25);
 
+    // FDT /chosen node
     struct fdt_node* chosen = fdt_node_create("chosen");
     uint8_t rng_buffer[64] = {0};
     rvvm_randombytes(rng_buffer, sizeof(rng_buffer));
     fdt_node_add_prop(chosen, "rng-seed", rng_buffer, sizeof(rng_buffer));
     fdt_node_add_child(machine->fdt, chosen);
 
+    // FDT /memory node
     struct fdt_node* memory = fdt_node_create_reg("memory", machine->mem.addr);
     fdt_node_add_prop_str(memory, "device_type", "memory");
     fdt_node_add_prop_reg(memory, "reg", machine->mem.addr, machine->mem.size);
     fdt_node_add_child(machine->fdt, memory);
 
+    // FDT /cpus node
     struct fdt_node* cpus = fdt_node_create("cpus");
     fdt_node_add_prop_u32(cpus, "#address-cells", 1);
     fdt_node_add_prop_u32(cpus, "#size-cells", 0);
     fdt_node_add_prop_u32(cpus, "timebase-frequency", rvvm_get_opt(machine, RVVM_OPT_TIME_FREQ));
+    fdt_node_add_child(machine->fdt, cpus);
 
     struct fdt_node* cpu_map = fdt_node_create("cpu-map");
     struct fdt_node* cluster = fdt_node_create("cluster0");
-
-    // Attach all the nodes to the root node before getting phandles
-    fdt_node_add_child(machine->fdt, cpus);
+    fdt_node_add_child(cpu_map, cluster);
 
     vector_foreach(machine->harts, i) {
         struct fdt_node* cpu = fdt_node_create_reg("cpu", i);
@@ -69,7 +98,6 @@ static void rvvm_init_fdt(rvvm_machine_t* machine)
         fdt_node_add_prop_u32(cpu, "clock-frequency", 3000000000);
         fdt_node_add_prop_u32(cpu, "riscv,cboz-block-size", 64);
         fdt_node_add_prop_u32(cpu, "riscv,cbom-block-size", 64);
-#ifdef USE_RV64
         if (vector_at(machine->harts, i)->rv64) {
 #ifdef USE_FPU
             fdt_node_add_prop_str(cpu, "riscv,isa", "rv64imafdcb_zicsr_zifencei_zkr_zicboz_zicbom_svadu_sstc");
@@ -78,16 +106,13 @@ static void rvvm_init_fdt(rvvm_machine_t* machine)
 #endif
             fdt_node_add_prop_str(cpu, "mmu-type", "riscv,sv39");
         } else {
-#endif
 #ifdef USE_FPU
             fdt_node_add_prop_str(cpu, "riscv,isa", "rv32imafdcb_zicsr_zifencei_zkr_zicboz_zicbom_svadu_sstc");
 #else
             fdt_node_add_prop_str(cpu, "riscv,isa", "rv32imacb_zicsr_zifencei_zkr_zicboz_zicbom_svadu_sstc");
 #endif
             fdt_node_add_prop_str(cpu, "mmu-type", "riscv,sv32");
-#ifdef USE_RV64
         }
-#endif
 
         fdt_node_add_prop_str(cpu, "status", "okay");
 
@@ -106,15 +131,14 @@ static void rvvm_init_fdt(rvvm_machine_t* machine)
         fdt_node_add_child(cluster, core);
     }
 
-    fdt_node_add_child(cpu_map, cluster);
     fdt_node_add_child(cpus, cpu_map);
 
+    // FDT /soc node
     struct fdt_node* soc = fdt_node_create("soc");
     fdt_node_add_prop_u32(soc, "#address-cells", 2);
     fdt_node_add_prop_u32(soc, "#size-cells", 2);
     fdt_node_add_prop_str(soc, "compatible", "simple-bus");
     fdt_node_add_prop(soc, "ranges", NULL, 0);
-
     fdt_node_add_child(machine->fdt, soc);
     machine->fdt_soc = soc;
 }
@@ -345,6 +369,42 @@ static void rvvm_reconfigure_eventloop(void)
 #endif
 }
 
+static void rvvm_set_manual_eventloop(bool manual)
+{
+    spin_lock(&global_lock);
+    global_manual = manual;
+    spin_unlock(&global_lock);
+    rvvm_reconfigure_eventloop();
+}
+
+static bool rvvm_reopen_check_size(rvfile_t** dest, const char* path, size_t size)
+{
+    rvclose(*dest);
+    if (path) {
+        *dest = rvopen(path, 0);
+        if (*dest == NULL) {
+            rvvm_error("Could not open file %s", path);
+            return false;
+        }
+        if (rvfilesize(*dest) > size) {
+            rvvm_error("File %s doesn't fit in RAM", path);
+            rvclose(*dest);
+            *dest = NULL;
+            return false;
+        }
+    } else {
+        *dest = NULL;
+    }
+    return true;
+}
+
+static void rvvm_mmio_free(rvvm_mmio_dev_t* dev)
+{
+    rvvm_info("Removing MMIO device \"%s\"", dev->type ? dev->type->name : "null");
+    rvvm_cleanup_mmio_desc(dev);
+    free(dev);
+}
+
 PUBLIC bool rvvm_check_abi(int abi)
 {
     if (RVVM_ABI_VERSION < 0) {
@@ -354,13 +414,9 @@ PUBLIC bool rvvm_check_abi(int abi)
     return abi == RVVM_ABI_VERSION;
 }
 
-PUBLIC bool rvvm_mmio_none(rvvm_mmio_dev_t* dev, void* dest, size_t offset, uint8_t size)
-{
-    UNUSED(dev);
-    UNUSED(offset);
-    memset(dest, 0, size);
-    return true;
-}
+/*
+ * RVVM Machine Management
+ */
 
 PUBLIC rvvm_machine_t* rvvm_create_machine(size_t mem_size, size_t hart_count, const char* isa)
 {
@@ -431,100 +487,11 @@ PUBLIC rvvm_machine_t* rvvm_create_machine(size_t mem_size, size_t hart_count, c
     return machine;
 }
 
-PUBLIC bool rvvm_write_ram(rvvm_machine_t* machine, rvvm_addr_t dest, const void* src, size_t size)
-{
-    if (dest < machine->mem.addr
-    || (dest - machine->mem.addr + size) > machine->mem.size) return false;
-    memcpy(((uint8_t*)machine->mem.data) + (dest - machine->mem.addr), src, size);
-    riscv_jit_mark_dirty_mem(machine, dest, size);
-    return true;
-}
-
-PUBLIC bool rvvm_read_ram(rvvm_machine_t* machine, void* dest, rvvm_addr_t src, size_t size)
-{
-    if (src < machine->mem.addr
-    || (src - machine->mem.addr + size) > machine->mem.size) return false;
-    memcpy(dest, ((uint8_t*)machine->mem.data) + (src - machine->mem.addr), size);
-    return true;
-}
-
-PUBLIC void* rvvm_get_dma_ptr(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
-{
-    if (addr < machine->mem.addr
-    || (addr - machine->mem.addr + size) > machine->mem.size) return NULL;
-    riscv_jit_mark_dirty_mem(machine, addr, size);
-    return ((uint8_t*)machine->mem.data) + (addr - machine->mem.addr);
-}
-
-PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
-{
-    // WIP, issue a total cache flush on all harts
-    // Needs improvements in RVJIT
-    UNUSED(addr);
-    UNUSED(size);
-    spin_lock(&global_lock);
-    vector_foreach(machine->harts, i) {
-        riscv_jit_flush_cache(vector_at(machine->harts, i));
-    }
-    spin_unlock(&global_lock);
-}
-
-PUBLIC plic_ctx_t* rvvm_get_plic(rvvm_machine_t* machine)
-{
-    return machine->plic;
-}
-
-PUBLIC void rvvm_set_plic(rvvm_machine_t* machine, plic_ctx_t* plic)
-{
-    if (plic) machine->plic = plic;
-}
-
-PUBLIC pci_bus_t* rvvm_get_pci_bus(rvvm_machine_t* machine)
-{
-    return machine->pci_bus;
-}
-
-PUBLIC void rvvm_set_pci_bus(rvvm_machine_t* machine, pci_bus_t* pci_bus)
-{
-    if (pci_bus) machine->pci_bus = pci_bus;
-}
-
-PUBLIC i2c_bus_t* rvvm_get_i2c_bus(rvvm_machine_t* machine)
-{
-    return machine->i2c_bus;
-}
-
-PUBLIC void rvvm_set_i2c_bus(rvvm_machine_t* machine, i2c_bus_t* i2c_bus)
-{
-    if (i2c_bus) machine->i2c_bus = i2c_bus;
-}
-
-PUBLIC struct fdt_node* rvvm_get_fdt_root(rvvm_machine_t* machine)
-{
-#ifdef USE_FDT
-    return machine->fdt;
-#else
-    UNUSED(machine);
-    return NULL;
-#endif
-}
-
-PUBLIC struct fdt_node* rvvm_get_fdt_soc(rvvm_machine_t* machine)
-{
-#ifdef USE_FDT
-    return machine->fdt_soc;
-#else
-    UNUSED(machine);
-    return NULL;
-#endif
-}
-
 PUBLIC void rvvm_set_cmdline(rvvm_machine_t* machine, const char* str)
 {
 #ifdef USE_FDT
-    free(machine->cmdline);
-    machine->cmdline = NULL;
-    rvvm_append_cmdline(machine, str);
+    struct fdt_node* chosen = fdt_node_find(machine->fdt, "chosen");
+    fdt_node_add_prop_str(chosen, "bootargs", str);
 #else
     UNUSED(machine);
     UNUSED(str);
@@ -534,22 +501,55 @@ PUBLIC void rvvm_set_cmdline(rvvm_machine_t* machine, const char* str)
 PUBLIC void rvvm_append_cmdline(rvvm_machine_t* machine, const char* str)
 {
 #ifdef USE_FDT
-    size_t cmd_len = machine->cmdline ? rvvm_strlen(machine->cmdline) : 0;
-    size_t append_len = rvvm_strlen(str);
-    char* tmp = safe_new_arr(char, cmd_len + append_len + (cmd_len ? 2 : 1));
-    if (cmd_len) {
-        memcpy(tmp, machine->cmdline, cmd_len);
-        tmp[cmd_len++] = ' ';
-    }
-    memcpy(tmp + cmd_len, str, append_len);
-    free(machine->cmdline);
-    machine->cmdline = tmp;
     struct fdt_node* chosen = fdt_node_find(machine->fdt, "chosen");
-    fdt_node_add_prop_str(chosen, "bootargs", machine->cmdline);
+    char* cmdline = fdt_node_get_prop_data(chosen, "bootargs");
+    char* tmp = rvvm_merge_strings_internal(cmdline, " ");
+    char* new = rvvm_merge_strings_internal(tmp, str);
+    fdt_node_add_prop_str(chosen, "bootargs", new);
+    free(tmp);
+    free(new);
 #else
     UNUSED(machine);
     UNUSED(str);
 #endif
+}
+
+PUBLIC bool rvvm_load_bootrom(rvvm_machine_t* machine, const char* path)
+{
+    return rvvm_reopen_check_size(&machine->bootrom_file, path, machine->mem.size);
+}
+
+PUBLIC bool rvvm_load_kernel(rvvm_machine_t* machine, const char* path)
+{
+    size_t kernel_offset = machine->rv64 ? 0x200000 : 0x400000;
+    size_t kernel_size = machine->mem.size > kernel_offset ? machine->mem.size - kernel_offset : 0;
+    return rvvm_reopen_check_size(&machine->kernel_file, path, kernel_size);
+}
+
+PUBLIC bool rvvm_load_dtb(rvvm_machine_t* machine, const char* path)
+{
+    return rvvm_reopen_check_size(&machine->dtb_file, path, machine->mem.size >> 1);
+}
+
+PUBLIC bool rvvm_dump_dtb(rvvm_machine_t* machine, const char* path)
+{
+#ifdef USE_FDT
+    rvfile_t* file = rvopen(path, RVFILE_RW | RVFILE_CREAT | RVFILE_TRUNC);
+    if (file) {
+        size_t size = fdt_size(rvvm_get_fdt_root(machine));
+        void* buffer = safe_calloc(size, 1);
+        size = fdt_serialize(rvvm_get_fdt_root(machine), buffer, size, 0);
+        rvwrite(file, buffer, size, 0);
+        rvclose(file);
+        free(buffer);
+        return true;
+    }
+#else
+    UNUSED(machine);
+    UNUSED(path);
+    rvvm_error("This build doesn't support FDT generation");
+#endif
+    return false;
 }
 
 PUBLIC rvvm_addr_t rvvm_get_opt(rvvm_machine_t* machine, uint32_t opt)
@@ -576,65 +576,6 @@ PUBLIC bool rvvm_set_opt(rvvm_machine_t* machine, uint32_t opt, rvvm_addr_t val)
             machine->mem.addr = val;
             return true;
     }
-    return false;
-}
-
-static bool file_reopen_check_size(rvfile_t** dest, const char* path, size_t size)
-{
-    rvclose(*dest);
-    if (path) {
-        *dest = rvopen(path, 0);
-        if (*dest == NULL) {
-            rvvm_error("Could not open file %s", path);
-            return false;
-        }
-        if (rvfilesize(*dest) > size) {
-            rvvm_error("File %s doesn't fit in RAM", path);
-            rvclose(*dest);
-            *dest = NULL;
-            return false;
-        }
-    } else {
-        *dest = NULL;
-    }
-    return true;
-}
-
-PUBLIC bool rvvm_load_bootrom(rvvm_machine_t* machine, const char* path)
-{
-    return file_reopen_check_size(&machine->bootrom_file, path, machine->mem.size);
-}
-
-PUBLIC bool rvvm_load_kernel(rvvm_machine_t* machine, const char* path)
-{
-    size_t kernel_offset = machine->rv64 ? 0x200000 : 0x400000;
-    size_t kernel_size = machine->mem.size > kernel_offset ? machine->mem.size - kernel_offset : 0;
-    return file_reopen_check_size(&machine->kernel_file, path, kernel_size);
-}
-
-PUBLIC bool rvvm_load_dtb(rvvm_machine_t* machine, const char* path)
-{
-    return file_reopen_check_size(&machine->dtb_file, path, machine->mem.size >> 1);
-}
-
-PUBLIC bool rvvm_dump_dtb(rvvm_machine_t* machine, const char* path)
-{
-#ifdef USE_FDT
-    rvfile_t* file = rvopen(path, RVFILE_RW | RVFILE_CREAT | RVFILE_TRUNC);
-    if (file) {
-        size_t size = fdt_size(rvvm_get_fdt_root(machine));
-        void* buffer = safe_calloc(size, 1);
-        size = fdt_serialize(rvvm_get_fdt_root(machine), buffer, size, 0);
-        rvwrite(file, buffer, size, 0);
-        rvclose(file);
-        free(buffer);
-        return true;
-    }
-#else
-    UNUSED(machine);
-    UNUSED(path);
-    rvvm_error("This build doesn't support FDT generation");
-#endif
     return false;
 }
 
@@ -701,21 +642,14 @@ PUBLIC void rvvm_reset_machine(rvvm_machine_t* machine, bool reset)
     condvar_wake(eventloop_cond);
 }
 
-PUBLIC bool rvvm_machine_powered(rvvm_machine_t* machine)
-{
-    return atomic_load_uint32(&machine->power_state) != RVVM_POWER_OFF;
-}
-
 PUBLIC bool rvvm_machine_running(rvvm_machine_t* machine)
 {
     return atomic_load_uint32(&machine->running);
 }
 
-static void rvvm_mmio_free(rvvm_mmio_dev_t* dev)
+PUBLIC bool rvvm_machine_powered(rvvm_machine_t* machine)
 {
-    rvvm_info("Removing MMIO device \"%s\"", dev->type ? dev->type->name : "null");
-    rvvm_cleanup_mmio_desc(dev);
-    free(dev);
+    return atomic_load_uint32(&machine->power_state) != RVVM_POWER_OFF;
 }
 
 PUBLIC void rvvm_free_machine(rvvm_machine_t* machine)
@@ -730,21 +664,66 @@ PUBLIC void rvvm_free_machine(rvvm_machine_t* machine)
         rvvm_mmio_free(vector_at(machine->mmio_devs, i));
     }
 
-    vector_foreach(machine->harts, i) {
+    vector_foreach_back(machine->harts, i) {
         riscv_hart_free(vector_at(machine->harts, i));
     }
 
     vector_free(machine->harts);
     vector_free(machine->mmio_devs);
+    vector_free(machine->msi_targets);
+
     riscv_free_ram(&machine->mem);
     rvclose(machine->bootrom_file);
     rvclose(machine->kernel_file);
     rvclose(machine->dtb_file);
 #ifdef USE_FDT
     fdt_node_free(machine->fdt);
-    free(machine->cmdline);
 #endif
     free(machine);
+}
+
+PUBLIC void rvvm_run_eventloop(void)
+{
+    rvvm_set_manual_eventloop(true);
+    rvvm_eventloop((void*)(size_t)1);
+    rvvm_set_manual_eventloop(false);
+}
+
+/*
+ * RVVM Device API
+ */
+
+PUBLIC bool rvvm_mmio_none(rvvm_mmio_dev_t* dev, void* dest, size_t offset, uint8_t size)
+{
+    UNUSED(dev);
+    UNUSED(offset);
+    memset(dest, 0, size);
+    return true;
+}
+
+PUBLIC bool rvvm_write_ram(rvvm_machine_t* machine, rvvm_addr_t dest, const void* src, size_t size)
+{
+    if (dest < machine->mem.addr
+    || (dest - machine->mem.addr + size) > machine->mem.size) return false;
+    memcpy(((uint8_t*)machine->mem.data) + (dest - machine->mem.addr), src, size);
+    riscv_jit_mark_dirty_mem(machine, dest, size);
+    return true;
+}
+
+PUBLIC bool rvvm_read_ram(rvvm_machine_t* machine, void* dest, rvvm_addr_t src, size_t size)
+{
+    if (src < machine->mem.addr
+    || (src - machine->mem.addr + size) > machine->mem.size) return false;
+    memcpy(dest, ((uint8_t*)machine->mem.data) + (src - machine->mem.addr), size);
+    return true;
+}
+
+PUBLIC void* rvvm_get_dma_ptr(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
+{
+    if (addr < machine->mem.addr
+    || (addr - machine->mem.addr + size) > machine->mem.size) return NULL;
+    riscv_jit_mark_dirty_mem(machine, addr, size);
+    return ((uint8_t*)machine->mem.data) + (addr - machine->mem.addr);
 }
 
 static inline bool rvvm_mmio_overlap_check(rvvm_addr_t addr1, size_t size1, rvvm_addr_t addr2, size_t size2)
@@ -853,24 +832,167 @@ PUBLIC void rvvm_cleanup_mmio_desc(const rvvm_mmio_dev_t* mmio_desc)
     }
 }
 
-static void rvvm_set_manual_eventloop(bool manual)
+PUBLIC rvvm_intc_t* rvvm_get_intc(rvvm_machine_t* machine)
 {
-    spin_lock(&global_lock);
-    global_manual = manual;
-    spin_unlock(&global_lock);
-    rvvm_reconfigure_eventloop();
+    return machine->intc;
 }
 
-PUBLIC void rvvm_run_eventloop(void)
+PUBLIC void rvvm_set_intc(rvvm_machine_t* machine, rvvm_intc_t* intc)
 {
-    rvvm_set_manual_eventloop(true);
-    rvvm_eventloop((void*)(size_t)1);
-    rvvm_set_manual_eventloop(false);
+    if (intc) machine->intc = intc;
 }
 
-//
-// Userland emulation API (WIP)
-//
+PUBLIC pci_bus_t* rvvm_get_pci_bus(rvvm_machine_t* machine)
+{
+    return machine->pci_bus;
+}
+
+PUBLIC void rvvm_set_pci_bus(rvvm_machine_t* machine, pci_bus_t* pci_bus)
+{
+    if (pci_bus) machine->pci_bus = pci_bus;
+}
+
+PUBLIC i2c_bus_t* rvvm_get_i2c_bus(rvvm_machine_t* machine)
+{
+    return machine->i2c_bus;
+}
+
+PUBLIC void rvvm_set_i2c_bus(rvvm_machine_t* machine, i2c_bus_t* i2c_bus)
+{
+    if (i2c_bus) machine->i2c_bus = i2c_bus;
+}
+
+PUBLIC struct fdt_node* rvvm_get_fdt_root(rvvm_machine_t* machine)
+{
+#ifdef USE_FDT
+    return machine->fdt;
+#else
+    UNUSED(machine);
+    return NULL;
+#endif
+}
+
+PUBLIC struct fdt_node* rvvm_get_fdt_soc(rvvm_machine_t* machine)
+{
+#ifdef USE_FDT
+    return machine->fdt_soc;
+#else
+    UNUSED(machine);
+    return NULL;
+#endif
+}
+
+/*
+ * RVVM Interrupt API
+ */
+
+PUBLIC bool rvvm_send_msi_irq(rvvm_machine_t* machine, rvvm_addr_t addr, uint32_t val)
+{
+    if (machine) {
+        uint32_t le = 0;
+        write_uint32_le(&le, val);
+        // Address must be aligned
+        if (likely(!(addr & 3))) {
+            vector_foreach(machine->msi_targets, i) {
+                rvvm_mmio_dev_t* mmio = vector_at(machine->msi_targets, i);
+                if (mmio->addr <= addr && addr < (mmio->addr + mmio->size)) {
+                    return mmio->write(mmio, &le, addr - mmio->addr, sizeof(le));
+                }
+            }
+        }
+        rvvm_debug("Failed to send MSI IRQ %x to %"PRIx64, val, addr);
+    }
+    return false;
+}
+
+PUBLIC bool rvvm_attach_msi_target(rvvm_machine_t* machine, const rvvm_mmio_dev_t* mmio_desc)
+{
+    rvvm_mmio_dev_t* mmio = rvvm_attach_mmio(machine, mmio_desc);
+    if (mmio) {
+        if (mmio->min_op_size <= 4 && mmio->max_op_size >= 4) {
+            vector_push_back(machine->msi_targets, mmio);
+            return true;
+        }
+        rvvm_warn("MSI target %s has invalid op sizes!", mmio->type ? mmio->type->name : NULL);
+    }
+    return false;
+}
+
+PUBLIC rvvm_irq_t rvvm_alloc_irq(rvvm_intc_t* intc)
+{
+    if (intc) {
+        if (intc->alloc_irq) {
+            return intc->alloc_irq(intc);
+        }
+        return atomic_add_uint32(&intc->last_irq, 1) + 1;
+    }
+    return 0;
+}
+
+PUBLIC bool rvvm_send_irq(rvvm_intc_t* intc, rvvm_irq_t irq)
+{
+    if (likely(intc)) {
+        return intc->send_irq(intc, irq);
+    }
+    return false;
+}
+
+PUBLIC bool rvvm_raise_irq(rvvm_intc_t* intc, rvvm_irq_t irq)
+{
+    if (likely(intc)) {
+        if (likely(intc->raise_irq)) {
+            return intc->raise_irq(intc, irq);
+        }
+    }
+    return rvvm_send_irq(intc, irq);
+}
+
+PUBLIC bool rvvm_lower_irq(rvvm_intc_t* intc, rvvm_irq_t irq)
+{
+
+    if (likely(intc && intc->lower_irq)) {
+        return intc->lower_irq(intc, irq);
+    }
+    return false;
+}
+
+PUBLIC bool rvvm_fdt_describe_irq(struct fdt_node* node, rvvm_intc_t* intc, rvvm_irq_t irq)
+{
+#ifdef USE_FDT
+    if (intc) {
+        uint32_t cells[8] = {0};
+        size_t count = rvvm_fdt_irq_cells(intc, irq, cells, STATIC_ARRAY_SIZE(cells));
+        fdt_node_add_prop_u32(node, "interrupt-parent", rvvm_fdt_intc_phandle(intc));
+        fdt_node_add_prop_cells(node, "interrupts", cells, count);
+        return true;
+    }
+#else
+    UNUSED(node); UNUSED(intc); UNUSED(irq);
+#endif
+    return false;
+}
+
+//! \brief Get interrupt-parent FDT phandle of an interrupt controller
+PUBLIC uint32_t rvvm_fdt_intc_phandle(rvvm_intc_t* intc)
+{
+    if (intc && intc->fdt_phandle) {
+        return intc->fdt_phandle(intc);
+    }
+    return 0;
+}
+
+//! \brief Get interrupts-extended FDT cells for an IRQ
+PUBLIC size_t rvvm_fdt_irq_cells(rvvm_intc_t* intc, rvvm_irq_t irq, uint32_t* cells, size_t size)
+{
+    if (intc && intc->fdt_irq_cells) {
+        return intc->fdt_irq_cells(intc, irq, cells, size);
+    }
+    return 0;
+}
+
+/*
+ * Userland emulation API (WIP)
+ */
 
 PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 {
@@ -901,6 +1023,19 @@ PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
     rvvm_set_opt(machine, RVVM_OPT_JIT_CACHE, 16 << 20);
 #endif
     return machine;
+}
+
+PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
+{
+    // WIP, issue a total cache flush on all harts
+    // Needs improvements in RVJIT
+    UNUSED(addr);
+    UNUSED(size);
+    spin_lock(&global_lock);
+    vector_foreach(machine->harts, i) {
+        riscv_jit_flush_cache(vector_at(machine->harts, i));
+    }
+    spin_unlock(&global_lock);
 }
 
 PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)

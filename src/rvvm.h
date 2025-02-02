@@ -151,11 +151,34 @@ BUILD_ASSERT(sizeof(rvvm_jit_tlb_entry_t) == 16);
 
 #endif
 
+/*
+ * Physical RAM region
+ */
+
 typedef struct {
     rvvm_addr_t addr; // Physical memory base address (Should be page-aligned)
     size_t      size; // Physical memory amount (Should be page-aligned)
     void*       data; // Pointer to memory data (Preferably page-aligned)
 } rvvm_ram_t;
+
+/*
+ * AIA register file
+ */
+
+// Maximum amount of external AIA interrupts in RVVM
+#define RVVM_AIA_IRQ_LIMIT 256
+#define RVVM_AIA_ARR_LEN (RVVM_AIA_IRQ_LIMIT >> 5)
+
+typedef struct {
+    uint32_t eidelivery;
+    uint32_t eithreshold;
+    uint32_t eip[RVVM_AIA_ARR_LEN];
+    uint32_t eie[RVVM_AIA_ARR_LEN];
+} rvvm_aia_regfile_t;
+
+/*
+ * Hart structure
+ */
 
 struct rvvm_hart_t {
     uint32_t running;
@@ -189,8 +212,9 @@ struct rvvm_hart_t {
     rvvm_uxlen_t lrsc_cas;
 
     struct {
-        uint32_t     fcsr;
-        uint32_t     hartid;
+        uint32_t fcsr;
+        uint32_t hartid;
+
         rvvm_uxlen_t status;
 
         rvvm_uxlen_t ie;
@@ -206,6 +230,7 @@ struct rvvm_hart_t {
         rvvm_uxlen_t cause[RISCV_PRIVS_MAX];
         rvvm_uxlen_t tval[RISCV_PRIVS_MAX];
 
+        rvvm_uxlen_t iselect[RISCV_PRIVS_MAX];
         rvvm_uxlen_t counteren[RISCV_PRIVS_MAX];
         uint64_t     envcfg[RISCV_PRIVS_MAX];
         uint64_t     mseccfg;
@@ -218,6 +243,9 @@ struct rvvm_hart_t {
     bool jit_block_ends;
     bool jit_skip_exec;
 #endif
+
+    // AIA register files for M/S modes
+    rvvm_aia_regfile_t* aia;
 
     thread_ctx_t* thread;
     cond_var_t* wfi_cond;
@@ -237,6 +265,7 @@ struct rvvm_machine_t {
     rvvm_ram_t mem;
     vector_t(rvvm_hart_t*) harts;
     vector_t(rvvm_mmio_dev_t*) mmio_devs;
+    vector_t(rvvm_mmio_dev_t*) msi_targets;
     rvtimer_t timer;
 
     uint32_t running;
@@ -247,9 +276,9 @@ struct rvvm_machine_t {
     rvfile_t* kernel_file;
     rvfile_t* dtb_file;
 
-    plic_ctx_t* plic;
-    pci_bus_t*  pci_bus;
-    i2c_bus_t*  i2c_bus;
+    rvvm_intc_t* intc;
+    pci_bus_t* pci_bus;
+    i2c_bus_t* i2c_bus;
 
     gdb_server_t* gdbstub;
 
@@ -258,9 +287,9 @@ struct rvvm_machine_t {
     // FDT nodes for device tree generation
     struct fdt_node* fdt;
     struct fdt_node* fdt_soc;
-    // Kernel cmdline
-    char* cmdline;
 #endif
 };
+
+void rvvm_append_isa_string(rvvm_machine_t* machine, const char* str);
 
 #endif
