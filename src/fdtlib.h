@@ -62,6 +62,12 @@ PUBLIC void fdt_node_add_prop_str(struct fdt_node* node, const char* name, const
 // Add register range property (addr cells: 2, size cells: 2)
 PUBLIC void fdt_node_add_prop_reg(struct fdt_node* node, const char* name, uint64_t begin, uint64_t size);
 
+// Returns underlying property data
+PUBLIC void* fdt_node_get_prop_data(struct fdt_node* node, const char* name);
+
+// Returns underlying property size
+PUBLIC size_t fdt_node_get_prop_size(struct fdt_node* node, const char* name);
+
 // Delete property
 PUBLIC bool fdt_node_del_prop(struct fdt_node* node, const char* name);
 

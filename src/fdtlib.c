@@ -149,27 +149,37 @@ uint32_t fdt_node_get_phandle(struct fdt_node* node)
     return node->phandle;
 }
 
+static struct fdt_prop* fdt_node_find_prop(struct fdt_node* node, const char* name)
+{
+    if (node) {
+        vector_foreach(node->props, i) {
+            struct fdt_prop* prop = &vector_at(node->props, i);
+            if (rvvm_strcmp(prop->name, name)) {
+                return prop;
+            }
+        }
+    }
+    return NULL;
+}
+
 void fdt_node_add_prop(struct fdt_node* node, const char* name, const void* data, uint32_t len)
 {
     if (node) {
         // Replace old prop if present
-        vector_foreach(node->props, i) {
-            struct fdt_prop* repl_prop = &vector_at(node->props, i);
-            if (rvvm_strcmp(repl_prop->name, name)) {
-                free(repl_prop->data);
-                repl_prop->data = heap_duplicate(data, len);
-                repl_prop->len = len;
-                return;
-            }
+        struct fdt_prop* old_prop = fdt_node_find_prop(node, name);
+        if (old_prop) {
+            free(old_prop->data);
+            old_prop->data = heap_duplicate(data, len);
+            old_prop->len = len;
+        } else {
+            // Put a new prop
+            struct fdt_prop prop = {
+                .name = str_duplicate(name),
+                .data = heap_duplicate(data, len),
+                .len = len,
+            };
+            vector_push_back(node->props, prop);
         }
-
-        // Put a new prop
-        struct fdt_prop prop = {
-            .name = str_duplicate(name),
-            .data = heap_duplicate(data, len),
-            .len = len,
-        };
-        vector_push_back(node->props, prop);
     }
 }
 
@@ -206,6 +216,24 @@ void fdt_node_add_prop_reg(struct fdt_node *node, const char *name, uint64_t beg
     write_uint64_be_m(&arr[0], begin);
     write_uint64_be_m(&arr[1], size);
     fdt_node_add_prop(node, name, arr, sizeof(arr));
+}
+
+void* fdt_node_get_prop_data(struct fdt_node* node, const char* name)
+{
+    struct fdt_prop* prop = fdt_node_find_prop(node, name);
+    if (prop) {
+        return prop->data;
+    }
+    return NULL;
+}
+
+size_t fdt_node_get_prop_size(struct fdt_node* node, const char* name)
+{
+    struct fdt_prop* prop = fdt_node_find_prop(node, name);
+    if (prop) {
+        return prop->len;
+    }
+    return 0;
 }
 
 bool fdt_node_del_prop(struct fdt_node* node, const char* name)
