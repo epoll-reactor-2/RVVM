@@ -22,6 +22,9 @@ rvvm_hart_t* riscv_hart_init(rvvm_machine_t* machine);
 // Prepare harts before spawning any of them
 void riscv_hart_prepare(rvvm_hart_t* vm);
 
+// Initialize RISC-V AIA support
+void riscv_hart_aia_init(rvvm_hart_t* vm);
+
 // Free hart context
 void riscv_hart_free(rvvm_hart_t* vm);
 
@@ -38,6 +41,9 @@ void riscv_interrupt(rvvm_hart_t* vm, bitcnt_t irq);
 
 // Clears interrupt in IP csr of the hart
 void riscv_interrupt_clear(rvvm_hart_t* vm, bitcnt_t irq);
+
+// Sends an AIA (MSI) IRQ to the hart at M/S mode
+void riscv_send_aia_irq(rvvm_hart_t* vm, bool smode, uint32_t irq);
 
 // Hart interrupts that are raised externally
 static inline uint64_t riscv_interrupts_raised(rvvm_hart_t* vm)
@@ -60,6 +66,9 @@ static inline uint64_t riscv_interrupts_pending(rvvm_hart_t* vm)
 {
     return (riscv_interrupts_raised(vm) | vm->csr.ip) & vm->csr.ie;
 }
+
+// Get/Claim highest-priority AIA (MSI) IRQ at M/S mode
+uint32_t riscv_get_aia_irq(rvvm_hart_t* vm, bool smode, bool claim);
 
 // Check interrupts after writing to ie/ip/status CSRs, or after sret/mret
 void riscv_hart_check_interrupts(rvvm_hart_t* vm);

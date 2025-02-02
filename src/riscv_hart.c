@@ -62,12 +62,20 @@ void riscv_hart_prepare(rvvm_hart_t *vm)
 #endif
 }
 
+void riscv_hart_aia_init(rvvm_hart_t* vm)
+{
+    if (!vm->aia) {
+        vm->aia = safe_new_arr(rvvm_aia_regfile_t, 2);
+    }
+}
+
 void riscv_hart_free(rvvm_hart_t* vm)
 {
 #ifdef USE_JIT
     if (vm->jit_enabled) rvjit_ctx_free(&vm->jit);
 #endif
     condvar_free(vm->wfi_cond);
+    free(vm->aia);
     free(vm);
 }
 
@@ -231,6 +239,68 @@ void riscv_interrupt_clear(rvvm_hart_t* vm, bitcnt_t irq)
 {
     // Discard pending irq
     atomic_and_uint64_ex(&vm->pending_irqs, ~(1U << irq), ATOMIC_RELAXED);
+}
+
+void riscv_send_aia_irq(rvvm_hart_t* vm, bool smode, uint32_t irq)
+{
+    if (likely(vm->aia)) {
+        rvvm_aia_regfile_t* aia = &vm->aia[smode];
+        if (likely(atomic_load_uint32_relax(&aia->eidelivery))) {
+            uint32_t reg = irq >> 5;
+            if (likely(reg < RVVM_AIA_ARR_LEN)) {
+                uint32_t val = (1U << (irq & 0x1F));
+                uint32_t eie = atomic_load_uint32_relax(&aia->eie[reg]);
+                uint32_t prev = atomic_or_uint32(&aia->eip[reg], val);
+                if ((val & eie) && !(val & prev)) {
+                    if (irq > atomic_load_uint32_relax(&aia->eithreshold)) {
+                        riscv_interrupt(vm, smode ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL);
+                    }
+                }
+            }
+        }
+    }
+}
+
+uint32_t riscv_get_aia_irq(rvvm_hart_t* vm, bool smode, bool claim)
+{
+    uint32_t ret = 0;
+    if (likely(vm->aia)) {
+        rvvm_aia_regfile_t* aia = &vm->aia[smode];
+        uint32_t eithreshold = atomic_load_uint32_relax(&aia->eithreshold);
+        bool clear_eip = claim;
+        for (size_t i = 0; i < RVVM_AIA_ARR_LEN; ++i) {
+            uint32_t eip = atomic_load_uint32_relax(&aia->eip[i]) & atomic_load_uint32_relax(&aia->eie[i]);
+            if (eip) {
+                if (ret) {
+                    // Pending interrupts remaining
+                    clear_eip = false;
+                    break;
+                } else {
+                    uint32_t bit = bit_clz32(eip) ^ 31;
+                    uint32_t irq = (i << 5) | bit;
+                    if (irq > eithreshold) {
+                        uint32_t rem_mask = ~(1U << bit);
+                        ret = irq;
+                        if (claim) {
+                            eip = atomic_and_uint32(&aia->eip[i], rem_mask);
+                            if (eip & rem_mask) {
+                                // Pending interrupts remaining
+                                clear_eip = false;
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // No more pending MSI IRQs
+        if (likely(clear_eip)) {
+            riscv_interrupt_clear(vm, smode ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL);
+        }
+    }
+    return ret;
 }
 
 void riscv_hart_check_interrupts(rvvm_hart_t* vm)
