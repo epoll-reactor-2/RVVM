@@ -74,6 +74,8 @@ void* rvfile_get_win32_handle(rvfile_t* file);
 
 /*
  * Block device API
+ *
+ * It's illegal to seek out of device bounds, resizing the device is also impossible.
  */
 
 #define BLKDEV_RW  RVFILE_RW
@@ -102,9 +104,13 @@ struct blkdev_t {
     uint64_t pos;
 };
 
+// Open a block device image
 blkdev_t* blk_open(const char* filename, uint8_t opts);
+
+// Close a block device handle
 void      blk_close(blkdev_t* dev);
 
+// Get block device size in bytes
 static inline uint64_t blk_getsize(blkdev_t* dev)
 {
     if (dev) {
@@ -113,7 +119,7 @@ static inline uint64_t blk_getsize(blkdev_t* dev)
     return 0;
 }
 
-// It's illegal to seek out of device bounds, resizing the device is also impossible
+// Read data from block device
 static inline size_t blk_read(blkdev_t* dev, void* dst, size_t size, uint64_t offset)
 {
     if (dev) {
@@ -127,6 +133,7 @@ static inline size_t blk_read(blkdev_t* dev, void* dst, size_t size, uint64_t of
     return 0;
 }
 
+// Write data to block device
 static inline size_t blk_write(blkdev_t* dev, const void* src, size_t size, uint64_t offset)
 {
     if (dev) {
@@ -140,6 +147,7 @@ static inline size_t blk_write(blkdev_t* dev, const void* src, size_t size, uint
     return 0;
 }
 
+// Seek drive head (For seekable devices like ATA)
 static inline bool blk_seek(blkdev_t* dev, int64_t offset, uint8_t startpos)
 {
     if (!dev) {
@@ -160,6 +168,7 @@ static inline bool blk_seek(blkdev_t* dev, int64_t offset, uint8_t startpos)
     return true;
 }
 
+// Tell drive head position
 static inline uint64_t blk_tell(blkdev_t* dev)
 {
     if (dev) {
@@ -168,6 +177,7 @@ static inline uint64_t blk_tell(blkdev_t* dev)
     return 0;
 }
 
+// Discard physical blocks, preferably zeroing them
 static inline bool blk_trim(blkdev_t* dev, uint64_t offset, uint64_t size)
 {
     if (dev && dev->type->trim) {
@@ -179,6 +189,7 @@ static inline bool blk_trim(blkdev_t* dev, uint64_t offset, uint64_t size)
     return false;
 }
 
+// Flush write buffers
 static inline bool blk_sync(blkdev_t* dev)
 {
     if (dev && dev->type->sync) {
