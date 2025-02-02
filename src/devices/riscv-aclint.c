@@ -1,5 +1,5 @@
 /*
-clint.c - RISC-V Advanced Core Local Interruptor
+riscv-aclint.c - RISC-V Advanced Core Local Interruptor
 Copyright (C) 2021  LekKit <github.com/LekKit>
 
 This Source Code Form is subject to the terms of the Mozilla Public
@@ -7,7 +7,7 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#include "clint.h"
+#include "riscv-aclint.h"
 #include "riscv_hart.h"
 #include "mem_ops.h"
 #include "bit_ops.h"
@@ -17,11 +17,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define ACLINT_MTIMER_SIZE 0x8000
 
 static rvvm_mmio_type_t aclint_mswi_dev_type = {
-    .name = "aclint_mswi",
+    .name = "riscv_aclint_mswi",
 };
 
 static rvvm_mmio_type_t aclint_mtimer_dev_type = {
-    .name = "aclint_mtimer",
+    .name = "riscv_aclint_mtimer",
 };
 
 static bool aclint_mswi_read(rvvm_mmio_dev_t* device, void* data, size_t offset, uint8_t size)
@@ -99,61 +99,63 @@ static bool aclint_mtimer_write(rvvm_mmio_dev_t* device, void* data, size_t offs
     return false;
 }
 
-PUBLIC void clint_init(rvvm_machine_t* machine, rvvm_addr_t addr)
+PUBLIC void riscv_clint_init(rvvm_machine_t* machine, rvvm_addr_t addr)
 {
     rvvm_mmio_dev_t aclint_mswi = {
         .addr = addr,
         .size = ACLINT_MSWI_SIZE,
-        .min_op_size = 4,
-        .max_op_size = 4,
+        .type = &aclint_mswi_dev_type,
         .read = aclint_mswi_read,
         .write = aclint_mswi_write,
-        .type = &aclint_mswi_dev_type,
+        .min_op_size = 4,
+        .max_op_size = 4,
     };
 
     rvvm_mmio_dev_t aclint_mtimer = {
         .addr = addr + ACLINT_MSWI_SIZE,
         .size = ACLINT_MTIMER_SIZE,
-        .min_op_size = 8,
-        .max_op_size = 8,
+        .type = &aclint_mtimer_dev_type,
         .read = aclint_mtimer_read,
         .write = aclint_mtimer_write,
-        .type = &aclint_mtimer_dev_type,
+        .min_op_size = 8,
+        .max_op_size = 8,
     };
 
-    rvvm_attach_mmio(machine, &aclint_mswi);
-    rvvm_attach_mmio(machine, &aclint_mtimer);
+    if (!rvvm_attach_mmio(machine, &aclint_mswi) || !rvvm_attach_mmio(machine, &aclint_mtimer)) {
+        rvvm_error("Failed to attach RISC-V ACLINT!");
+        return;
+    }
 
 #ifdef USE_FDT
-    struct fdt_node* clint = fdt_node_create_reg("clint", addr);
     struct fdt_node* cpus = fdt_node_find(rvvm_get_fdt_root(machine), "cpus");
-    size_t irq_ext_cells = vector_size(machine->harts) << 2;
-    uint32_t* irq_ext = safe_calloc(irq_ext_cells, sizeof(uint32_t));
-
-    fdt_node_add_prop_reg(clint, "reg", addr, CLINT_MMIO_SIZE);
-    fdt_node_add_prop(clint, "compatible", "sifive,clint0\0riscv,clint0", 27);
+    vector_t(uint32_t) irq_ext = {0};
 
     vector_foreach(machine->harts, i) {
         struct fdt_node* cpu = fdt_node_find_reg(cpus, "cpu", i);
         struct fdt_node* cpu_irq = fdt_node_find(cpu, "interrupt-controller");
-        if (cpu_irq) {
-            uint32_t irq_phandle = fdt_node_get_phandle(cpu_irq);
-            irq_ext[(i << 2)] = irq_ext[(i << 2) + 2] = irq_phandle;
-            irq_ext[(i << 2) + 1] = RISCV_INTERRUPT_MSOFTWARE;
-            irq_ext[(i << 2) + 3] = RISCV_INTERRUPT_MTIMER;
+        uint32_t irq_phandle = fdt_node_get_phandle(cpu_irq);
+
+        if (irq_phandle) {
+            vector_push_back(irq_ext, irq_phandle);
+            vector_push_back(irq_ext, RISCV_INTERRUPT_MSOFTWARE);
+            vector_push_back(irq_ext, irq_phandle);
+            vector_push_back(irq_ext, RISCV_INTERRUPT_MTIMER);
         } else {
-            rvvm_warn("Missing nodes in FDT!");
+            rvvm_warn("Missing /cpus/cpu/interrupt-controller node in FDT!");
         }
     }
 
-    fdt_node_add_prop_cells(clint, "interrupts-extended", irq_ext, irq_ext_cells);
+    struct fdt_node* clint = fdt_node_create_reg("clint", addr);
+    fdt_node_add_prop_reg(clint, "reg", addr, CLINT_MMIO_SIZE);
+    fdt_node_add_prop(clint, "compatible", "sifive,clint0\0riscv,clint0", 27);
+    fdt_node_add_prop_cells(clint, "interrupts-extended", vector_buffer(irq_ext), vector_size(irq_ext));
     fdt_node_add_child(rvvm_get_fdt_soc(machine), clint);
-    free(irq_ext);
+    vector_free(irq_ext);
 #endif
 }
 
-PUBLIC void clint_init_auto(rvvm_machine_t* machine)
+PUBLIC void riscv_clint_init_auto(rvvm_machine_t* machine)
 {
-    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, CLINT_DEFAULT_MMIO, CLINT_MMIO_SIZE);
-    clint_init(machine, addr);
+    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, CLINT_ADDR_DEFAULT, CLINT_MMIO_SIZE);
+    riscv_clint_init(machine, addr);
 }
