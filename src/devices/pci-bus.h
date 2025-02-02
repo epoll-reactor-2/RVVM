@@ -12,7 +12,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RVVM_PCI_BUS_H
 
 #include "rvvmlib.h"
-#include "plic.h"
 
 // PCI constants
 #define PCI_BUS_IRQS  0x4
@@ -26,12 +25,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define PCI_IRQ_PIN_INTC 0x3
 #define PCI_IRQ_PIN_INTD 0x4
 
-// Default PCI bus settings
-#define PCI_BASE_DEFAULT_MMIO 0x30000000
-#define PCI_IO_DEFAULT_ADDR   0x03000000
-#define PCI_IO_DEFAULT_SIZE   0x00010000
-#define PCI_MEM_DEFAULT_MMIO  0x40000000
-#define PCI_MEM_DEFAULT_SIZE  0x40000000
+// Default PCI bus configuration
+#define PCI_ECAM_ADDR_DEFAULT 0x30000000U
+#define PCI_IO_ADDR_DEFAULT   0x03000000U
+#define PCI_IO_SIZE_DEFAULT   0x00010000U
+#define PCI_MEM_ADDR_DEFAULT  0x40000000U
+#define PCI_MEM_SIZE_DEFAULT  0x40000000U
 
 // PCI function address in the form of [bus:8] | [dev:5] | [func:3]
 typedef uint32_t pci_bus_addr_t;
@@ -42,7 +41,7 @@ typedef struct rvvm_pci_function pci_func_t;
 // PCI device handle
 typedef struct rvvm_pci_device pci_dev_t;
 
-// PCI function description
+// PCI single function description (For multi-function devices, see pci_dev_desc_t)
 typedef struct {
     uint16_t vendor_id;
     uint16_t device_id;
@@ -67,19 +66,19 @@ typedef struct {
 
 //! \brief  Attach a manually configured PCIe host ECAM controller to a powered off machine
 //! \param  machine   RVVM Machine handle
-//! \param  plic      Platform-Level Interrupt Controller handle
+//! \param  intc      Wired interrupt controller handle
 //! \param  irqs      Vector of 4 wire IRQs for legacy INTx interrupts
-//! \param  base_addr Base address of ECAM space
+//! \param  ecam_addr Base address of ECAM space
 //! \param  bus_count Amount of PCI bus addressing units
 //! \param  io_addr   Start of PCI IO Port Space (Unused, but neded for proper guest initialization)
 //! \param  io_len    Length of PCI IO Port Space (Unused, but neded for proper guest initialization)
 //! \param  mem_addr  Start of PCI MMIO Space
 //! \param  mem_len   Length of PCI MMIO Space
 //! \return PCI bus handle, or NULL on failure
-PUBLIC pci_bus_t* pci_bus_init(rvvm_machine_t* machine, plic_ctx_t* plic, const uint32_t irqs[PCI_BUS_IRQS],
-                                rvvm_addr_t base_addr, size_t bus_count,
-                                rvvm_addr_t io_addr, size_t io_len,
-                                rvvm_addr_t mem_addr, size_t mem_len);
+PUBLIC pci_bus_t* pci_bus_init(rvvm_machine_t* machine, rvvm_intc_t* intc, const rvvm_irq_t* irqs,
+                               rvvm_addr_t ecam_addr, size_t bus_count,
+                               rvvm_addr_t io_addr,   size_t io_len,
+                               rvvm_addr_t mem_addr,  size_t mem_len);
 
 //! \brief  Attach an automatically configured PCIe host ECAM controller to a powered off machine
 //! \param  machine RVVM Machine handle with a working IRQ controller
