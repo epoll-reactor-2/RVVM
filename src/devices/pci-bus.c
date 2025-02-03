@@ -57,8 +57,21 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Expansion ROM bits
 #define PCI_EXPANSION_ROM_ENABLED 0x1
 
-#define PCI_CAP_LIST_OFF 0x80 // Capabilities List Offset
-#define PCI_MSI_CAP_OFF  0xC0 // MSI Capability Offset
+// PCI capabilities offsets
+#define PCI_CAP_LIST_OFF 0x40 // Capabilities List Offset
+
+#define PCI_REG_ENDPOINT 0x40 // Endpoint capability
+
+#define PCI_REG_MSI      0x90 // MSI capability
+#define PCI_REG_MSI_AL   0x94 // MSI address low
+#define PCI_REG_MSI_AH   0x98 // MSI address high
+#define PCI_REG_MSI_DATA 0x9C // MSI data
+#define PCI_REG_MSI_MASK 0xA0 // MSI mask vector
+#define PCI_REG_MSI_PEND 0xA4 // MSI pending vector
+
+#define PCI_REG_MSIX     0xB0 // MSI-X capability
+#define PCI_REG_MSIX_TBL 0xB4 // MSI-X table offset/BAR
+#define PCI_REG_MSIX_PBO 0xB8 // MSI-X pending bits offset/BAR
 
 // PCI Express capability port type
 #define PCIE_CAP_PORT_ENDPOINT       0x0
@@ -67,8 +80,24 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define PCIE_CAP_DOWNSTREAM_SWITCH   0x6
 #define PCIE_CAP_INTEGRATED_ENDPOINT 0x9
 
+// MSI-X interrupts
+#define PCI_MSIX_MAX_IRQS 1
+#define PCI_MSIX_TBL_SIZE (((PCI_MSIX_MAX_IRQS + 1) >> 1) << 3)
+#define PCI_MSIX_PBA_SIZE ((PCI_MSIX_MAX_IRQS + 0x1F) >> 5)
+#define PCI_MSIX_BAR_SIZE (PCI_MSIX_TBL_SIZE + PCI_MSIX_PBA_SIZE)
+
+#define PCI_MSIX_ENABLED 0x80000000
+#define PCI_MSIX_MASKED  0x40000000
+#define PCI_MSIX_VALID   0xC0000000
+
+// MSI interrupts
+#define PCI_MSI_ENABLED 0x00010000 // MSI Enabled
+#define PCI_MSI_MME     0x00300000 // Multiple Message Enable
+#define PCI_MSI_VALID   0x00310000
+
 static const uint32_t pci_express_caps_ro[] = {
-    0x0102C010, // [80] PCI Express (v2) Endpoint, IntMsgNum 0
+    // [40] PCI Express (v2) Endpoint, IntMsgNum 0
+    0x01028010,
     0x00008002, // DevCap: MaxPayload 512 bytes, RBE+
     0x00002050, // DevCtl: RlxdOrd+
     0x01800D02, // LnkCap: Speed 5GT/s, Width x16
@@ -85,17 +114,24 @@ static const uint32_t pci_express_caps_ro[] = {
     0x00000000,
     0x00000000,
 
-    0x0003D001, // [C0] Power Management version 3
+    // [80] Power Management version 3
+    0x00039001,
     0x00000008, // NoSoftRst+
     0x00000000,
     0x00000000,
 
-    0x01810005, // [D0] MSI: Enable- Count=1/1 Maskable+ 64bit+
+    // [90] MSI: Enable- Count=1/8 Maskable+ 64bit+
+    0x0186B005,
     0x00000000, // Message Address Low
     0x00000000, // Message Address High
     0x00000000, // Message Data
     0x00000000, // Mask
     0x00000000, // Pending
+    0x00000000,
+    0x00000000,
+
+    // [B0] MSI-X: Enable- Count=X Masked-
+    0x00000011 | ((PCI_MSIX_MAX_IRQS - 1) << 16),
 };
 
 struct rvvm_pci_function {
@@ -108,15 +144,22 @@ struct rvvm_pci_function {
     uint32_t command;
     uint32_t irq_line;
 
-    // MSI configuration
-    uint32_t msi_enable;
-    uint32_t msi_lo;
-    uint32_t msi_hi;
-    uint32_t msi_data;
-
     // Bridge IO/MEM assignment
     uint32_t bridge_io;
     uint32_t bridge_mem;
+
+    // MSI-X state (Sits in a dedicated BAR)
+    uint32_t msix_control;
+    uint32_t msix_bar;
+    uint32_t msix[PCI_MSIX_BAR_SIZE];
+
+    // MSI state
+    uint32_t msi_control;
+    uint32_t msi_addr_low;
+    uint32_t msi_addr_high;
+    uint32_t msi_data;
+    uint32_t msi_mask;
+    uint32_t msi_pending;
 
     // RO attributes
     uint16_t vendor_id;
@@ -146,6 +189,144 @@ struct rvvm_pci_bus {
     size_t      io_len;
     rvvm_addr_t mem_addr;
     size_t      mem_len;
+};
+
+// Get INTx IRQ pin routing id for a function
+static inline rvvm_irq_t pci_bus_intx_irq(pci_bus_t* bus, uint32_t dev_id, uint32_t irq_pin)
+{
+    return bus->irqs[(dev_id + irq_pin + 3) & 3];
+}
+
+// Get INTx IRQ for a function
+static inline rvvm_irq_t pci_func_intx_irq(pci_func_t* func)
+{
+    return pci_bus_intx_irq(func->bus, func->addr >> 3, func->irq_pin);
+}
+
+// Attempts to send an IRQ via MSI, returns true if enabled
+static bool pci_func_send_msi_irq(pci_func_t* func, uint32_t msi_id)
+{
+    uint32_t msi_control = atomic_load_uint32_relax(&func->msi_control);
+    if (msi_control & PCI_MSI_ENABLED) {
+        // MSI enabled
+        uint32_t command = atomic_load_uint32_relax(&func->command);
+        if (likely(command & PCI_CMD_BUS_MASTER)) {
+            // Bus mastering enabled
+            uint32_t bit = 1U << (msi_id & 0x1F);
+            uint32_t mask = atomic_load_uint32_relax(&func->msi_mask);
+            uint32_t mme_mask = (1U << (msi_control & PCI_MSI_MME)) - 1;
+            uint32_t data = atomic_load_uint32_relax(&func->msi_data) | (msi_id & mme_mask);
+            rvvm_addr_t addr = atomic_load_uint32_relax(&func->msi_addr_low)
+                  | ((uint64_t)atomic_load_uint32_relax(&func->msi_addr_high) << 32);
+
+            if (likely(!(mask & bit))) {
+                // Perform an MSI write
+                rvvm_send_msi_irq(func->bus->machine, addr, data);
+            } else {
+                // Vector is masked, set pending bit
+                atomic_or_uint32(&func->msi_pending, bit);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// Attempts to send an IRQ via MSI-X, returns true if enabled
+static bool pci_func_send_msix_irq(pci_func_t* func, uint32_t msi_id)
+{
+    uint32_t msix_control = atomic_load_uint32_relax(&func->msix_control);
+    if (msix_control & PCI_MSIX_ENABLED) {
+        // MSI-X enabled
+        uint32_t command = atomic_load_uint32_relax(&func->command);
+        if (likely((command & PCI_CMD_BUS_MASTER) && (msi_id < PCI_MSIX_MAX_IRQS))) {
+            // Bus mastering enabled, valid MSI-X vector
+            uint32_t mask = atomic_load_uint32_relax(&func->msix[msi_id + 3]);
+            uint32_t data = atomic_load_uint32_relax(&func->msix[msi_id + 2]);
+            rvvm_addr_t addr = atomic_load_uint32_relax(&func->msix[msi_id])
+                  | ((uint64_t)atomic_load_uint32_relax(&func->msix[msi_id + 1]) << 32);
+
+            if (likely(!(msix_control & PCI_MSIX_MASKED) && !(mask & 1))) {
+                // Perform an MSI write
+                rvvm_send_msi_irq(func->bus->machine, addr, data);
+            } else {
+                // Vector is masked, set pending bit
+                uint32_t reg = msi_id >> 5;
+                uint32_t bit = 1U << (msi_id & 0x1F);
+                atomic_or_uint32(&func->msix[PCI_MSIX_TBL_SIZE + reg], bit);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// Re-send pending MSI IRQs on MSI vector mask update
+static void pci_func_update_msi_mask(pci_func_t* func)
+{
+    uint32_t mask = atomic_load_uint32_relax(&func->msi_mask);
+    uint32_t pending = atomic_and_uint32(&func->msi_mask, mask);
+    uint32_t enabled = pending & ~mask;
+    if (enabled) {
+        for (size_t i = 0; i < 32; ++i) {
+            if (enabled & (1U << i)) {
+                pci_func_send_msi_irq(func, i);
+            }
+        }
+    }
+}
+
+// Re-send pending MSI-X IRQs on MSI-X vector mask or function mask update
+static void pci_func_update_msix_mask(pci_func_t* func)
+{
+    if (atomic_load_uint32_relax(&func->msix_control) == PCI_MSIX_ENABLED) {
+        for (size_t reg = 0; reg < PCI_MSIX_PBA_SIZE; ++reg) {
+            uint32_t pending = atomic_load_uint32_relax(&func->msix[PCI_MSIX_TBL_SIZE + reg]);
+            if (pending) {
+                pending = atomic_swap_uint32(&func->msix[PCI_MSIX_TBL_SIZE + reg], 0);
+                for (size_t bit = 0; bit < 32; ++bit) {
+                    pci_func_send_msix_irq(func, (reg << 5) | bit);
+                }
+            }
+        }
+    }
+}
+
+static bool pci_msix_bar_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+{
+    pci_func_t* func = dev->data;
+    size_t reg = offset >> 2;
+    uint32_t val = atomic_load_uint32_relax(&func->msix[reg]);
+    UNUSED(size);
+    write_uint32_le(data, val);
+    return true;
+}
+
+static bool pci_msix_bar_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+{
+    pci_func_t* func = dev->data;
+    size_t reg = offset >> 2;
+    uint32_t val = read_uint32_le(data);
+    UNUSED(size);
+    if (reg < PCI_MSIX_TBL_SIZE && (reg & 3) == 3 && !(val & 1)) {
+        if (atomic_swap_uint32(&func->msix[reg], val) & 1) {
+            // MSI-X vector unmasked
+            pci_func_update_msix_mask(func);
+        }
+    } else {
+        atomic_store_uint32_relax(&func->msix[reg], val);
+    }
+    return true;
+}
+
+static void msix_bar_remove(rvvm_mmio_dev_t* dev)
+{
+    UNUSED(dev);
+}
+
+static const rvvm_mmio_type_t pci_msix_dev_type = {
+    .name = "msix_bar",
+    .remove = msix_bar_remove,
 };
 
 // Free a PCI function description that we've failed to attach
@@ -215,19 +396,6 @@ static void pci_free_dev_internal(pci_dev_t* dev, bool remove_mmio)
     }
 }
 
-// Get INTx IRQ pin routing id for a function
-static inline rvvm_irq_t pci_bus_intx_irq(pci_bus_t* bus, uint32_t dev_id, uint32_t irq_pin)
-{
-    return bus->irqs[(dev_id + irq_pin + 3) & 3];
-}
-
-
-// Get INTx IRQ for a function
-static inline rvvm_irq_t pci_func_intx_irq(pci_func_t* func)
-{
-    return pci_bus_intx_irq(func->bus, func->addr >> 3, func->irq_pin);
-}
-
 // Assign MMIO address for a BAR
 static rvvm_addr_t pci_assign_mmio_addr(pci_bus_t* bus, size_t bar_size)
 {
@@ -275,6 +443,20 @@ static pci_func_t* pci_attach_func_internal(pci_bus_t* bus, const pci_func_desc_
                 free(func);
                 return NULL;
             }
+        } else if (bus_addr && bar_id >= 4 && !func->msix_bar) {
+            // Try to attach MSI-X BAR (Unless it's a host bridge)
+            rvvm_mmio_dev_t msix_bar = {
+                .size = sizeof(func->msix),
+                .data = func,
+                .type = &pci_msix_dev_type,
+                .read = pci_msix_bar_read,
+                .write = pci_msix_bar_write,
+            };
+            func->bar[bar_id] = pci_attach_bar(bus, msix_bar);
+            if (func->bar[bar_id]) {
+                // Successfully attached MSI-X BAR
+                func->msix_bar = bar_id;
+            }
         }
     }
 
@@ -311,9 +493,9 @@ static inline rvvm_mmio_dev_t* pci_effective_bar(pci_func_t* func, size_t bar_id
     return func->bar[bar_id];
 }
 
-static bool pci_bus_read(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, uint8_t size)
+static bool pci_bus_read(rvvm_mmio_dev_t* ecam, void* data, size_t offset, uint8_t size)
 {
-    pci_bus_t* bus = mmio_dev->data;
+    pci_bus_t* bus = ecam->data;
     pci_bus_addr_t bus_addr = offset >> 12;
     size_t reg = offset & 0xFFC;
     uint32_t val = 0;
@@ -324,6 +506,14 @@ static bool pci_bus_read(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, u
         // Nonexistent devices have all 0xFFFF in their conf space
         write_uint32_le(data, 0xFFFFFFFF);
         return true;
+    }
+
+    if (bus_addr && reg >= PCI_CAP_LIST_OFF) {
+        // Handle RO PCI capabilities
+        size_t cap_id = (reg - PCI_CAP_LIST_OFF) >> 2;
+        if (cap_id < STATIC_ARRAY_SIZE(pci_express_caps_ro)) {
+            val = pci_express_caps_ro[cap_id];
+        }
     }
 
     switch (reg) {
@@ -417,37 +607,49 @@ static bool pci_bus_read(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, u
                 val = PCI_CAP_LIST_OFF;
             }
             break;
-        default:
-            if (bus_addr) {
-                // Handle PCI capabilities
-                size_t cap_id = (reg - PCI_CAP_LIST_OFF) >> 2;
-                if (cap_id < STATIC_ARRAY_SIZE(pci_express_caps_ro)) {
-                    val = pci_express_caps_ro[cap_id];
-                }
-                switch (cap_id) {
-                    case 0x00: // PCIe endpoint type
-                        if (func->class_code == 0x0604) {
-                            // This is a PCI-PCI bridge (PCI Express Root Port)
-                            val |= (PCIE_CAP_ROOT_PORT << 20);
-                        } else if (!(bus_addr >> 8)) {
-                            // This is an integrated endpoint on bus 00
-                            val |= (PCIE_CAP_INTEGRATED_ENDPOINT << 20);
-                        }
-                        break;
-                    case 0x14: // MSI enable
-                        val |= atomic_load_uint32_relax(&func->msi_enable);
-                        break;
-                    case 0x15: // MSI address low
-                        val = atomic_load_uint32_relax(&func->msi_lo);
-                        break;
-                    case 0x16: // MSI address high
-                        val = atomic_load_uint32_relax(&func->msi_hi);
-                        break;
-                    case 0x17: // MSI data
-                        val = atomic_load_uint32_relax(&func->msi_data);
-                        break;
-                }
+
+        // PCI capabilities
+        case PCI_REG_ENDPOINT:
+            if (func->class_code == 0x0604) {
+                // This is a PCI-PCI bridge (PCI Express Root Port)
+                val |= (PCIE_CAP_ROOT_PORT << 20);
+            } else if (!(bus_addr >> 8)) {
+                // This is an integrated endpoint on bus 00
+                val |= (PCIE_CAP_INTEGRATED_ENDPOINT << 20);
             }
+            break;
+
+        case PCI_REG_MSI:
+            val |= atomic_load_uint32_relax(&func->msi_control);
+            if (!func->msix_bar) {
+                // Hide MSI-X capability if MSI-X BAR is missing
+                val &= ~(0xFF00U);
+            }
+            break;
+        case PCI_REG_MSI_AL:
+            val = atomic_load_uint32_relax(&func->msi_addr_low);
+            break;
+        case PCI_REG_MSI_AH:
+            val = atomic_load_uint32_relax(&func->msi_addr_high);
+            break;
+        case PCI_REG_MSI_DATA:
+            val = atomic_load_uint32_relax(&func->msi_data);
+            break;
+        case PCI_REG_MSI_MASK:
+            val = atomic_load_uint32_relax(&func->msi_mask);
+            break;
+        case PCI_REG_MSI_PEND:
+            val = atomic_load_uint32_relax(&func->msi_pending);
+            break;
+
+        case PCI_REG_MSIX:
+            val |= atomic_load_uint32_relax(&func->msix_control);
+            break;
+        case PCI_REG_MSIX_TBL:
+            val = func->msix_bar;
+            break;
+        case PCI_REG_MSIX_PBO:
+            val = func->msix_bar | PCI_MSIX_TBL_SIZE;
             break;
     }
 
@@ -456,9 +658,9 @@ static bool pci_bus_read(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, u
     return true;
 }
 
-static bool pci_bus_write(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, uint8_t size)
+static bool pci_bus_write(rvvm_mmio_dev_t* ecam, void* data, size_t offset, uint8_t size)
 {
-    pci_bus_t* bus = mmio_dev->data;
+    pci_bus_t* bus = ecam->data;
     pci_bus_addr_t bus_addr = offset >> 12;
     size_t reg = offset & 0xFFC;
     uint32_t val = read_uint32_le(data);
@@ -523,34 +725,40 @@ static bool pci_bus_write(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, 
         case PCI_REG_IRQ_PIN_LINE:
             atomic_store_uint32_relax(&func->irq_line, (uint8_t)val);
             break;
-        default:
-            if (bus_addr) {
-                // Handle PCI capabilities
-                size_t cap_id = (reg - PCI_CAP_LIST_OFF) >> 2;
-                switch (cap_id) {
-                    case 0x14: // MSI enable
-                        atomic_store_uint32_relax(&func->msi_enable, val & 0x10000);
-                        break;
-                    case 0x15: // MSI address low
-                        atomic_store_uint32_relax(&func->msi_lo, val);
-                        break;
-                    case 0x16: // MSI address high
-                        atomic_store_uint32_relax(&func->msi_hi, val);
-                        break;
-                    case 0x17: // MSI data
-                        atomic_store_uint32_relax(&func->msi_data, val);
-                        break;
-                }
+
+        // PCI Capabilities
+        case PCI_REG_MSI: {
+            uint32_t prev = atomic_swap_uint32(&func->msi_control, val & PCI_MSI_VALID);
+            if ((prev & PCI_MSIX_MASKED) && !(val & PCI_MSIX_MASKED)) {
+                pci_func_update_msix_mask(func);
             }
+            break;
+        }
+        case PCI_REG_MSI_AL:
+            atomic_store_uint32_relax(&func->msi_addr_low, val);
+            break;
+        case PCI_REG_MSI_AH:
+            atomic_store_uint32_relax(&func->msi_addr_high, val);
+            break;
+        case PCI_REG_MSI_DATA:
+            atomic_store_uint32_relax(&func->msi_data, val & 0xFFFF);
+            break;
+        case PCI_REG_MSI_MASK:
+            atomic_store_uint32_relax(&func->msi_mask, val);
+            pci_func_update_msi_mask(func);
+            break;
+
+        case PCI_REG_MSIX:
+            atomic_store_uint32_relax(&func->msix_control, val & PCI_MSIX_VALID);
             break;
     }
 
     return true;
 }
 
-static void pci_bus_remove(rvvm_mmio_dev_t* mmio_dev)
+static void pci_bus_remove(rvvm_mmio_dev_t* ecam)
 {
-    pci_bus_t* bus = mmio_dev->data;
+    pci_bus_t* bus = ecam->data;
     vector_foreach(bus->dev, i) {
         pci_free_dev_internal(vector_at(bus->dev, i), false);
     }
@@ -858,16 +1066,21 @@ PUBLIC void pci_send_irq(pci_func_t* func, uint32_t msi_id)
 {
     UNUSED(msi_id);
     if (likely(func)) {
-        pci_bus_t* bus = func->bus;
-        // Check IRQs enabled
-        if (likely(atomic_load_uint32_relax(&func->msi_enable))) {
-            // Send MSI
-            rvvm_addr_t addr = atomic_load_uint32_relax(&func->msi_lo) | ((uint64_t)atomic_load_uint32_relax(&func->msi_hi) << 32);
-            uint32_t data = atomic_load_uint32_relax(&func->msi_data);
-            rvvm_send_msi_irq(bus->machine, addr, data);
-        } else if (likely(func->irq_pin && !(atomic_load_uint32_relax(&func->command) & PCI_CMD_INTX_DISABLE))) {
+        if (pci_func_send_msix_irq(func, msi_id)) {
+            // Sent an MSI-X IRQ
+            return;
+        }
+
+        if (pci_func_send_msi_irq(func, msi_id)) {
+            // Sent an MSI IRQ
+            return;
+        }
+
+        if (likely(!(atomic_load_uint32_relax(&func->command) & PCI_CMD_INTX_DISABLE))) {
             // Send INTx IRQ
-            rvvm_send_irq(bus->intc, pci_func_intx_irq(func));
+            if (likely(func->irq_pin)) {
+                rvvm_send_irq(func->bus->intc, pci_func_intx_irq(func));
+            }
         }
     }
 }
