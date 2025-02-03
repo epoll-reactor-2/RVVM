@@ -45,9 +45,10 @@ static no_inline void spin_lock_debug_report(spinlock_t* lock, bool crash)
 #ifdef RVVM_VERSION
     rvvm_warn("Version: RVVM v"RVVM_VERSION);
 #endif
-    stacktrace_print();
     if (crash) {
         rvvm_fatal("Locking issue detected!");
+    } else {
+        stacktrace_print();
     }
 }
 
