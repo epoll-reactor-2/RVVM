@@ -742,7 +742,7 @@ PUBLIC pci_dev_t* pci_attach_func_at(pci_bus_t* bus, const pci_func_desc_t* desc
         bool was_running = rvvm_pause_machine(bus->machine);
         if (dev->func[func_id]) {
             // Another function already in the slot
-            rvvm_error("PCI function %02x:%02x.%01x is busy!", (bus_addr >> 8) & 0xFF, (bus_addr >> 3) & 0x1F, func_id);
+            rvvm_error("PCI function %02x:%02x.%01x is busy!", (bus_addr >> 8) & 0xFF, (bus_addr >> 3) & 0x1F, (uint32_t)func_id);
             pci_free_func_internal(func, true);
             dev = NULL;
         } else {
