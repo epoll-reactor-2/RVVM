@@ -100,9 +100,15 @@ static struct xdg_wm_base* wm_base = NULL;
 static struct zxdg_output_manager_v1* xdg_output_manager = NULL;
 static struct zxdg_decoration_manager_v1* xdg_decoration_manager = NULL;
 
+static struct zwp_relative_pointer_manager_v1* relative_pointer_manager = NULL;
+static struct zwp_pointer_constraints_v1* pointer_constraints = NULL;
+static struct zwp_keyboard_shortcuts_inhibit_manager_v1 *keyboard_shortcuts_inhibit_manager = NULL;
+
 struct xkb_context* xkb_context = NULL;
 
 static hashmap_t globals;
+static hashmap_t outputs;
+static hashmap_t seats;
 
 typedef struct {
     gui_window_t* win;
@@ -125,6 +131,12 @@ typedef struct {
     uint32_t last_enter_serial;
     uint32_t last_button_serial;
     uint32_t last_key_serial;
+
+    // Pointer
+    struct zwp_locked_pointer_v1 *locked_pointer;
+
+    // Keyboard
+    struct zwp_keyboard_shortcuts_inhibitor_v1 *keyboard_shortcuts_inhibitor;
 
     bool grabbed;
 } wayland_data_t;
@@ -195,6 +207,8 @@ struct pointer_data {
 
     int32_t x;
     int32_t y;
+
+    struct zwp_relative_pointer_v1 *relative_source;
 
     struct {
         int32_t mask;
@@ -433,15 +447,14 @@ static void wl_pointer_on_frame(void* data, struct wl_pointer* pointer)
             wayland_data = wl_surface_get_user_data(pointer_data->frame.surface);
             wayland_data->last_enter_serial = pointer_data->frame.enter_serial;
             wl_pointer_set_cursor(pointer, pointer_data->frame.enter_serial, NULL, 0, 0);
-            if (wayland_data->grabbed) {
-                pointer_data->frame.mask &= ~WL_POINTER_FRAME_MOTION;
+            if (wayland_data->locked_pointer) {
+                zwp_locked_pointer_v1_set_cursor_position_hint(wayland_data->locked_pointer, pointer_data->frame.x, pointer_data->frame.y);
             }
         }
     }
     if (pointer_data->frame.mask & WL_POINTER_FRAME_MOTION) {
         if (wayland_data) {
-            if (wayland_data->grabbed) wayland_data->win->on_mouse_move(wayland_data->win, pointer_data->x, pointer_data->y);
-            else wayland_data->win->on_mouse_place(wayland_data->win, pointer_data->x, pointer_data->y);
+            if (!wayland_data->grabbed) wayland_data->win->on_mouse_place(wayland_data->win, pointer_data->x, pointer_data->y);
         }
     }
     if (pointer_data->frame.mask & WL_POINTER_FRAME_BUTTON) {
@@ -784,6 +797,48 @@ static const struct wl_keyboard_listener keyboard_listener = {
     .repeat_info = wl_keyboard_on_repeat_info,
 };
 
+// zwp_relative_pointer_v1
+
+static void relative_pointer_on_relative_motion(void* data, struct zwp_relative_pointer_v1* relative_pointer, uint32_t utime_hi, uint32_t utime_lo, wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t dx_unaccel, wl_fixed_t dy_unaccel)
+{
+    struct pointer_data* pointer_data = data;
+    UNUSED(relative_pointer);
+    UNUSED(utime_hi);
+    UNUSED(utime_lo);
+    UNUSED(dx);
+    UNUSED(dy);
+
+    if (!pointer_data->entered_surface) return;
+    wayland_data_t* wayland_data = wl_surface_get_user_data(pointer_data->entered_surface);
+    if (!wayland_data->grabbed) return;
+    wayland_data->win->on_mouse_move(wayland_data->win, wl_fixed_to_int(dx_unaccel), wl_fixed_to_int(dy_unaccel));
+}
+
+static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
+    .relative_motion = relative_pointer_on_relative_motion,
+};
+
+// zwp_locked_pointer_v1
+
+static void zwp_locked_pointer_on_locked(void* data, struct zwp_locked_pointer_v1* locked_pointer)
+{
+    wayland_data_t* wayland_data = data;
+    UNUSED(locked_pointer);
+    wayland_data->grabbed = true;
+}
+
+static void zwp_locked_pointer_on_unlocked(void* data, struct zwp_locked_pointer_v1* locked_pointer)
+{
+    wayland_data_t* wayland_data = data;
+    UNUSED(locked_pointer);
+    wayland_data->grabbed = false;
+}
+
+static const struct zwp_locked_pointer_v1_listener locked_pointer_listener = {
+    .locked = zwp_locked_pointer_on_locked,
+    .unlocked = zwp_locked_pointer_on_unlocked,
+};
+
 // wl_seat
 
 static void wl_seat_on_capabilities(void* data, struct wl_seat* seat, uint32_t capabilities)
@@ -796,14 +851,26 @@ static void wl_seat_on_capabilities(void* data, struct wl_seat* seat, uint32_t c
         pointer_data->pointer = seat_data->pointer;
         wl_pointer_add_listener(pointer_data->pointer, &pointer_listener, pointer_data);
         wl_pointer_set_user_data(pointer_data->pointer, pointer_data);
+
+        if (relative_pointer_manager) {
+            pointer_data->relative_source = zwp_relative_pointer_manager_v1_get_relative_pointer(relative_pointer_manager, pointer_data->pointer);
+            zwp_relative_pointer_v1_add_listener(pointer_data->relative_source, &relative_pointer_listener, pointer_data);
+        }
     }
 
     if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
-        seat_data->keyboard = wl_seat_get_keyboard(seat);
+        rvvm_warn("kb ptr: %p", seat_data->keyboard);
+        struct wl_keyboard* kb = wl_seat_get_keyboard(seat);
         struct keyboard_data* keyboard_data = safe_new_obj(struct keyboard_data);
-        keyboard_data->keyboard = seat_data->keyboard;
-        wl_keyboard_add_listener(keyboard_data->keyboard, &keyboard_listener, keyboard_data);
-        wl_keyboard_set_user_data(keyboard_data->keyboard, keyboard_data);
+        rvvm_warn("kb ptr: %p", seat_data->keyboard);
+        keyboard_data->keyboard = kb;
+        wl_keyboard_add_listener(kb, &keyboard_listener, keyboard_data);
+        wl_keyboard_set_user_data(kb, keyboard_data);
+        rvvm_warn("kb ptr: %p", seat_data->keyboard);
+        seat_data->keyboard = kb;
+        rvvm_warn("kb ptr: %p", seat_data->keyboard);
+        rvvm_warn("touch ptr: %p", seat_data->touch);
+
     }
 
     if (capabilities & WL_SEAT_CAPABILITY_TOUCH) {
@@ -994,7 +1061,7 @@ static void wl_registry_on_global(void* data, struct wl_registry* registry, uint
         struct seat_data* seat_data = safe_new_obj(struct seat_data);
         global_data->data = seat_data;
         seat_data->seat = (struct wl_seat*)proxy;
-
+        hashmap_put(&seats, name, (size_t)(uintptr_t)seat_data);
         wl_seat_add_listener(seat_data->seat, &seat_listener, seat_data);
 
     } else if (rvvm_strcmp(interface, xdg_wm_base_interface.name) && version >= 3) {
@@ -1011,6 +1078,21 @@ static void wl_registry_on_global(void* data, struct wl_registry* registry, uint
     } else if (rvvm_strcmp(interface, zxdg_decoration_manager_v1_interface.name)) {
         proxy = wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, version);
         xdg_decoration_manager = (struct zxdg_decoration_manager_v1*)proxy;
+        global_data->global_type = GLOBAL_ANY;
+
+    } else if (rvvm_strcmp(interface, zwp_keyboard_shortcuts_inhibit_manager_v1_interface.name)) {
+        proxy = wl_registry_bind(registry, name, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface, version);
+        keyboard_shortcuts_inhibit_manager = (struct zwp_keyboard_shortcuts_inhibit_manager_v1*)proxy;
+        global_data->global_type = GLOBAL_ANY;
+
+    } else if (rvvm_strcmp(interface, zwp_pointer_constraints_v1_interface.name)) {
+        proxy = wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface, version);
+        pointer_constraints = (struct zwp_pointer_constraints_v1*)proxy;
+        global_data->global_type = GLOBAL_ANY;
+
+    } else if (rvvm_strcmp(interface, zwp_relative_pointer_manager_v1_interface.name)) {
+        proxy = wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface, version);
+        relative_pointer_manager = (struct zwp_relative_pointer_manager_v1*)proxy;
         global_data->global_type = GLOBAL_ANY;
 
     } else {
@@ -1040,6 +1122,8 @@ static bool wayland_init(void)
 {
 
     hashmap_init(&globals, 16);
+    hashmap_init(&seats, 1);
+    hashmap_init(&outputs, 1);
 #ifdef WAYLAND_DYNAMIC_LOADING
     dlib_ctx_t* libwayland = dlib_open("wayland-client", DLIB_NAME_PROBE);
     dlib_ctx_t* libxkbcommon = dlib_open("xkbcommon", DLIB_NAME_PROBE);
@@ -1151,6 +1235,50 @@ void wayland_window_set_fullscreen(gui_window_t *win, bool fullscreen)
     else xdg_toplevel_unset_fullscreen(wayland->xdg_toplevel);
 }
 
+void wayland_grab_input(gui_window_t *win, bool grab)
+{
+    rvvm_warn("Wayland grab input called");
+    wayland_data_t* wayland_data = win->data;
+    rvvm_warn("locked pointer: %p", wayland_data->locked_pointer);
+    rvvm_warn("keyboard shortcuts inhibitor: %p", wayland_data->keyboard_shortcuts_inhibitor);
+    if (grab) {
+        if (!wayland_data->locked_pointer) {
+            hashmap_foreach(&seats, key, seatptr) {
+                UNUSED(key);
+                struct seat_data* seat = (void*)(uintptr_t)seatptr;
+                if (seat->pointer) {
+                    wayland_data->locked_pointer = zwp_pointer_constraints_v1_lock_pointer(pointer_constraints, wayland_data->surface, seat->pointer, NULL, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+                    zwp_locked_pointer_v1_set_user_data(wayland_data->locked_pointer, wayland_data);
+                    zwp_locked_pointer_v1_add_listener(wayland_data->locked_pointer, &locked_pointer_listener, wayland_data);
+                    break;
+                }
+            }
+
+        }
+        if (!wayland_data->keyboard_shortcuts_inhibitor) {
+            hashmap_foreach(&seats, key, seatptr) {
+                UNUSED(key);
+                struct seat_data* seat = (void*)(uintptr_t)seatptr;
+                if (seat->keyboard) {
+                    wayland_data->keyboard_shortcuts_inhibitor = zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(keyboard_shortcuts_inhibit_manager, wayland_data->surface, seat->seat);
+                    break;
+                }
+            }
+        }
+    } else {
+        if (wayland_data->locked_pointer) {
+            zwp_locked_pointer_v1_destroy(wayland_data->locked_pointer);
+        }
+        if (wayland_data->keyboard_shortcuts_inhibitor) {
+            zwp_keyboard_shortcuts_inhibitor_v1_destroy(wayland_data->keyboard_shortcuts_inhibitor);
+        }
+        wl_display_roundtrip(display);
+        wayland_data->locked_pointer = NULL;
+        wayland_data->keyboard_shortcuts_inhibitor = NULL;
+        wayland_data->grabbed = false;
+    }
+}
+
 bool wayland_window_init(gui_window_t *win)
 {
     static bool libwayland_avail = false;
@@ -1212,6 +1340,10 @@ bool wayland_window_init(gui_window_t *win)
     win->remove = wayland_window_remove;
     win->set_title = wayland_window_set_title;
     win->set_fullscreen = wayland_window_set_fullscreen;
+
+    if (pointer_constraints && relative_pointer_manager) {
+        win->grab_input = wayland_grab_input;
+    }
 
     return true;
 }
