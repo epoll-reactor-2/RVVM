@@ -219,21 +219,18 @@ static size_t term_read(chardev_t* dev, void* buf, size_t nbytes)
 
 static size_t term_write(chardev_t* dev, const void* buf, size_t nbytes)
 {
-    if (term_poll(dev) & CHARDEV_TX) {
-        chardev_term_t* term = dev->data;
-        spin_lock(&term->lock);
-        size_t ret = ringbuf_write(&term->tx, buf, nbytes);
-        if (!ringbuf_space(&term->tx)) {
-            char buffer[257] = {0};
-            size_t tx_size = ringbuf_peek(&term->tx, buffer, sizeof(buffer) - 1);
-            term_push_io(term, buffer, NULL, &tx_size);
-            ringbuf_skip(&term->tx, tx_size);
-        }
-        term_update_flags(term);
-        spin_unlock(&term->lock);
-        return ret;
+    chardev_term_t* term = dev->data;
+    spin_lock(&term->lock);
+    size_t ret = ringbuf_write(&term->tx, buf, nbytes);
+    if (!ringbuf_space(&term->tx)) {
+        char buffer[257] = {0};
+        size_t tx_size = ringbuf_peek(&term->tx, buffer, sizeof(buffer) - 1);
+        term_push_io(term, buffer, NULL, &tx_size);
+        ringbuf_skip(&term->tx, tx_size);
     }
-    return 0;
+    term_update_flags(term);
+    spin_unlock(&term->lock);
+    return ret;
 }
 
 static void term_remove(chardev_t* dev)
