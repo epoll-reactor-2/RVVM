@@ -17,7 +17,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "vma_ops.h"
 #include "utils.h"
 #include "compiler.h"
-#include "xkb-keymap.h"
 #include "hashmap.h"
 
 #define WAYLAND_DYNAMIC_LOADING
