@@ -82,10 +82,7 @@ static void signal_handler(int sig)
             rvvm_warn("Fatal signal %d", sig);
             break;
     }
-    if (backtrace_full && bt_state) {
-        rvvm_warn("Stacktrace:");
-        stacktrace_print();
-    }
+    stacktrace_print();
     full_deinit();
     _Exit(-sig);
 }
@@ -147,6 +144,9 @@ void stacktrace_print(void)
 {
     stacktrace_init();
     if (backtrace_print && bt_state) {
+        rvvm_warn("Stacktrace:");
         backtrace_print(bt_state, 0, stderr);
+    } else {
+        DO_ONCE(rvvm_warn("Please install libbacktrace to obtain debug stacktraces"));
     }
 }
