@@ -212,6 +212,11 @@ bool gui_window_create(gui_window_t* win)
         if (haiku_window_init(win)) return true;
     }
 #endif
+#ifdef USE_WAYLAND
+    if (!rvvm_has_arg("gui") || rvvm_strcmp(rvvm_getarg("gui"), "wayland")) {
+        if (wayland_window_init(win)) return true;
+    }
+#endif
 #ifdef USE_X11
     if (!rvvm_has_arg("gui") || rvvm_strcmp(rvvm_getarg("gui"), "x11")) {
         if (x11_window_init(win)) return true;
