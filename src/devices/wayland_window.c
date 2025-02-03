@@ -26,9 +26,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XKB_DLIB_SYM(sym) static typeof(sym)* sym##_dlib = NULL;
 
 #if !(CHECK_INCLUDE(wayland-client-core.h, 1) && CHECK_INCLUDE(xkbcommon/xkbcommon.h, 1))
-// No X11 headers found
+// No Wayland and/or XKB headers found
 #undef USE_WAYLAND
-#warning Disabling Wayland support as <wayland-client.h> is unavailable
+#warning Disabling Wayland support as <wayland-client.h> and/or <xkbcommon/xkbcommon.h> is unavailable
 #endif
 
 #ifdef USE_WAYLAND

@@ -1,3 +1,7 @@
+/*
+wayland-window.h - Wayland protocols autogen for wayland backend
+*/
+
 #ifndef WAYLAND_CLIENT_PROTOCOL_H
 #define WAYLAND_CLIENT_PROTOCOL_H
 #ifdef __cplusplus
