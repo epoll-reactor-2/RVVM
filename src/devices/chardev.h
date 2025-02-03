@@ -22,9 +22,9 @@ typedef struct rvvm_chardev chardev_t;
 
 struct rvvm_chardev {
     // IO Dev -> Chardev calls
+    uint32_t (*poll)(chardev_t* dev);
     size_t (*read)(chardev_t* dev, void* buf, size_t nbytes);
     size_t (*write)(chardev_t* dev, const void* buf, size_t nbytes);
-    uint32_t (*poll)(chardev_t* dev);
 
     // Chardev -> IO Device notifications (IRQ)
     void   (*notify)(void* io_dev, uint32_t flags);
@@ -40,37 +40,49 @@ struct rvvm_chardev {
 #define CHARDEV_RX 0x1
 #define CHARDEV_TX 0x2
 
+static inline uint32_t chardev_poll(chardev_t* dev)
+{
+    if (dev && dev->poll) {
+        return dev->poll(dev);
+    }
+    return CHARDEV_TX;
+}
+
 static inline size_t chardev_read(chardev_t* dev, void* buf, size_t nbytes)
 {
-    if (dev) return dev->read(dev, buf, nbytes);
+    if (dev && dev->read) {
+        return dev->read(dev, buf, nbytes);
+    }
     return 0;
 }
 
 static inline size_t chardev_write(chardev_t* dev, const void* buf, size_t nbytes)
 {
-    if (dev) return dev->write(dev, buf, nbytes);
+    if (dev && dev->write) {
+        return dev->write(dev, buf, nbytes);
+    }
     return nbytes;
-}
-
-static inline uint32_t chardev_poll(chardev_t* dev)
-{
-    if (dev) return dev->poll(dev);
-    return CHARDEV_TX;
 }
 
 static inline void chardev_free(chardev_t* dev)
 {
-    if (dev && dev->remove) dev->remove(dev);
+    if (dev && dev->remove) {
+        dev->remove(dev);
+    }
 }
 
 static inline void chardev_update(chardev_t* dev)
 {
-    if (dev && dev->update) dev->update(dev);
+    if (dev && dev->update) {
+        dev->update(dev);
+    }
 }
 
 static inline void chardev_notify(chardev_t* dev, uint32_t flags)
 {
-    if (dev->notify) dev->notify(dev->io_dev, flags);
+    if (dev && dev->notify) {
+        dev->notify(dev->io_dev, flags);
+    }
 }
 
 // Built-in chardev implementations
