@@ -18,6 +18,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "utils.h"
 #include "compiler.h"
 #include "hashmap.h"
+#include "atomics.h"
 
 #define WAYLAND_DYNAMIC_LOADING
 
@@ -52,6 +53,7 @@ WAYLAND_DLIB_SYM(wl_proxy_marshal_flags)
 WAYLAND_DLIB_SYM(wl_proxy_add_listener)
 WAYLAND_DLIB_SYM(wl_proxy_set_user_data)
 WAYLAND_DLIB_SYM(wl_proxy_get_user_data)
+WAYLAND_DLIB_SYM(wl_proxy_destroy)
 
 #define wl_display_connect wl_display_connect_dlib
 #define wl_display_disconnect wl_display_disconnect_dlib
@@ -66,6 +68,7 @@ WAYLAND_DLIB_SYM(wl_proxy_get_user_data)
 #define wl_proxy_get_user_data wl_proxy_get_user_data_dlib
 #define wl_display_prepare_read wl_display_prepare_read_dlib
 #define wl_display_read_events wl_display_read_events_dlib
+#define wl_proxy_destroy wl_proxy_destroy_dlib
 
 XKB_DLIB_SYM(xkb_context_new)
 XKB_DLIB_SYM(xkb_context_unref)
@@ -182,6 +185,8 @@ struct output_data {
 
     struct wl_output* output;
     struct zxdg_output_v1* xdg_output;
+
+    int32_t refcounter;
 
 };
 
@@ -966,10 +971,18 @@ static void wl_surface_on_enter(void* data, struct wl_surface* wl_surface, struc
     UNUSED(wl_surface);
 
     wayland_data_t* wayland_data = data;
+
+    if (wayland_data->output) {
+        struct global_data* global_data = wl_output_get_user_data(wayland_data->output);
+        struct output_data* output_data = global_data->data;
+        output_data->refcounter--;
+    }
+
     wayland_data->output = output;
 
     struct global_data* global_data = wl_output_get_user_data(wayland_data->output);
     struct output_data* output_data = global_data->data;
+    output_data->refcounter++;
 
     if (!wayland_data->scale) wayland_data->scale = 1;
 
@@ -1044,6 +1057,7 @@ static void wl_registry_on_global(void* data, struct wl_registry* registry, uint
         global_data->data = output_data;
         global_data->global_type = GLOBAL_TYPE_OUTPUT;
         output_data->output = (struct wl_output*)proxy;
+        output_data->refcounter = 1;
 
         if (xdg_output_manager) {
             output_data->xdg_output = zxdg_output_manager_v1_get_xdg_output(xdg_output_manager, output_data->output);
@@ -1107,6 +1121,36 @@ static void wl_registry_on_global_remove(void* data, struct wl_registry* registr
     UNUSED(data);
     UNUSED(registry);
     UNUSED(name);
+
+    size_t val = hashmap_get(&globals, name);
+    if (!val) return;
+
+    struct global_data* global_data = (struct global_data*)(uintptr_t)val;
+    if (global_data->global_type == GLOBAL_TYPE_OUTPUT) {
+        struct output_data* output_data = global_data->data;
+        output_data->refcounter--;
+        if (output_data->refcounter <= 0) {
+            if (output_data->xdg_output) zxdg_output_v1_destroy(output_data->xdg_output);
+            wl_output_destroy(output_data->output);
+            safe_free(output_data);
+        }
+    } else if (global_data->global_type == GLOBAL_TYPE_SEAT) {
+        struct seat_data* seat_data = global_data->data;
+        if (seat_data->pointer) {
+            struct pointer_data* pointer_data = wl_pointer_get_user_data(seat_data->pointer);
+            if (pointer_data->relative_source) zwp_relative_pointer_v1_destroy(pointer_data->relative_source);
+            wl_pointer_destroy(seat_data->pointer);
+        }
+        if (seat_data->keyboard) {
+            struct keyboard_data* keyboard_data = wl_keyboard_get_user_data(seat_data->keyboard);
+            if (keyboard_data->keymap) xkb_keymap_unref(keyboard_data->keymap);
+            if (keyboard_data->state) xkb_state_unref(keyboard_data->state);
+            wl_keyboard_destroy(seat_data->keyboard);
+        }
+        if (seat_data->touch) wl_touch_destroy(seat_data->touch);
+        safe_free(seat_data);
+    }
+
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -1139,6 +1183,7 @@ static bool wayland_init(void)
     WAYLAND_DLIB_RESOLVE(libwayland, wl_proxy_set_user_data);
     WAYLAND_DLIB_RESOLVE(libwayland, wl_proxy_get_user_data);
     WAYLAND_DLIB_RESOLVE(libwayland, wl_display_read_events);
+    WAYLAND_DLIB_RESOLVE(libwayland, wl_proxy_destroy);
 
     XKB_DLIB_RESOLVE(libxkbcommon, xkb_context_new);
     XKB_DLIB_RESOLVE(libxkbcommon, xkb_context_unref);
@@ -1243,7 +1288,7 @@ void wayland_grab_input(gui_window_t *win, bool grab)
 {
     wayland_data_t* wayland_data = win->win_data;
     if (grab) {
-        if (!wayland_data->locked_pointer) {
+        if (!wayland_data->locked_pointer && pointer_constraints) {
             hashmap_foreach(&seats, key, seatptr) {
                 UNUSED(key);
                 struct seat_data* seat = (void*)(uintptr_t)seatptr;
@@ -1256,7 +1301,7 @@ void wayland_grab_input(gui_window_t *win, bool grab)
             }
 
         }
-        if (!wayland_data->keyboard_shortcuts_inhibitor) {
+        if (!wayland_data->keyboard_shortcuts_inhibitor && keyboard_shortcuts_inhibit_manager) {
             hashmap_foreach(&seats, key, seatptr) {
                 UNUSED(key);
                 struct seat_data* seat = (void*)(uintptr_t)seatptr;
