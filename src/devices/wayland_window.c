@@ -88,7 +88,7 @@ XKB_DLIB_SYM(xkb_keymap_unref)
 
 // Autogen start
 
-#include "autogenfile.h"
+#include "wayland_window.h"
 
 // Autogen end
 
@@ -253,7 +253,8 @@ static void wl_output_on_geometry(
     int32_t subpixel, const char* make, const char* model, int32_t transform
 )
 {
-    struct output_data* output_data = data;
+    struct global_data* global_data = data;
+    struct output_data* output_data = global_data->data;
     UNUSED(output);
     UNUSED(x);
     UNUSED(y);
@@ -295,14 +296,16 @@ static void wl_output_on_description(void* data, struct wl_output* output, const
 
 static void wl_output_on_done(void* data, struct wl_output* output)
 {
-    struct output_data* output_data = data;
+    struct global_data* global_data = data;
+    struct output_data* output_data = global_data->data;
     UNUSED(output);
     output_data->done = true;
 }
 
 static void wl_output_on_scale(void* data, struct wl_output* output, int32_t scale)
 {
-    struct output_data* output_data = data;
+    struct global_data* global_data = data;
+    struct output_data* output_data = global_data->data;
     UNUSED(output);
     output_data->scale = scale;
 }
@@ -843,7 +846,8 @@ static const struct zwp_locked_pointer_v1_listener locked_pointer_listener = {
 
 static void wl_seat_on_capabilities(void* data, struct wl_seat* seat, uint32_t capabilities)
 {
-    struct seat_data* seat_data = data;
+    struct global_data* global_data = data;
+    struct seat_data* seat_data = global_data->data;
 
     if (capabilities & WL_SEAT_CAPABILITY_POINTER) {
         seat_data->pointer = wl_seat_get_pointer(seat);
@@ -859,17 +863,12 @@ static void wl_seat_on_capabilities(void* data, struct wl_seat* seat, uint32_t c
     }
 
     if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
-        rvvm_warn("kb ptr: %p", seat_data->keyboard);
         struct wl_keyboard* kb = wl_seat_get_keyboard(seat);
         struct keyboard_data* keyboard_data = safe_new_obj(struct keyboard_data);
-        rvvm_warn("kb ptr: %p", seat_data->keyboard);
         keyboard_data->keyboard = kb;
         wl_keyboard_add_listener(kb, &keyboard_listener, keyboard_data);
         wl_keyboard_set_user_data(kb, keyboard_data);
-        rvvm_warn("kb ptr: %p", seat_data->keyboard);
         seat_data->keyboard = kb;
-        rvvm_warn("kb ptr: %p", seat_data->keyboard);
-        rvvm_warn("touch ptr: %p", seat_data->touch);
 
     }
 
@@ -1052,7 +1051,7 @@ static void wl_registry_on_global(void* data, struct wl_registry* registry, uint
             zxdg_output_v1_add_listener(output_data->xdg_output, &xdg_output_listener, output_data);
         }
 
-        wl_output_add_listener(output_data->output, &output_listener, output_data);
+        wl_output_add_listener(output_data->output, &output_listener, NULL);
 
     } else if (rvvm_strcmp(interface, "wl_seat")) {
         proxy = wl_registry_bind(registry, name, &wl_seat_interface, version);
@@ -1062,7 +1061,7 @@ static void wl_registry_on_global(void* data, struct wl_registry* registry, uint
         global_data->data = seat_data;
         seat_data->seat = (struct wl_seat*)proxy;
         hashmap_put(&seats, name, (size_t)(uintptr_t)seat_data);
-        wl_seat_add_listener(seat_data->seat, &seat_listener, seat_data);
+        wl_seat_add_listener(seat_data->seat, &seat_listener, NULL);
 
     } else if (rvvm_strcmp(interface, xdg_wm_base_interface.name) && version >= 3) {
         proxy = wl_registry_bind(registry, name, &xdg_wm_base_interface, version);
@@ -1174,6 +1173,12 @@ static bool wayland_init(void)
     wl_display_roundtrip(display);
     wl_display_roundtrip(display);
 
+    rvvm_info("Wayland backend initialized.");
+    rvvm_info("Available features:");
+    rvvm_info(" - Decorations: %s", xdg_decoration_manager ? "Available" : "Not available");
+    rvvm_info(" - Pointer input grab: %s", (pointer_constraints && relative_pointer_manager) ? "Available" : "Not available");
+    rvvm_info(" - Keyboard input grab: %s", keyboard_shortcuts_inhibit_manager ? "Available" : "Not available");
+
     return true;
 }
 
@@ -1237,10 +1242,7 @@ void wayland_window_set_fullscreen(gui_window_t *win, bool fullscreen)
 
 void wayland_grab_input(gui_window_t *win, bool grab)
 {
-    rvvm_warn("Wayland grab input called");
-    wayland_data_t* wayland_data = win->data;
-    rvvm_warn("locked pointer: %p", wayland_data->locked_pointer);
-    rvvm_warn("keyboard shortcuts inhibitor: %p", wayland_data->keyboard_shortcuts_inhibitor);
+    wayland_data_t* wayland_data = win->win_data;
     if (grab) {
         if (!wayland_data->locked_pointer) {
             hashmap_foreach(&seats, key, seatptr) {
@@ -1353,7 +1355,6 @@ bool wayland_window_init(gui_window_t *win)
 bool wayland_window_init(gui_window_t *win)
 {
     UNUSED(win);
-    rvvm_warn("Wayland init called");
     return false;
 }
 
