@@ -192,42 +192,48 @@ static void term_update(chardev_t* dev)
     }
 }
 
-static size_t term_read(chardev_t* dev, void* buf, size_t nbytes)
+static uint32_t term_poll(chardev_t* dev)
 {
     chardev_term_t* term = dev->data;
-    spin_lock(&term->lock);
-    size_t ret = ringbuf_read(&term->rx, buf, nbytes);
-    if (!ringbuf_avail(&term->rx)) {
-        char buffer[256] = {0};
-        size_t rx_size = sizeof(buffer);
-        term_push_io(term, buffer, &rx_size, NULL);
-        ringbuf_write(&term->rx, buffer, rx_size);
+    return atomic_load_uint32_relax(&term->flags);
+}
+
+static size_t term_read(chardev_t* dev, void* buf, size_t nbytes)
+{
+    if (term_poll(dev) & CHARDEV_RX) {
+        chardev_term_t* term = dev->data;
+        spin_lock(&term->lock);
+        size_t ret = ringbuf_read(&term->rx, buf, nbytes);
+        if (!ringbuf_avail(&term->rx)) {
+            char buffer[256] = {0};
+            size_t rx_size = sizeof(buffer);
+            term_push_io(term, buffer, &rx_size, NULL);
+            ringbuf_write(&term->rx, buffer, rx_size);
+        }
+        term_update_flags(term);
+        spin_unlock(&term->lock);
+        return ret;
     }
-    term_update_flags(term);
-    spin_unlock(&term->lock);
-    return ret;
+    return 0;
 }
 
 static size_t term_write(chardev_t* dev, const void* buf, size_t nbytes)
 {
-    chardev_term_t* term = dev->data;
-    spin_lock(&term->lock);
-    size_t ret = ringbuf_write(&term->tx, buf, nbytes);
-    if (!ringbuf_space(&term->tx)) {
-        char buffer[257] = {0};
-        size_t tx_size = ringbuf_peek(&term->tx, buffer, sizeof(buffer) - 1);
-        term_push_io(term, buffer, NULL, &tx_size);
-        ringbuf_skip(&term->tx, tx_size);
+    if (term_poll(dev) & CHARDEV_TX) {
+        chardev_term_t* term = dev->data;
+        spin_lock(&term->lock);
+        size_t ret = ringbuf_write(&term->tx, buf, nbytes);
+        if (!ringbuf_space(&term->tx)) {
+            char buffer[257] = {0};
+            size_t tx_size = ringbuf_peek(&term->tx, buffer, sizeof(buffer) - 1);
+            term_push_io(term, buffer, NULL, &tx_size);
+            ringbuf_skip(&term->tx, tx_size);
+        }
+        term_update_flags(term);
+        spin_unlock(&term->lock);
+        return ret;
     }
-    term_update_flags(term);
-    spin_unlock(&term->lock);
-    return ret;
-}
-
-static uint32_t term_poll(chardev_t* dev)
-{
-    chardev_term_t* term = dev->data;
-    return atomic_load_uint32(&term->flags);
+    return 0;
 }
 
 static void term_remove(chardev_t* dev)
