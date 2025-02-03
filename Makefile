@@ -300,6 +300,7 @@ override SRC_USE_WIN32_GUI := $(SRCDIR)/devices/win32window.c
 override SRC_CXX_USE_HAIKU_GUI := $(SRCDIR)/devices/haiku_window.cpp
 override SRC_USE_X11 := $(SRCDIR)/devices/x11window_xlib.c
 override SRC_USE_SDL := $(SRCDIR)/devices/sdl_window.c
+override SRC_USE_WAYLAND := $(SRCDIR)/devices/wayland_window.c
 
 override SRC_USE_TAP_LINUX := $(SRCDIR)/devices/tap_linux.c
 override SRC_USE_NET := $(SRCDIR)/networking.c $(SRCDIR)/devices/tap_user.c
@@ -324,6 +325,7 @@ override LDFLAGS_USE_FPU := -lm
 # Useflag dependencies
 override NEED_USE_X11 := USE_GUI
 override NEED_USE_SDL := USE_GUI
+override NEED_USE_WAYLAND := USE_GUI
 override NEED_USE_JNI := USE_LIB
 
 #
