@@ -77,7 +77,7 @@ struct cond_var {
 #if defined(_WIN32) && !defined(HOST_64BIT)
 // Wrap our function call to hide calling convention details
 typedef struct { thread_func_t func; void* arg; } thread_win32_wrap_t;
-static __stdcall DWORD thread_win32_wrap(void* arg)
+static DWORD __stdcall thread_win32_wrap(void* arg)
 {
     thread_win32_wrap_t wrap = *(thread_win32_wrap_t*)arg;
     free(arg);
