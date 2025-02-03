@@ -174,7 +174,7 @@ static inline size_t pci_bus_addr_to_id_internal(pci_bus_addr_t bus_addr)
     return (bus_addr < 0x100) ? (bus_addr >> 3) : ((bus_addr >> 8) + PCI_BUS_DEVS);
 }
 
-static inline size_t pci_bus_addr_valid(pci_bus_addr_t bus_addr)
+static inline bool pci_bus_addr_valid(pci_bus_addr_t bus_addr)
 {
     return (bus_addr < 0x100) || !(bus_addr & 0xF8);
 }
@@ -291,7 +291,7 @@ static pci_func_t* pci_attach_func_internal(pci_bus_t* bus, const pci_func_desc_
 }
 
 // Check whether this BAR is an upper half for a previous 64-bit BAR
-static inline size_t pci_bar_is_upper_half(pci_func_t* func, size_t bar_id)
+static inline bool pci_bar_is_upper_half(pci_func_t* func, size_t bar_id)
 {
     return bar_id && !func->bar[bar_id] && func->bar[bar_id - 1];
 }
@@ -371,7 +371,7 @@ static bool pci_bus_read(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, u
         case PCI_REG_BAR3:
         case PCI_REG_BAR4:
         case PCI_REG_BAR5: {
-            uint8_t bar_id = (reg - PCI_REG_BAR0) >> 2;
+            size_t bar_id = (reg - PCI_REG_BAR0) >> 2;
             // Only BAR0 & BAR1 exist for a PCI-PCI bridge
             if (func->class_code != 0x0604 || bar_id < 2) {
                 rvvm_mmio_dev_t* bar = pci_effective_bar(func, bar_id);
@@ -480,13 +480,13 @@ static bool pci_bus_write(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, 
         case PCI_REG_BAR3:
         case PCI_REG_BAR4:
         case PCI_REG_BAR5: {
-            uint8_t bar_id = (reg - PCI_REG_BAR0) >> 2;
+            size_t bar_id = (reg - PCI_REG_BAR0) >> 2;
             // Only BAR0 & BAR1 exist for a PCI-PCI bridge
             if (func->class_code != 0x0604 || bar_id < 2) {
                 rvvm_mmio_dev_t* bar = pci_effective_bar(func, bar_id);
                 if (bar) {
                     rvvm_addr_t bar_addr = bar->addr;
-                    size_t bar_size = bit_next_pow2(bar->size);
+                    rvvm_addr_t bar_size = bit_next_pow2(bar->size);
                     if (pci_bar_is_upper_half(func, bar_id)) {
                         // This is an upper half of a 64-bit BAR
                         bar_addr = bit_replace(bar_addr, 32, 32, val);
@@ -515,7 +515,7 @@ static bool pci_bus_write(rvvm_mmio_dev_t* mmio_dev, void* data, size_t offset, 
         case PCI_REG_EXPANSION_ROM:
             if (func->expansion_rom) {
                 rvvm_addr_t rom_addr = val & ~0xFFFU;
-                size_t rom_size = bit_next_pow2(func->expansion_rom->size);
+                rvvm_addr_t rom_size = bit_next_pow2(func->expansion_rom->size);
                 func->expansion_rom->addr = rom_addr & ~(rom_size - 1);
                 atomic_fence();
             }
@@ -727,7 +727,7 @@ PUBLIC pci_dev_t* pci_attach_multifunc(pci_bus_t* bus, const pci_dev_desc_t* des
 PUBLIC pci_dev_t* pci_attach_func_at(pci_bus_t* bus, const pci_func_desc_t* desc, pci_bus_addr_t bus_addr)
 {
     pci_dev_t* dev = pci_get_bus_device(bus, bus_addr);
-    uint8_t func_id = bus_addr & 0x7;
+    size_t func_id = bus_addr & 0x7;
     if (dev) {
         // Inject a function into an existing device
         pci_func_t* func = pci_attach_func_internal(bus, desc, bus_addr);
