@@ -4812,3 +4812,125 @@ WL_PRIVATE const struct wl_interface zwp_tablet_pad_v2_interface = {
  2, zwp_tablet_pad_v2_requests,
  8, zwp_tablet_pad_v2_events,
 };
+#ifndef TEARING_CONTROL_V1_CLIENT_PROTOCOL_H
+#define TEARING_CONTROL_V1_CLIENT_PROTOCOL_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+struct wl_surface;
+struct wp_tearing_control_manager_v1;
+struct wp_tearing_control_v1;
+#ifndef WP_TEARING_CONTROL_MANAGER_V1_INTERFACE
+#define WP_TEARING_CONTROL_MANAGER_V1_INTERFACE
+extern const struct wl_interface wp_tearing_control_manager_v1_interface;
+#endif
+#ifndef WP_TEARING_CONTROL_V1_INTERFACE
+#define WP_TEARING_CONTROL_V1_INTERFACE
+extern const struct wl_interface wp_tearing_control_v1_interface;
+#endif
+#ifndef WP_TEARING_CONTROL_MANAGER_V1_ERROR_ENUM
+#define WP_TEARING_CONTROL_MANAGER_V1_ERROR_ENUM
+enum wp_tearing_control_manager_v1_error {
+ WP_TEARING_CONTROL_MANAGER_V1_ERROR_TEARING_CONTROL_EXISTS = 0,
+};
+#endif
+#define WP_TEARING_CONTROL_MANAGER_V1_DESTROY 0
+#define WP_TEARING_CONTROL_MANAGER_V1_GET_TEARING_CONTROL 1
+#define WP_TEARING_CONTROL_MANAGER_V1_DESTROY_SINCE_VERSION 1
+#define WP_TEARING_CONTROL_MANAGER_V1_GET_TEARING_CONTROL_SINCE_VERSION 1
+static inline void
+wp_tearing_control_manager_v1_set_user_data(struct wp_tearing_control_manager_v1 *wp_tearing_control_manager_v1, void *user_data)
+{
+ wl_proxy_set_user_data((struct wl_proxy *) wp_tearing_control_manager_v1, user_data);
+}
+static inline void *
+wp_tearing_control_manager_v1_get_user_data(struct wp_tearing_control_manager_v1 *wp_tearing_control_manager_v1)
+{
+ return wl_proxy_get_user_data((struct wl_proxy *) wp_tearing_control_manager_v1);
+}
+static inline uint32_t
+wp_tearing_control_manager_v1_get_version(struct wp_tearing_control_manager_v1 *wp_tearing_control_manager_v1)
+{
+ return wl_proxy_get_version((struct wl_proxy *) wp_tearing_control_manager_v1);
+}
+static inline void
+wp_tearing_control_manager_v1_destroy(struct wp_tearing_control_manager_v1 *wp_tearing_control_manager_v1)
+{
+ wl_proxy_marshal_flags((struct wl_proxy *) wp_tearing_control_manager_v1,
+    WP_TEARING_CONTROL_MANAGER_V1_DESTROY, NULL, wl_proxy_get_version((struct wl_proxy *) wp_tearing_control_manager_v1), WL_MARSHAL_FLAG_DESTROY);
+}
+static inline struct wp_tearing_control_v1 *
+wp_tearing_control_manager_v1_get_tearing_control(struct wp_tearing_control_manager_v1 *wp_tearing_control_manager_v1, struct wl_surface *surface)
+{
+ struct wl_proxy *id;
+ id = wl_proxy_marshal_flags((struct wl_proxy *) wp_tearing_control_manager_v1,
+    WP_TEARING_CONTROL_MANAGER_V1_GET_TEARING_CONTROL, &wp_tearing_control_v1_interface, wl_proxy_get_version((struct wl_proxy *) wp_tearing_control_manager_v1), 0, NULL, surface);
+ return (struct wp_tearing_control_v1 *) id;
+}
+#ifndef WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ENUM
+#define WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ENUM
+enum wp_tearing_control_v1_presentation_hint {
+ WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC = 0,
+ WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC = 1,
+};
+#endif
+#define WP_TEARING_CONTROL_V1_SET_PRESENTATION_HINT 0
+#define WP_TEARING_CONTROL_V1_DESTROY 1
+#define WP_TEARING_CONTROL_V1_SET_PRESENTATION_HINT_SINCE_VERSION 1
+#define WP_TEARING_CONTROL_V1_DESTROY_SINCE_VERSION 1
+static inline void
+wp_tearing_control_v1_set_user_data(struct wp_tearing_control_v1 *wp_tearing_control_v1, void *user_data)
+{
+ wl_proxy_set_user_data((struct wl_proxy *) wp_tearing_control_v1, user_data);
+}
+static inline void *
+wp_tearing_control_v1_get_user_data(struct wp_tearing_control_v1 *wp_tearing_control_v1)
+{
+ return wl_proxy_get_user_data((struct wl_proxy *) wp_tearing_control_v1);
+}
+static inline uint32_t
+wp_tearing_control_v1_get_version(struct wp_tearing_control_v1 *wp_tearing_control_v1)
+{
+ return wl_proxy_get_version((struct wl_proxy *) wp_tearing_control_v1);
+}
+static inline void
+wp_tearing_control_v1_set_presentation_hint(struct wp_tearing_control_v1 *wp_tearing_control_v1, uint32_t hint)
+{
+ wl_proxy_marshal_flags((struct wl_proxy *) wp_tearing_control_v1,
+    WP_TEARING_CONTROL_V1_SET_PRESENTATION_HINT, NULL, wl_proxy_get_version((struct wl_proxy *) wp_tearing_control_v1), 0, hint);
+}
+static inline void
+wp_tearing_control_v1_destroy(struct wp_tearing_control_v1 *wp_tearing_control_v1)
+{
+ wl_proxy_marshal_flags((struct wl_proxy *) wp_tearing_control_v1,
+    WP_TEARING_CONTROL_V1_DESTROY, NULL, wl_proxy_get_version((struct wl_proxy *) wp_tearing_control_v1), WL_MARSHAL_FLAG_DESTROY);
+}
+#ifdef __cplusplus
+}
+#endif
+#endif
+extern const struct wl_interface wl_surface_interface;
+extern const struct wl_interface wp_tearing_control_v1_interface;
+static const struct wl_interface *tearing_control_v1_types[] = {
+ NULL,
+ &wp_tearing_control_v1_interface,
+ &wl_surface_interface,
+};
+static const struct wl_message wp_tearing_control_manager_v1_requests[] = {
+ { "destroy", "", tearing_control_v1_types + 0 },
+ { "get_tearing_control", "no", tearing_control_v1_types + 1 },
+};
+const struct wl_interface wp_tearing_control_manager_v1_interface = {
+ "wp_tearing_control_manager_v1", 1,
+ 2, wp_tearing_control_manager_v1_requests,
+ 0, NULL,
+};
+static const struct wl_message wp_tearing_control_v1_requests[] = {
+ { "set_presentation_hint", "u", tearing_control_v1_types + 0 },
+ { "destroy", "", tearing_control_v1_types + 0 },
+};
+const struct wl_interface wp_tearing_control_v1_interface = {
+ "wp_tearing_control_v1", 1,
+ 2, wp_tearing_control_v1_requests,
+ 0, NULL,
+};
