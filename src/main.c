@@ -31,6 +31,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "devices/riscv-aplic.h"
 #include "devices/riscv-aclint.h"
 #include "devices/riscv-plic.h"
+#include "devices/intel-hda.h"
 #include "devices/syscon.h"
 #include "devices/rtc-goldfish.h"
 #include "devices/ns16550a.h"
@@ -133,6 +134,11 @@ static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_de
     int arg_iter = 1;
     const char* arg_name = NULL;
     const char* arg_val = NULL;
+
+    if (!intel_hda_init_auto(machine)) {
+        rvvm_error("Failed to attach Intel HDA device");
+    }
+
     while ((arg_name = rvvm_next_arg(&arg_val, &arg_iter))) {
         if (arg_val) {
             if (rvvm_strcmp(arg_name, "i") || rvvm_strcmp(arg_name, "image") || rvvm_strcmp(arg_name, "nvme")) {
