@@ -1202,7 +1202,6 @@ static bool wayland_init(void)
     rvvm_info("Initializing wayland backend");
     display = wl_display_connect(NULL);
     if (!display) {
-        rvvm_warn("Failed to connect to Wayland display");
         return false;
     }
 
@@ -1330,7 +1329,6 @@ bool wayland_window_init(gui_window_t *win)
     static bool libwayland_avail = false;
     DO_ONCE(libwayland_avail = wayland_init());
     if (!libwayland_avail) {
-        rvvm_warn("Failed to load libwayland-client!");
         return false;
     }
 
