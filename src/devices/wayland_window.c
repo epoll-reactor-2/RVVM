@@ -1279,8 +1279,8 @@ void wayland_window_remove(gui_window_t *win)
     wl_surface_attach(wayland->surface, NULL, 0, 0);
     wl_surface_commit(wayland->surface);
     wl_display_roundtrip(display);
-    zxdg_toplevel_decoration_v1_destroy(wayland->xdg_decoration);
-    wp_tearing_control_v1_destroy(wayland->tearing_control);
+    if (wayland->xdg_decoration) zxdg_toplevel_decoration_v1_destroy(wayland->xdg_decoration);
+    if (wayland->tearing_control) wp_tearing_control_v1_destroy(wayland->tearing_control);
     xdg_toplevel_destroy(wayland->xdg_toplevel);
     xdg_surface_destroy(wayland->xdg_surface);
     wl_surface_destroy(wayland->surface);
