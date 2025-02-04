@@ -19,6 +19,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "compiler.h"
 #include "hashmap.h"
 #include "atomics.h"
+#include "threading.h"
 
 #define WAYLAND_DYNAMIC_LOADING
 
@@ -88,6 +89,8 @@ XKB_DLIB_SYM(xkb_keymap_unref)
 
 #endif
 
+thread_ctx_t* wayland_evloop_thread = NULL;
+
 // Autogen start
 
 #include "wayland_window.h"
@@ -105,6 +108,7 @@ static struct zxdg_decoration_manager_v1* xdg_decoration_manager = NULL;
 static struct zwp_relative_pointer_manager_v1* relative_pointer_manager = NULL;
 static struct zwp_pointer_constraints_v1* pointer_constraints = NULL;
 static struct zwp_keyboard_shortcuts_inhibit_manager_v1 *keyboard_shortcuts_inhibit_manager = NULL;
+static struct wp_tearing_control_manager_v1* tearing_control_manager = NULL;
 
 struct xkb_context* xkb_context = NULL;
 
@@ -127,6 +131,9 @@ typedef struct {
     struct xdg_surface* xdg_surface;
     struct xdg_toplevel* xdg_toplevel;
     struct zxdg_toplevel_decoration_v1* xdg_decoration;
+
+    // Tearing control
+    struct wp_tearing_control_v1* tearing_control;
 
     // Serials
     uint32_t configure_serial;
@@ -458,8 +465,11 @@ static void wl_pointer_on_frame(void* data, struct wl_pointer* pointer)
                 zwp_locked_pointer_v1_set_cursor_position_hint(wayland_data->locked_pointer, pointer_data->frame.x, pointer_data->frame.y);
             }
         }
+        pointer_data->entered_surface = pointer_data->frame.surface;
     }
     if (pointer_data->frame.mask & WL_POINTER_FRAME_MOTION) {
+        pointer_data->x = pointer_data->frame.x;
+        pointer_data->y = pointer_data->frame.y;
         if (wayland_data) {
             if (!wayland_data->grabbed) wayland_data->win->on_mouse_place(wayland_data->win, pointer_data->x, pointer_data->y);
         }
@@ -914,7 +924,11 @@ static void xdg_surface_on_configure(void* data, struct xdg_surface* xdg_surface
 
     if (!wayland_data->configure_serial) {
         wl_surface_attach(wayland_data->surface, wayland_data->buffer, 0, 0);
+        struct wl_region *region = wl_compositor_create_region(compositor);
+        wl_region_add(region, 0, 0, wayland_data->win->fb.width, wayland_data->win->fb.height);
+        wl_surface_set_opaque_region(wayland_data->surface, region);
         wl_surface_commit(wayland_data->surface);
+        wl_region_destroy(region);
     }
 
     wayland_data->configure_serial = serial;
@@ -1107,6 +1121,11 @@ static void wl_registry_on_global(void* data, struct wl_registry* registry, uint
         relative_pointer_manager = (struct zwp_relative_pointer_manager_v1*)proxy;
         global_data->global_type = GLOBAL_ANY;
 
+    } else if (rvvm_strcmp(interface, wp_tearing_control_manager_v1_interface.name)) {
+        proxy = wl_registry_bind(registry, name, &wp_tearing_control_manager_v1_interface, version);
+        tearing_control_manager = (struct wp_tearing_control_manager_v1*)proxy;
+        global_data->global_type = GLOBAL_ANY;
+
     } else {
         safe_free(global_data);
         return;
@@ -1159,6 +1178,14 @@ static const struct wl_registry_listener registry_listener = {
 };
 
 // ----------------------------------------------------
+
+void* wayland_eventloop(void* data)
+{
+    UNUSED(data);
+    while (wl_display_dispatch(display) != -1);
+    rvvm_warn("Wayland connection broken.");
+    return NULL;
+}
 
 static bool wayland_init(void)
 {
@@ -1221,6 +1248,12 @@ static bool wayland_init(void)
     rvvm_info(" - Decorations: %s", xdg_decoration_manager ? "Available" : "Not available");
     rvvm_info(" - Pointer input grab: %s", (pointer_constraints && relative_pointer_manager) ? "Available" : "Not available");
     rvvm_info(" - Keyboard input grab: %s", keyboard_shortcuts_inhibit_manager ? "Available" : "Not available");
+    rvvm_info(" - Tearing control hints: %s", tearing_control_manager ? "Available" : "Not available");
+
+    wayland_evloop_thread = thread_create(wayland_eventloop, NULL);
+    if (!wayland_evloop_thread) {
+        return false;
+    }
 
     return true;
 }
@@ -1235,23 +1268,8 @@ void wayland_window_draw(gui_window_t *win)
     wl_surface_attach(wayland->surface, wayland->buffer, 0, 0);
     wl_surface_damage_buffer(wayland->surface, 0, 0, INT32_MAX, INT32_MAX);
     wl_surface_commit(wayland->surface);
-}
 
-void wayland_window_poll(gui_window_t *win)
-{
-    UNUSED(win);
-    if (wl_display_prepare_read(display) == -1) {
-  		wl_display_dispatch_pending(display);
-  		return;
-    }
-
-    while (true) {
-		int ret = wl_display_flush(display);
-
-		if (ret != -1 || errno != EAGAIN)
-			break;
-	}
-    wl_display_read_events(display);
+    wl_display_flush(display);
 }
 
 void wayland_window_remove(gui_window_t *win)
@@ -1261,7 +1279,8 @@ void wayland_window_remove(gui_window_t *win)
     wl_surface_attach(wayland->surface, NULL, 0, 0);
     wl_surface_commit(wayland->surface);
     wl_display_roundtrip(display);
-    zxdg_toplevel_decoration_v1_destroy(wayland->xdg_decoration);
+    if (wayland->xdg_decoration) zxdg_toplevel_decoration_v1_destroy(wayland->xdg_decoration);
+    if (wayland->tearing_control) wp_tearing_control_v1_destroy(wayland->tearing_control);
     xdg_toplevel_destroy(wayland->xdg_toplevel);
     xdg_surface_destroy(wayland->xdg_surface);
     wl_surface_destroy(wayland->surface);
@@ -1364,6 +1383,12 @@ bool wayland_window_init(gui_window_t *win)
         zxdg_toplevel_decoration_v1_set_mode(xdg_decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
 
+    if (tearing_control_manager) {
+        struct wp_tearing_control_v1* tearing_control = wp_tearing_control_manager_v1_get_tearing_control(tearing_control_manager, surface);
+        wp_tearing_control_v1_set_presentation_hint(tearing_control, WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC);
+        wayland->tearing_control = tearing_control;
+    }
+
     xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, wayland);
     xdg_toplevel_add_listener(xdg_toplevel, &xdg_toplevel_listener, wayland);
 
@@ -1380,7 +1405,6 @@ bool wayland_window_init(gui_window_t *win)
 
     win->win_data = wayland;
     win->draw = wayland_window_draw;
-    win->poll = wayland_window_poll;
     win->remove = wayland_window_remove;
     win->set_title = wayland_window_set_title;
     win->set_fullscreen = wayland_window_set_fullscreen;
