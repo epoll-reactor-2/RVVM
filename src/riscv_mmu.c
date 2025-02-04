@@ -498,8 +498,8 @@ no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
     size_t size = attr >> 16;
 
     if (unlikely(!riscv_block_in_page(vaddr, size))) {
-        if (attr & RISCV_MMU_ATTR_RMW) {
-            // Can't get RMW pointer to data spanning multiple pages
+        if (attr & RISCV_MMU_ATTR_PTR) {
+            // Can't get pointer to data spanning multiple pages
             riscv_mmu_misalign(vm, vaddr, attr);
             return NULL;
         } else {
@@ -527,7 +527,7 @@ no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
         if (likely(ptr)) {
             // Physical address in main memory, cache address translation
             riscv_tlb_put(vm, vaddr, ptr, access);
-            if (likely(!(attr & RISCV_MMU_ATTR_RMW))) {
+            if (likely(!(attr & RISCV_MMU_ATTR_PTR))) {
                 // Perform actual load/store on translated pointer
                 if (access == RISCV_MMU_WRITE) {
                     atomic_memcpy_relaxed(ptr, data, size);
@@ -544,7 +544,7 @@ no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
 
         if (likely(data)) {
             // Attempt to access MMIO
-            uint8_t mmio_access = (attr & RISCV_MMU_ATTR_RMW) ? RISCV_MMU_READ : access;
+            uint8_t mmio_access = (attr & RISCV_MMU_ATTR_PTR) ? RISCV_MMU_READ : access;
             if (riscv_mmio_scan(vm, vaddr, paddr, data, size, mmio_access)) {
                 return data;
             }

@@ -31,15 +31,26 @@ static forceinline void riscv_emulate_atomic_w(rvvm_hart_t* vm, const uint32_t i
     const xaddr_t vaddr = riscv_read_reg(vm, rs1);
     const uint32_t val = riscv_read_reg(vm, rs2);
     // MMIO atomics bounce buffer
-    uint32_t bounce;
+    uint32_t bounce = 0;
+    void* ptr = NULL;
 
     if (unlikely(vaddr & 3)) {
-        riscv_trap(vm, RISCV_TRAP_STORE_MISALIGN, vaddr);
+        // Misaligned atomic
+        uint32_t cause = (op == RISCV_AMO_LR) ? RISCV_TRAP_LOAD_MISALIGN : RISCV_TRAP_STORE_MISALIGN;
+        riscv_trap(vm, cause, vaddr);
         return;
     }
 
-    void* ptr = riscv_rmw_translate(vm, vaddr, &bounce, sizeof(bounce));
-    if (unlikely(ptr == NULL)) return;
+    if (op == RISCV_AMO_LR) {
+        ptr = riscv_ro_translate(vm, vaddr, &bounce, sizeof(bounce));
+    } else {
+        ptr = riscv_rmw_translate(vm, vaddr, &bounce, sizeof(bounce));
+    }
+
+    if (unlikely(!ptr)) {
+        // Pagefault
+        return;
+    }
 
     switch (op) {
         case RISCV_AMO_LR:
@@ -48,15 +59,21 @@ static forceinline void riscv_emulate_atomic_w(rvvm_hart_t* vm, const uint32_t i
             vm->lrsc_addr = vaddr;
             vm->lrsc_cas = atomic_load_uint32_le(ptr);
             riscv_write_reg(vm, rds, (int32_t)vm->lrsc_cas);
-            break;
+
+            // Return to skip RMW MMIO commit
+            return;
         case RISCV_AMO_SC:
             // If our reservation is valid, perform a CAS
             if (vm->lrsc && vm->lrsc_addr == vaddr && atomic_cas_uint32_le(ptr, vm->lrsc_cas, val)) {
+                // SC success
                 riscv_write_reg(vm, rds, 0);
+                vm->lrsc = false;
             } else {
+                // SC failed, skip RMW MMIO commit
                 riscv_write_reg(vm, rds, 1);
+                vm->lrsc = false;
+                return;
             }
-            vm->lrsc = false;
             break;
         case RISCV_AMO_SWAP:
             riscv_write_reg(vm, rds, (int32_t)atomic_swap_uint32_le(ptr, val));
@@ -87,11 +104,11 @@ static forceinline void riscv_emulate_atomic_w(rvvm_hart_t* vm, const uint32_t i
             break;
         default:
             riscv_illegal_insn(vm, insn);
-            break;
+            return;
     }
 
     if (unlikely(ptr == &bounce)) {
-        riscv_rmw_mmio_write(vm, vaddr, &bounce, sizeof(bounce));
+        riscv_rmw_mmio_commit(vm, vaddr, &bounce, sizeof(bounce));
     }
 }
 
@@ -107,14 +124,24 @@ static forceinline void riscv_emulate_atomic_d(rvvm_hart_t* vm, const uint32_t i
     const uint64_t val = riscv_read_reg(vm, rs2);
     // MMIO atomics bounce buffer
     uint64_t bounce;
+    void* ptr = NULL;
 
     if (unlikely(vaddr & 7)) {
-        riscv_trap(vm, RISCV_TRAP_STORE_MISALIGN, vaddr);
+        uint32_t cause = (op == RISCV_AMO_LR) ? RISCV_TRAP_LOAD_MISALIGN : RISCV_TRAP_STORE_MISALIGN;
+        riscv_trap(vm, cause, vaddr);
         return;
     }
 
-    void* ptr = riscv_rmw_translate(vm, vaddr, &bounce, sizeof(bounce));
-    if (unlikely(ptr == NULL)) return;
+    if (op == RISCV_AMO_LR) {
+        ptr = riscv_ro_translate(vm, vaddr, &bounce, sizeof(bounce));
+    } else {
+        ptr = riscv_rmw_translate(vm, vaddr, &bounce, sizeof(bounce));
+    }
+
+    if (unlikely(!ptr)) {
+        // Pagefault
+        return;
+    }
 
     switch (op) {
         case RISCV_AMO_LR:
@@ -123,15 +150,21 @@ static forceinline void riscv_emulate_atomic_d(rvvm_hart_t* vm, const uint32_t i
             vm->lrsc_addr = vaddr;
             vm->lrsc_cas = atomic_load_uint64_le(ptr);
             riscv_write_reg(vm, rds, vm->lrsc_cas);
-            break;
+
+            // Return to skip RMW MMIO commit
+            return;
         case RISCV_AMO_SC:
             // If our reservation is valid, perform a CAS
             if (vm->lrsc && vm->lrsc_addr == vaddr && atomic_cas_uint64_le(ptr, vm->lrsc_cas, val)) {
+                // SC success
                 riscv_write_reg(vm, rds, 0);
+                vm->lrsc = false;
             } else {
+                // SC failed, skip RMW MMIO commit
                 riscv_write_reg(vm, rds, 1);
+                vm->lrsc = false;
+                return;
             }
-            vm->lrsc = false;
             break;
         case RISCV_AMO_SWAP:
             riscv_write_reg(vm, rds, atomic_swap_uint64_le(ptr, val));
@@ -166,7 +199,7 @@ static forceinline void riscv_emulate_atomic_d(rvvm_hart_t* vm, const uint32_t i
     }
 
     if (unlikely(ptr == &bounce)) {
-        riscv_rmw_mmio_write(vm, vaddr, &bounce, sizeof(bounce));
+        riscv_rmw_mmio_commit(vm, vaddr, &bounce, sizeof(bounce));
     }
 }
 

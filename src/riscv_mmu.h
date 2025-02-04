@@ -45,16 +45,23 @@ void riscv_jit_tlb_flush(rvvm_hart_t* vm);
 #endif
 
 /*
- * Slow memory access path which walks the MMU, calls MMIO handlers if needed.
+ * Slow memory access path which walks the MMU
  */
 
-#define RISCV_MMU_ATTR_NO_TRAP 0x100 // Never trap the CPU
-#define RISCV_MMU_ATTR_NO_PROT 0x200 // Ignore MMU protection
-#define RISCV_MMU_ATTR_PHYS    0x400 // Translate into physical address and write to *data
-#define RISCV_MMU_ATTR_RMW     0x800 // Return direct pointer for RMW atomics, data is used for MMIO if non-NULL
+// Never trap the CPU
+#define RISCV_MMU_ATTR_NO_TRAP 0x100
 
-// Used for GDB stub
-#define RISCV_MMU_ATTR_DEBUG   (RISCV_MMU_ATTR_NO_TRAP | RISCV_MMU_ATTR_NO_PROT)
+// Ignore MMU protection (Perform operation on any valid page)
+#define RISCV_MMU_ATTR_NO_PROT 0x200
+
+// Translate into physical address and write to *(rvvm_addr_t*)data
+#define RISCV_MMU_ATTR_PHYS    0x400
+
+// Return direct pointer to memory, data is used as MMIO bounce buffer if non-NULL
+#define RISCV_MMU_ATTR_PTR     0x800
+
+// Used for GDB stub memory accesses
+#define RISCV_MMU_ATTR_DEBUG (RISCV_MMU_ATTR_NO_TRAP | RISCV_MMU_ATTR_NO_PROT)
 
 no_inline void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint32_t attr);
 
@@ -63,25 +70,34 @@ static forceinline void* riscv_mmu_op_helper(rvvm_hart_t* vm, rvvm_addr_t vaddr,
     return riscv_mmu_op_internal(vm, vaddr, data, (((uint32_t)size) << 16) | (attr & 0xFF00) | access);
 }
 
+/*
+ * Slow path MMU helpers
+ */
+
+// Load/store/fetch helper
+// Traps on pagefault
 static forceinline bool riscv_mmu_op(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint8_t size, uint8_t access)
 {
     return !!riscv_mmu_op_helper(vm, vaddr, data, 0, size, access);
 }
 
-// Translate virtual address to physical with respect to current CPU mode
+// Translate virtual address to physical with respect to current CPU mode and access type
+// Should not have visible side effects to the guest
 static forceinline bool riscv_mmu_virt_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, rvvm_addr_t* paddr, uint8_t access)
 {
     return !!riscv_mmu_op_helper(vm, vaddr, paddr, RISCV_MMU_ATTR_PHYS | RISCV_MMU_ATTR_NO_TRAP, 0, access);
 }
 
-// Translate virtual address into VM pointer for RMW atomics, data is used as MMIO bounce buffer
-static forceinline void* riscv_mmu_rmw_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, size_t size, uint8_t access)
+// Translate virtual address into a pointer (For atomics)
+// When non-null data is passed, it is used as a bounce buffer for MMIO atomics
+static forceinline void* riscv_mmu_ptr_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, size_t size, uint8_t access)
 {
-    return riscv_mmu_op_helper(vm, vaddr, data, RISCV_MMU_ATTR_RMW, size, access);
+    return riscv_mmu_op_helper(vm, vaddr, data, RISCV_MMU_ATTR_PTR, size, access);
 }
 
 // Commit RMW changes back to MMIO
-static forceinline void riscv_rmw_mmio_write(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, size_t size)
+// Does not trap - Should already trap in riscv_mmu_ptr_translate()
+static forceinline void riscv_rmw_mmio_commit(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, size_t size)
 {
     riscv_mmu_op_helper(vm, vaddr, data, RISCV_MMU_ATTR_NO_TRAP, size, RISCV_MMU_WRITE);
 }
@@ -142,6 +158,16 @@ static forceinline bool riscv_virt_translate_e(rvvm_hart_t* vm, rvvm_addr_t vadd
     return riscv_mmu_virt_translate(vm, vaddr, paddr, RISCV_MMU_EXEC);
 }
 
+static forceinline void* riscv_ro_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* buff, size_t size)
+{
+    const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
+    const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
+    if (likely(entry->r == vpn)) {
+        return (void*)(size_t)(entry->ptr + vaddr);
+    }
+    return riscv_mmu_ptr_translate(vm, vaddr, buff, size, RISCV_MMU_READ);
+}
+
 static forceinline void* riscv_rmw_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* buff, size_t size)
 {
     const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
@@ -149,7 +175,7 @@ static forceinline void* riscv_rmw_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr,
     if (likely(entry->w == vpn)) {
         return (void*)(size_t)(entry->ptr + vaddr);
     }
-    return riscv_mmu_rmw_translate(vm, vaddr, buff, size, RISCV_MMU_WRITE);
+    return riscv_mmu_ptr_translate(vm, vaddr, buff, size, RISCV_MMU_WRITE);
 }
 
 // Integer load operations
