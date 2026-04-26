@@ -21,6 +21,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "devices/amdgpu.h"
 #include "feature_test.h"
 
 #include "gdbstub.h"
@@ -371,6 +372,8 @@ static int rvvm_cli_main(int argc, char** argv)
     if (rvvm_has_arg("hda_test")) {
         sound_hda_init_auto(machine);
     }
+
+    amdgpu_init_auto(machine);
 
     tap_dev_t* tap = NULL;
 #ifdef USE_NET
