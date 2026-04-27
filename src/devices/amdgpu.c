@@ -8,8 +8,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "amdgpu.h"
+#include "amdgpu_bios.h"
+#include "compiler.h"
+#include "rvvm/rvvm_base.h"
 #include "utils.h"
 #include "mem_ops.h"
+#include <stdint.h>
 
 /* https://rocm.docs.amd.com/en/docs-6.4.3/how-to/Bar-Memory.html#bar-configuration-for-amd-gpus
  *
@@ -72,6 +76,79 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
  * Possibly important functions:
  * // vi - Volcanic Islands
  * static int vi_common_early_init(struct amdgpu_ip_block *ip_block);
+ *
+ *
+ *********************************************************************
+ * Initialization:
+ * [root@archlinux ~]# [   74.494168] amdgpu: DSDT table not found for OEM information
+ * RVVM: AMDGPU region 5 read: offset=3f0c
+ * RVVM: AMDGPU region 5 read: offset=1c
+ * RVVM: AMDGPU region 5 write: offset=6b0, data=c0600010
+ * RVVM: AMDGPU region 5 write: offset=6b4, data=0
+ * RVVM: AMDGPU region 5 write: offset=6b0, data=c0600014
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 read: offset=5420
+ * RVVM: AMDGPU region 5 write: offset=6b0, data=c0600000
+ * RVVM: AMDGPU region 5 read: offset=6b4
+ * RVVM: AMDGPU region 5 write: offset=5420, data=0
+ * RVVM: AMDGPU region 5 write: offset=6b0, data=c0600000
+ * RVVM: AMDGPU region 5 write: offset=6b4, data=c0600002
+ * RVVM: AMDGPU region 5 write: offset=5420, data=0
+ * RVVM: AMDGPU region 5 write: offset=6b0, data=c0600000
+ * RVVM: AMDGPU region 5 write: offset=6b4, data=c0600000
+ * [   74.611984] amdgpu 0000:00:02.0: amdgpu: Unable to locate a BIOS ROM
+ * [   74.613713] amdgpu 0000:00:02.0: amdgpu: Fatal error during GPU init
+ * [   74.615324] amdgpu 0000:00:02.0: probe with driver amdgpu failed with error -22
+ *
+ ***********************************************************************
+ *
+ * Since BIOS stage passed, kernel now reports:
+ *
+ * [   77.787345] [drm] amdgpu kernel modesetting enabled.
+ * [   77.796156] amdgpu: DSDT table not found for OEM information
+ * [   77.802050] amdgpu: IO link not available for non x86 platforms
+ * [   77.802120] amdgpu: Virtual CRAT table created for CPU
+ * [   77.802774] amdgpu: Topology: Add CPU node
+ * [   77.808088] amdgpu 0000:00:02.0: amdgpu: initializing kernel modesetting (POLARIS10 0x1002:0x67DF 0x10DC:0x5100 0x00).
+ * [   77.808637] amdgpu 0000:00:02.0: amdgpu: register mmio base: 0x40400000
+ * [   77.808685] amdgpu 0000:00:02.0: amdgpu: register mmio size: 262144
+ * [   77.845352] amdgpu 0000:00:02.0: amdgpu: detected ip block number 0 <vi_common>
+ * [   77.845456] amdgpu 0000:00:02.0: amdgpu: detected ip block number 1 <gmc_v8_0>
+ * [   77.845508] amdgpu 0000:00:02.0: amdgpu: detected ip block number 2 <tonga_ih>
+ * [   77.845546] amdgpu 0000:00:02.0: amdgpu: detected ip block number 3 <gfx_v8_0>
+ * [   77.845582] amdgpu 0000:00:02.0: amdgpu: detected ip block number 4 <sdma_v3_0>
+ * [   77.845617] amdgpu 0000:00:02.0: amdgpu: detected ip block number 5 <powerplay>
+ * [   77.845672] amdgpu 0000:00:02.0: amdgpu: detected ip block number 6 <dm>
+ * [   77.845713] amdgpu 0000:00:02.0: amdgpu: detected ip block number 7 <uvd_v6_0>
+ * [   77.845748] amdgpu 0000:00:02.0: amdgpu: detected ip block number 8 <vce_v3_0>
+ * [   78.324900] amdgpu 0000:00:02.0: amdgpu: Fetched VBIOS from ROM BAR
+ * [   78.325136] amdgpu: ATOM BIOS: 113-D0090101-100
+ * [   78.358823] amdgpu 0000:00:02.0: amdgpu: Trusted Memory Zone (TMZ) feature not supported
+ * [   78.359180] amdgpu 0000:00:02.0: amdgpu: PCI CONFIG reset
+ * [   78.359460] amdgpu 0000:00:02.0: amdgpu: GPU posting now...
+ * [   98.500094] [drm:atom_op_jump [amdgpu]] *ERROR* atombios stuck in loop for more than 20secs aborting
+ * [   98.549730] [drm:amdgpu_atom_execute_table_locked [amdgpu]] *ERROR* atombios stuck executing AE7E (len 403, WS 20, PS 0) @ 0xAF97
+ * [   98.600839] [drm:amdgpu_atom_execute_table_locked [amdgpu]] *ERROR* atombios stuck executing AADC (len 133, WS 0, PS 8) @ 0xAB36
+ * [   98.652268] amdgpu 0000:00:02.0: amdgpu: gpu post error!
+ * [   98.653072] amdgpu 0000:00:02.0: amdgpu: Fatal error during GPU init
+ * [   98.653885] amdgpu 0000:00:02.0: amdgpu: amdgpu: finishing device.
+ * [   98.654333] amdgpu 0000:00:02.0: probe with driver amdgpu failed with error -22
+ *
+ * Some ATOMBIOS scripts running.
  */
 
 #define AMDGPU_VENDOR_ID_AMD     0x1002
@@ -172,6 +249,25 @@ static bool amdgpu_mmio_write_region5(rvvm_mmio_dev_t* dev, void* data, size_t o
     return true;
 }
 
+static bool amdgpu_mmio_read_expansion_rom(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+{
+    UNUSED(dev);
+    /* Note that in practice BIOS always 4-byte aligned so we probably will not encounter
+     * alignment or buffer-overflow issues. */
+    memcpy(data, amdgpu_bios_rx480_8192_160603 + offset, size);
+
+    return true;
+}
+
+static bool amdgpu_mmio_write_expansion_rom(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+{
+    UNUSED(dev);
+    UNUSED(data);
+    UNUSED(offset);
+    UNUSED(size);
+    return true;
+}
+
 PUBLIC pci_dev_t *amdgpu_init(pci_bus_t *pci_bus)
 {
     amdgpu_dev_t *amdgpu_dev = safe_new_obj(amdgpu_dev_t);
@@ -183,6 +279,16 @@ PUBLIC pci_dev_t *amdgpu_init(pci_bus_t *pci_bus)
         .class_code = AMDGPU_CLASS_CODE,
         .prog_if    = 0x00,
         .irq_pin    = PCI_IRQ_PIN_INTA,
+        /* Used to load the BIOS. */
+        .expansion_rom = {
+            .size        = 0x200000,
+            .min_op_size = 1,
+            .max_op_size = 4,
+            .read        = amdgpu_mmio_read_expansion_rom,
+            .write       = amdgpu_mmio_write_expansion_rom,
+            .data        = amdgpu_dev,
+            .type        = &amdgpu_type
+        },
         /* VRAM mapping (maybe unused). */
         .bar[0]     = {
             .size        = 0x200000,
