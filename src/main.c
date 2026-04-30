@@ -21,6 +21,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "devices/xe2.h"
 #include "feature_test.h"
 
 #include "gdbstub.h"
@@ -196,6 +197,7 @@ static void rvvm_print_help(void)
         "    -nvme       ...  Explicitly attach storage image as NVMe device\n"
         "    -ata        ...  Explicitly attach storage image as ATA (IDE) device\n"
         "    -nogui           Disable display GUI\n"
+        "    -nogpu           Disable GPU\n"
         "    -nosound         Disable sound support\n"
         "    -nonet           Disable networking\n"
         "    -serial     ...  Add more serial ports (Via pty/pipe path), or null\n"
@@ -370,6 +372,10 @@ static int rvvm_cli_main(int argc, char** argv)
 
     if (rvvm_has_arg("hda_test")) {
         sound_hda_init_auto(machine);
+    }
+
+    if (!rvvm_has_arg("nogpu")) {
+        xe2_init_auto(machine);
     }
 
     tap_dev_t* tap = NULL;
