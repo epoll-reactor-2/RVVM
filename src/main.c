@@ -37,6 +37,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <devices/ns16550a.h>
 #include <devices/rtl8169.h>
 #include <devices/sound-hda.h>
+#include <devices/syscon.h>
+#include <devices/usb-xhci.h>
+#include <devices/xe2.h>
 
 #include <gui/gui_window.h>
 
@@ -360,6 +363,10 @@ static int rvvm_cli_main(int argc, char** argv)
 
     if (rvvm_has_arg("hda_test")) {
         sound_hda_init(machine);
+    }
+
+    if (!rvvm_has_arg("nogpu")) {
+        xe2_init_auto(machine);
     }
 
     tap_dev_t* tap = NULL;
