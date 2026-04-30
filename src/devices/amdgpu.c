@@ -149,9 +149,41 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
  * [   98.654333] amdgpu 0000:00:02.0: probe with driver amdgpu failed with error -22
  *
  * Some ATOMBIOS scripts running.
+ *
+ ************************************************************************
+ *
+ * Does PCI extended capability supported?
+ * #define PCI_EXT_CAP_ID_ERR	0x01	/ * Advanced Error Reporting * /
+ * #define PCI_EXT_CAP_ID_VC	0x02	/ * Virtual Channel Capability * /
+ * #define PCI_EXT_CAP_ID_DSN	0x03	/ * Device Serial Number * /
+ * #define PCI_EXT_CAP_ID_PWR	0x04	/ * Power Budgeting * /
+ * #define PCI_EXT_CAP_ID_RCLD	0x05	/ * Root Complex Link Declaration * /
+ * #define PCI_EXT_CAP_ID_RCILC	0x06	/ * Root Complex Internal Link Control * /
+ * #define PCI_EXT_CAP_ID_RCEC	0x07	/ * Root Complex Event Collector * /
+ * #define PCI_EXT_CAP_ID_MFVC	0x08	/ * Multi-Function VC Capability * /
+ * #define PCI_EXT_CAP_ID_VC9	0x09	/ * same as _VC * /
+ * #define PCI_EXT_CAP_ID_RCRB	0x0A	/ * Root Complex RB? * /
+ * #define PCI_EXT_CAP_ID_VNDR	0x0B	/ * Vendor-Specific * /
+ *
+ *************************************************************************
+ *
+ * Next stage: Initialize VRAM.
+ *
+ * 	r = amdgpu_vram_mgr_init(adev);
+ *	if (r) {
+ *		dev_err(adev->dev, "Failed initializing VRAM heap.\n");
+ *		return r;
+ *	}
+ *
+ *	amdgpu_vram_mgr_init() uses data collected before to initialize VRAM,
+ *	so he successfully collected 0 bytes.
+ *
+ **************************************************************************
+ *
+ * Вывод: выбросить это говно нахуй и сделать Intel XE2.
  */
 
-#define AMDGPU_VENDOR_ID_AMD     0x1002
+#define AMDGPU_VENDOR_ID_AMD     0x8086
 #define AMDGPU_DEVICE_POLARIS_10 0x67DF
 #define AMDGPU_CLASS_CODE        0x0300
 
@@ -171,7 +203,7 @@ static rvvm_mmio_type_t amdgpu_type = {
 
 static bool amdgpu_mmio_read_region0(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    rvvm_info("AMDGPU region 0 read: offset=%zx", offset);
+    // rvvm_info("AMDGPU region 0 read: offset=%zx", offset);
     UNUSED(dev);
     UNUSED(data);
     UNUSED(offset);
@@ -181,7 +213,7 @@ static bool amdgpu_mmio_read_region0(rvvm_mmio_dev_t* dev, void* data, size_t of
 
 static bool amdgpu_mmio_write_region0(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    rvvm_info("AMDGPU region 0 write: offset=%zx, data=%x", offset, read_uint32_le(data));
+    // rvvm_info("AMDGPU region 0 write: offset=%zx, data=%x", offset, read_uint32_le(data));
     UNUSED(dev);
     UNUSED(data);
     UNUSED(offset);
@@ -191,7 +223,7 @@ static bool amdgpu_mmio_write_region0(rvvm_mmio_dev_t* dev, void* data, size_t o
 
 static bool amdgpu_mmio_read_region2(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    rvvm_info("AMDGPU region 2 read: offset=%zx", offset);
+    // rvvm_info("AMDGPU region 2 read: offset=%zx", offset);
     UNUSED(dev);
     UNUSED(data);
     UNUSED(offset);
@@ -201,7 +233,7 @@ static bool amdgpu_mmio_read_region2(rvvm_mmio_dev_t* dev, void* data, size_t of
 
 static bool amdgpu_mmio_write_region2(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    rvvm_info("AMDGPU region 2 write: offset=%zx, data=%x", offset, read_uint32_le(data));
+    // rvvm_info("AMDGPU region 2 write: offset=%zx, data=%x", offset, read_uint32_le(data));
     UNUSED(dev);
     UNUSED(data);
     UNUSED(offset);
@@ -211,7 +243,7 @@ static bool amdgpu_mmio_write_region2(rvvm_mmio_dev_t* dev, void* data, size_t o
 
 static bool amdgpu_mmio_read_region4(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    rvvm_info("AMDGPU region 4 read: offset=%zx", offset);
+    // rvvm_info("AMDGPU region 4 read: offset=%zx", offset);
     UNUSED(dev);
     UNUSED(data);
     UNUSED(offset);
@@ -231,7 +263,17 @@ static bool amdgpu_mmio_write_region4(rvvm_mmio_dev_t* dev, void* data, size_t o
 
 static bool amdgpu_mmio_read_region5(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    rvvm_info("AMDGPU region 5 read: offset=%zx", offset);
+    // rvvm_info("AMDGPU region 5 read: offset=%zx", offset);
+
+    /* We need to evaluate some ATOMBIOS bytecode. */
+    switch (offset) {
+    case 0x809:
+        rvvm_info("Possible VRAM location");
+        break;
+    default:
+        break;
+    }
+
     UNUSED(dev);
     UNUSED(data);
     UNUSED(offset);
@@ -241,7 +283,7 @@ static bool amdgpu_mmio_read_region5(rvvm_mmio_dev_t* dev, void* data, size_t of
 
 static bool amdgpu_mmio_write_region5(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    rvvm_info("AMDGPU region 5 write: offset=%zx, data=%x", offset, read_uint32_le(data));
+    // rvvm_info("AMDGPU region 5 write: offset=%zx, data=%x", offset, read_uint32_le(data));
     UNUSED(dev);
     UNUSED(data);
     UNUSED(offset);
