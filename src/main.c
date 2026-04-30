@@ -187,6 +187,7 @@ static void rvvm_print_help(void)
         "    -nvme       ...  Explicitly attach storage image as NVMe device\n"
         "    -ata        ...  Explicitly attach storage image as ATA (IDE) device\n"
         "    -nogui           Disable display GUI\n"
+        "    -nogpu           Disable GPU\n"
         "    -nosound         Disable sound support\n"
         "    -nonet           Disable networking\n"
         "    -serial     ...  Add more serial ports (Via pty/pipe path), or null\n"
@@ -337,7 +338,18 @@ static int rvvm_cli_main(int argc, char** argv)
     }
 
     if (!rvvm_has_arg("nogui") && !rvvm_has_arg("res")) {
-        if (rvvm_has_arg("bochs_display")) {
+        if (!rvvm_has_arg("nogpu") && !rvvm_has_arg("bochs_display")) {
+            // The Battlemage GPU drives the display: open a window sized to the
+            // panel's native mode and hand its fbdev to the device to scan out.
+            rvvm_fb_t     hint = {
+                    .width  = 1920,
+                    .height = 1080,
+                    .format = RVVM_RGB_XRGB8888,
+            };
+            gui_window_t* win = gui_rvvm_init(rvvm_fb_size(&hint), &hint, machine);
+            rvvm_fbdev_t* gpu_fbdev = gui_window_get_fbdev(win);
+            rvvm_gpu_xe2_init_auto(machine, gpu_fbdev);
+        } else if (rvvm_has_arg("bochs_display")) {
             gui_window_t* win = gui_rvvm_init(0x1000000UL, NULL, machine);
             rvvm_bochs_display_init_auto(machine, gui_window_get_fbdev(win));
         } else {

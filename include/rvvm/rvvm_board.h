@@ -422,6 +422,21 @@ static inline rvvm_pci_func_t* rvvm_ata_init_auto(rvvm_machine_t* machine, const
 }
 
 /**
+ * Attach Intel XE2 GPU to the machine (PCI-based)
+ *
+ * \param machine Machine handle (Nullable, invokes cleanup)
+ * \param fbdev   Framebuffer device handle (Nullable)
+ * \param addr    PCI bus address
+ * \return        PCI function handle (NULL on failure)
+ */
+RVVM_PUBLIC rvvm_pci_func_t* rvvm_gpu_xe2_init(rvvm_machine_t* machine, rvvm_fbdev_t* fbdev, rvvm_pci_addr_t addr);
+
+static inline rvvm_pci_func_t* rvvm_gpu_xe2_init_auto(rvvm_machine_t* machine, rvvm_fbdev_t* fbdev)
+{
+    return rvvm_gpu_xe2_init(machine, fbdev, -1);
+}
+
+/**
  * @}
  * @defgroup rvvm_board_setup Built-in boards
  * @addtogroup rvvm_board_setup
