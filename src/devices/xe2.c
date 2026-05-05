@@ -16,67 +16,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
-//
-// Current state. Power management is fucked up, but driver is successfully
-// probed and visible in `lsmod`.
-//
-// [   62.539630] xe 0000:00:01.0: [drm] Found lunarlake (device ID 6420) integrated display version 14.01 stepping A0
-// [   62.562008] xe 0000:00:01.0: ROM [??? 0x00000000 flags 0x20000000]: can't assign; bogus alignment
-// [   62.562293] xe 0000:00:01.0: [drm] Failed to find VBIOS tables (VBT)
-// [   62.562769] xe 0000:00:01.0: [drm] *ERROR* DC state mismatch (0x0 -> 0x4000000b)
-// [   62.566733] xe 0000:00:01.0: [drm] *ERROR* Writing dc state to 0x20000000 failed, now 0x6000000b
-// [   62.567889] Unable to handle kernel access to user memory without uaccess routines at virtual address 0000000000000000
-// [   62.568336] Current (udev-worker) pgtable: 4K pagesize, 48-bit VAs, pgdp=0x0000000084ec0000
-// [   62.569448] [0000000000000000] pgd=0000000000000000, p4d=0000000000000000
-// [   62.570105] Oops [#1]
-// [   62.570278] Modules linked in: xe(+) joydev mousedev drm_gpuvm drm_gpusvm_helper drm_buddy gpu_sched i2c_hid_of i2c_hid video drm_exec r8169 drm_suballoc_helper drm_ttm_helper ttm realtek i2c_algo_bit mdio_devres of_mdio drm_display_helper fixed_phy fwnode_mdio libphy cec mdio_bus i2c_ocores uio_pdrv_genirq uio nfnetlink nvme nvme_core nvme_keyring nvme_auth pci_host_generic fixed
-// [   62.571575] CPU: 0 UID: 0 PID: 237 Comm: (udev-worker) Not tainted 6.17.2-arch1-1 #1 PREEMPT(full)  2907a6588127d6f916d34529c63bd40a4d2a2f79
-// [   62.571972] Hardware name: RVVM v0.7-git-gb5b74c0-dirty (DT)
-// [   62.572185] epc : intel_dmc_update_dc6_allowed_count+0x18/0xa8 [xe]
-// [   62.590284]  ra : gen9_set_dc_state.part.0+0x22c/0x2e8 [xe]
-// [   62.608226] epc : ffffffff03bc48a8 ra : ffffffff03bb830c sp : ffff8f80007b3380
-// [   62.608395]  gp : ffffffff82c3a320 tp : ffffaf80078d90c0 t0 : ffffffff80027890
-// [   62.608574]  t1 : 0000000000006000 t2 : ffffffff82a2dfe0 s0 : ffff8f80007b33c0
-// [   62.608772]  s1 : ffffaf8005208000 a0 : ffffaf8005208000 a1 : 0000000000000000
-// [   62.611590]  a2 : 0000000000000000 a3 : ffffffff055b2bc8 a4 : 000000000000000d
-// [   62.614137]  a5 : 0000000000000000 a6 : ffffffff8300df38 a7 : 0000000000000004
-// [   62.616410]  s2 : 0000000020000000 s3 : 000000006000000b s4 : 0000000000000000
-// [   62.618553]  s5 : 0000000000001448 s6 : 0000000000000064 s7 : 0000000000000006
-// [   62.620954]  s8 : 0000000000000064 s9 : 000000004000000b s10: 0000000000000000
-// [   62.624120]  s11: 0000000000000001 t3 : 0000000000000000 t4 : ffffaf803fdab680
-// [   62.626953]  t5 : 0000000000000380 t6 : 0000000000000000
-// [   62.628398] status: 0000000200000120 badaddr: 0000000000000000 cause: 000000000000000d
-// [   62.631005] [<ffffffff03bc48a8>] intel_dmc_update_dc6_allowed_count+0x18/0xa8 [xe]
-// [   62.653561] [<ffffffff03bb830c>] gen9_set_dc_state.part.0+0x22c/0x2e8 [xe]
-// [   62.672701] [<ffffffff03bb9c36>] gen9_set_dc_state+0x1e/0x30 [xe]
-// [   62.692503] [<ffffffff03bb481c>] icl_display_core_init+0x2c/0x978 [xe]
-// [   62.711199] [<ffffffff03bb532e>] intel_power_domains_init_hw+0x1c6/0x628 [xe]
-// [   62.730357] [<ffffffff03baaacc>] intel_display_driver_probe_noirq+0x9c/0x348 [xe]
-// [   62.751679] [<ffffffff03b56e5a>] xe_display_init_early+0x82/0x150 [xe]
-// [   62.770709] [<ffffffff03ade4b0>] xe_device_probe+0x288/0x7a8 [xe]
-// [   62.788842] [<ffffffff03b1c74a>] xe_pci_probe+0x6f2/0xa88 [xe]
-// [   62.808118] [<ffffffff808c95a4>] local_pci_probe+0x3c/0x98
-// [   62.810145] [<ffffffff808ca0e4>] pci_device_probe+0xcc/0x2b8
-// [   62.811815] [<ffffffff80aa124e>] really_probe+0x9e/0x350
-// [   62.812973] [<ffffffff80aa1580>] __driver_probe_device+0x80/0x138
-// [   62.814044] [<ffffffff80aa1722>] driver_probe_device+0x3a/0xd0
-// [   62.815432] [<ffffffff80aa1994>] __driver_attach+0xac/0x1b8
-// [   62.816588] [<ffffffff80a9eb54>] bus_for_each_dev+0x6c/0xc8
-// [   62.817553] [<ffffffff80aa0a6e>] driver_attach+0x26/0x38
-// [   62.818491] [<ffffffff80aa0184>] bus_add_driver+0x104/0x230
-// [   62.819687] [<ffffffff80aa2b52>] driver_register+0x52/0x100
-// [   62.820681] [<ffffffff808c892c>] __pci_register_driver+0x4c/0x60
-// [   62.821949] [<ffffffff03b1cb10>] xe_register_pci_driver+0x30/0x40 [xe]
-// [   62.844857] [<ffffffff055e70b8>] xe_init+0x28/0x60 [xe]
-// [   62.863714] [<ffffffff8001999a>] do_one_initcall+0x62/0x2a0
-// [   62.864580] [<ffffffff8011a326>] do_init_module+0x5e/0x278
-// [   62.865398] [<ffffffff8011c292>] load_module+0x1a52/0x1f70
-// [   62.866176] [<ffffffff8011c9ea>] init_module_from_file+0x82/0xe0
-// [   62.866962] [<ffffffff8011ccb2>] __riscv_sys_finit_module+0x26a/0x368
-// [   62.867722] [<ffffffff80f1ebd4>] do_trap_ecall_u+0x3b4/0x490
-// [   62.868500] [<ffffffff80f2df4c>] handle_exception+0x154/0x160
-// [   62.869561] Code: 0013 0000 7139 f822 fc06 f426 0080 3783 3185 4735 (6384) d683 
-// [   62.871942] ---[ end trace 0000000000000000 ]---
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -177,7 +116,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //   SKL_PG2 = 2
 //   ICL_PG3 = 3
 //   ICL_PG4 = 4
-#define XE2_REG_SKL_FUSE_STATUS_DST_MASK(pg)            (1 << (27 - (pg)))
+#define XE2_REG_SKL_FUSE_STATUS_DST_MASK(pg)                (1 << (27 - (pg)))
 
 #define XE2_REG_DBUF_CTL_S0                                 0x45008
 #define XE2_REG_DBUF_CTL_S1                                 0x44FE8
@@ -192,7 +131,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_CDCLK_CTL_FREQ_SEL_MASK                     xe2_reg_genmask(27, 26)
 #define XE2_REG_CDCLK_CTL_SOURCE_SEL_MASK                   xe2_reg_bit(25)
 #define XE2_REG_CDCLK_CTL_CD2X_DIV_SEL_MASK                 xe2_reg_genmask(23, 22)
-#define XE2_REG_CDCLK_CTL_CD2X_PIPE_MASK                    xe2_reg_bit(20)
+#define XE2_REG_CDCLK_CTL_CD2X_PIPE_MASK                    xe2_reg_genmask(21, 20)
 
 #define XE2_REG_SKL_DSSM                                    0x51004 // Reference CDCLK
 #define XE2_REG_SKL_DSSM_PLL_REFCLK_MASK                    (7U << 29)
@@ -203,9 +142,14 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_DC_STATE_EN                                 0x45504
 #define XE2_REG_DC_STATE_EN_DC3C0_MASK                      xe2_reg_bit(30)
 #define XE2_REG_DC_STATE_DC3CO_STATUS_MASK                  xe2_reg_bit(29)
-#define XE2_REG_DC_STATE_EN_UPTO_DC5                        (1 << 0)
-#define XE2_REG_DC_STATE_EN_UPTO_DC6                        (2 << 0)
-#define XE2_REG_DC_STATE_EN_DC9                             (1 << 3)
+#define XE2_REG_DC_STATE_EN_DC3C0                           (1 << 30)
+#define XE2_REG_DC_STATE_EN_UPTO_DC5                        (1 <<  0)
+#define XE2_REG_DC_STATE_EN_UPTO_DC6                        (2 <<  0)
+#define XE2_REG_DC_STATE_EN_DC9                             (1 <<  3)
+
+#define XE2_REG_ILK_DPFC_CONTROL_1                          0x43208
+#define XE2_REG_ILK_DPFC_CONTROL_2                          0x43248
+#define XE2_REG_ILK_DPFC_CONTROL_X_EN_MASK                  xe2_reg_bit(31)
 
 typedef struct {
     pci_func_t *pci_func;
@@ -282,11 +226,9 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
-        case XE2_REG_PP_CONTROL: {
-            uint32_t cmd = xe2->pp_control;
-            write_uint32_le(data, cmd);
+        case XE2_REG_PP_CONTROL:
+            write_uint32_le(data, xe2->pp_control);
             break;
-        }
         case XE2_REG_HSW_POWER_WELL_CTL1:
         case XE2_REG_HSW_POWER_WELL_CTL2:
         case XE2_REG_HSW_POWER_WELL_CTL3:
@@ -294,8 +236,8 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, 0xFFFFFFFF);
             break;
         case XE2_REG_BXT_DE_PLL_ENABLE: {
-            xe2->pll_enable &= ~xe2_reg_field_prep(XE2_REG_BXT_DE_PLL_ENABLE_MASK, 1);
-            write_uint32_le(data, xe2->pll_enable);
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_BXT_DE_PLL_ENABLE_LOCK_MASK, xe2->pll_enable);
+            write_uint32_le(data, cmd);
             break;
         }
         case XE2_REG_SKL_FUSE_STATUS: {
@@ -375,28 +317,26 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
+        case XE2_REG_SKL_DSSM:
+            write_uint32_le(data, XE2_REG_SKL_DSSM_PLL_REFCLK_38_4MHZ);
+            break;
         case XE2_REG_CDCLK_CTL: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_CDCLK_CTL_FREQ_SEL_MASK, 2)     // 337/308 freq
-                         | xe2_reg_field_prep(XE2_REG_CDCLK_CTL_SOURCE_SEL_MASK, 0)   // CD2XCLK source select
+                         | xe2_reg_field_prep(XE2_REG_CDCLK_CTL_SOURCE_SEL_MASK, 1)   // CDCDLK_PLL source select
                          | xe2_reg_field_prep(XE2_REG_CDCLK_CTL_CD2X_DIV_SEL_MASK, 0) // 1x divisor
-                         | xe2_reg_field_prep(XE2_REG_CDCLK_CTL_CD2X_PIPE_MASK, 0);   // No pipe
+                         | xe2_reg_field_prep(XE2_REG_CDCLK_CTL_CD2X_PIPE_MASK, 3);   // No pipe
             write_uint32_le(data, cmd);
             break;
         }
         case XE2_REG_DC_STATE_EN:
-            // DC mask:
-            // EN_DC3C0    |
-            // EN_UPTO_DC6 |
-            // EN_DC9
-            //
-            // 1. Read DC state
-            // 2. If read DC state & mask != DC state -> abort
-            xe2->dc_state |= xe2_reg_field_prep(XE2_REG_DC_STATE_EN_DC3C0_MASK, 1)
-                          |  XE2_REG_DC_STATE_EN_UPTO_DC5
-                          |  XE2_REG_DC_STATE_EN_UPTO_DC6
-                          |  XE2_REG_DC_STATE_EN_DC9;
             write_uint32_le(data, xe2->dc_state);
             break;
+        case XE2_REG_ILK_DPFC_CONTROL_1:
+        case XE2_REG_ILK_DPFC_CONTROL_2: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_ILK_DPFC_CONTROL_X_EN_MASK, 1);
+            write_uint32_le(data, cmd);
+            break;
+        }
         case XE2_REG_DPA_AUX_CH_CTL:
         case XE2_REG_DPB_AUX_CH_CTL:
             write_uint32_le(data, xe2->aux.ctl);
@@ -448,9 +388,11 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             }
             break;
         }
-        case XE2_REG_BXT_DE_PLL_ENABLE:
-            xe2->pll_enable = read_uint32_le(data);
+        case XE2_REG_BXT_DE_PLL_ENABLE: {
+            uint32_t cmd = read_uint32_le(data);
+            xe2->pll_enable = !!xe2_reg_field_get(XE2_REG_BXT_DE_PLL_ENABLE_MASK, cmd);
             break;
+        }
         case XE2_REG_PP_CONTROL:
             xe2->pp_control = read_uint32_le(data);
             break;
@@ -466,9 +408,14 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         case XE2_REG_DBUF_CTL_S3:
             xe2->dbuf_ctl[3] = read_uint32_le(data);
             break;
-        case XE2_REG_DC_STATE_EN:
-            xe2->dc_state |= read_uint32_le(data);
+        case XE2_REG_DC_STATE_EN: {
+            uint32_t cmd = read_uint32_le(data);
+            uint32_t mask = XE2_REG_DC_STATE_EN_DC3C0
+                          | XE2_REG_DC_STATE_EN_UPTO_DC5;
+            xe2->dc_state &= ~mask;
+            xe2->dc_state |= (cmd & mask);
             break;
+        }
         default:
             break;
     }
@@ -479,10 +426,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
 {
     xe2_dev_t *xe2 = safe_new_obj(xe2_dev_t);
-    xe2->forcewake_gsc = 0;
-    xe2->forcewake_gt_mtl = 0;
     xe2->steer_semaphore = 1; // Begin with unlocked state.
-    xe2->dc_state = xe2_reg_field_prep(XE2_REG_DC_STATE_DC3CO_STATUS_MASK, 1); // Initial DC state.
 
     pci_func_desc_t xe2_desc = {
         .vendor_id  = XE2_VENDOR_ID_INTEL,
