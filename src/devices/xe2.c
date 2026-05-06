@@ -16,100 +16,103 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
+//
+// Current status: firmwares loaded, now drivers lookups
+// DMC & GUC registers.
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
 #define xe2_reg_field_get(mask, val)    (((val) & (mask)) >> __builtin_ctz(mask))
 #define xe2_reg_field_prep(mask, val)   (((val) << __builtin_ctz(mask)) & (mask))
 
-#define XE2_VENDOR_ID_INTEL                             0x8086
-#define XE2_DEVICE_ID_LUNAR_LAKE_IGPU                   0x6420
-#define XE2_CLASS_CODE                                  0x0300
+#define XE2_VENDOR_ID_INTEL                                 0x8086
+#define XE2_DEVICE_ID_LUNAR_LAKE_IGPU                       0x6420
+#define XE2_CLASS_CODE                                      0x0300
 
-#define XE2_REG_GT_GMD_ID                               0xD8C
-#define XE2_REG_GT_GMD_ID_ARCH_MASK                     xe2_reg_genmask(31, 22)
-#define XE2_REG_GT_GMD_ID_RELEASE_MASK                  xe2_reg_genmask(21, 14)
-#define XE2_REG_GT_GMD_ID_REVID_MASK                    xe2_reg_genmask(5, 0)
+#define XE2_REG_GT_GMD_ID                                   0xD8C
+#define XE2_REG_GT_GMD_ID_ARCH_MASK                         xe2_reg_genmask(31, 22)
+#define XE2_REG_GT_GMD_ID_RELEASE_MASK                      xe2_reg_genmask(21, 14)
+#define XE2_REG_GT_GMD_ID_REVID_MASK                        xe2_reg_genmask(5, 0)
 
-#define XE2_REG_GT_GMD_ID_DISPLAY                       0x510A0
-#define XE2_REG_GT_GMD_ID_DISPLAY_ARCH_MASK             xe2_reg_genmask(31, 22)
-#define XE2_REG_GT_GMD_ID_DISPLAY_RELEASE_MASK          xe2_reg_genmask(21, 14)
-#define XE2_REG_GT_GMD_ID_DISPLAY_REVID_MASK            xe2_reg_genmask(5, 0)
+#define XE2_REG_GT_GMD_ID_DISPLAY                           0x510A0
+#define XE2_REG_GT_GMD_ID_DISPLAY_ARCH_MASK                 xe2_reg_genmask(31, 22)
+#define XE2_REG_GT_GMD_ID_DISPLAY_RELEASE_MASK              xe2_reg_genmask(21, 14)
+#define XE2_REG_GT_GMD_ID_DISPLAY_REVID_MASK                xe2_reg_genmask(5, 0)
 
-#define XE2_REG_GT_FORCEWAKE_GSC                        0xA618
-#define XE2_REG_GT_FORCEWAKE_ACK_GSC                    0xDF8
-#define XE2_REG_GT_FORCEWAKE_GT                         0xA188
-#define XE2_REG_GT_FORCEWAKE_ACK_GT                     0x130044 // How these forcewakes are related?
-#define XE2_REG_GT_FORCEWAKE_ACK_GT_MTL                 0xDFC
+#define XE2_REG_GT_FORCEWAKE_GSC                            0xA618
+#define XE2_REG_GT_FORCEWAKE_ACK_GSC                        0xDF8
+#define XE2_REG_GT_FORCEWAKE_GT                             0xA188
+#define XE2_REG_GT_FORCEWAKE_ACK_GT                         0x130044 // How these forcewakes are related?
+#define XE2_REG_GT_FORCEWAKE_ACK_GT_MTL                     0xDFC
 
-#define XE2_REG_MTL_MEM_SS_INFO                         0x45700 // Memory subsystem configuration
-#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_MASK         xe2_reg_genmask(11, 8)
-#define XE2_REG_MTL_MEM_SS_INFO_N_CHANNELS_MASK         xe2_reg_genmask(7, 4)
-#define XE2_REG_MTL_MEM_SS_INFO_DDR_TYPE_MASK           xe2_reg_genmask(3, 0)
+#define XE2_REG_MTL_MEM_SS_INFO                             0x45700 // Memory subsystem configuration
+#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_MASK             xe2_reg_genmask(11, 8)
+#define XE2_REG_MTL_MEM_SS_INFO_N_CHANNELS_MASK             xe2_reg_genmask(7, 4)
+#define XE2_REG_MTL_MEM_SS_INFO_DDR_TYPE_MASK               xe2_reg_genmask(3, 0)
 
-#define XE2_REG_STEER_SEMAPHORE                         0xFD0
-#define XE2_REG_GGC                                     0x108040 // Graphics control
-#define XE2_REG_GGC_GMS_MASK                            xe2_reg_genmask(15, 8)
-#define XE2_REG_GGC_GGMS_MASK                           xe2_reg_genmask(7, 6)
+#define XE2_REG_STEER_SEMAPHORE                             0xFD0
+#define XE2_REG_GGC                                         0x108040 // Graphics control
+#define XE2_REG_GGC_GMS_MASK                                xe2_reg_genmask(15, 8)
+#define XE2_REG_GGC_GGMS_MASK                               xe2_reg_genmask(7, 6)
 
-#define XE2_REG_GUC_TLB_INV_DESC0                       0xCF7C
-#define XE2_REG_GUC_TLB_INV_DESC1                       0xCF80
-#define XE2_REG_GU_CNTL_PROTECTED                       0x10100C // This being used from i915
-#define XE2_REG_GU_CNTL_PROTECTED_PRESENT_MASK          xe2_reg_genmask(9, 9)
+#define XE2_REG_GUC_TLB_INV_DESC0                           0xCF7C
+#define XE2_REG_GUC_TLB_INV_DESC1                           0xCF80
+#define XE2_REG_GU_CNTL_PROTECTED                           0x10100C // This being used from i915
+#define XE2_REG_GU_CNTL_PROTECTED_PRESENT_MASK              xe2_reg_genmask(9, 9)
 
-#define XE2_REG_VF_CAP                                  0x1901F8
-#define XE2_REG_VF_CAP_MASK                             xe2_reg_genmask(0, 0)
+#define XE2_REG_VF_CAP                                      0x1901F8
+#define XE2_REG_VF_CAP_MASK                                 xe2_reg_genmask(0, 0)
 
-#define XE2_REG_DPA_AUX_CH_CTL                          0x64010 // i915/display/intel_dp_aux_regs.h
-#define XE2_REG_DPB_AUX_CH_CTL                          0x64110
-#define XE2_REG_DBX_AUX_CH_CTL_SEND_BUSY_MASK           xe2_reg_bit(31)
-#define XE2_REG_DBX_AUX_CH_CTL_DONE_MASK                xe2_reg_bit(30)
-#define XE2_REG_DBX_AUX_CH_CTL_INTERRUPT_MASK           xe2_reg_bit(29)
-#define XE2_REG_DBX_AUX_CH_CTL_TIME_OUT_ERROR_MASK      xe2_reg_bit(28)
-#define XE2_REG_DBX_AUX_CH_CTL_TIME_OUT_MASK            xe2_reg_genmask(27, 26)
-#define XE2_REG_DBX_AUX_CH_CTL_RECEIVE_ERROR_MASK       xe2_reg_bit(25)
-#define XE2_REG_DBX_AUX_CH_CTL_MSG_SIZE_MASK            xe2_reg_genmask(24, 20)
-#define XE2_REG_DBX_AUX_CH_CTL_PRECHARGE_2US_MASK       xe2_reg_genmask(19, 16)
-#define XE2_REG_DBX_AUX_CH_CTL_AUX_AKSV_SELECT_MASK     xe2_reg_bit(15)
-#define XE2_REG_DBX_AUX_CH_CTL_MANCHESTER_MASK          xe2_reg_bit(14)
-#define XE2_REG_DBX_AUX_CH_CTL_PSR_DATA_AUX_SKL_MASK    xe2_reg_bit(14)
-#define XE2_REG_DBX_AUX_CH_CTL_SYNC_TEST_MASK           xe2_reg_bit(13)
-#define XE2_REG_DBX_AUX_CH_CTL_FS_DATA_AUX_SKL_MASK     xe2_reg_bit(13)
-#define XE2_REG_DBX_AUX_CH_CTL_DEGLITCH_TEST__MASK      xe2_reg_bit(12)
-#define XE2_REG_DBX_AUX_CH_CTL_GTC_DATA_AUX_REG_MASK    xe2_reg_bit(12)
-#define XE2_REG_DBX_AUX_CH_CTL_PRECHARGE_TEST_MASK      xe2_reg_bit(11)
-#define XE2_REG_DBX_AUX_CH_CTL_TBT_IO_MASK              xe2_reg_bit(11)
-#define XE2_REG_DBX_AUX_CH_CTL_BIT_CLOCK_2X_MASK        xe2_reg_genmask(10, 0)
-#define XE2_REG_DBX_AUX_CH_CTL_FW_SYNC_PULSE_SKL_MASK   xe2_reg_genmask(9, 5)
-#define XE2_REG_DBX_AUX_CH_CTL_SYNC_PUSLE_SKL_MASK      xe2_reg_genmask(4, 0)
+#define XE2_REG_DPA_AUX_CH_CTL                              0x64010 // i915/display/intel_dp_aux_regs.h
+#define XE2_REG_DPB_AUX_CH_CTL                              0x64110
+#define XE2_REG_DBX_AUX_CH_CTL_SEND_BUSY_MASK               xe2_reg_bit(31)
+#define XE2_REG_DBX_AUX_CH_CTL_DONE_MASK                    xe2_reg_bit(30)
+#define XE2_REG_DBX_AUX_CH_CTL_INTERRUPT_MASK               xe2_reg_bit(29)
+#define XE2_REG_DBX_AUX_CH_CTL_TIME_OUT_ERROR_MASK          xe2_reg_bit(28)
+#define XE2_REG_DBX_AUX_CH_CTL_TIME_OUT_MASK                xe2_reg_genmask(27, 26)
+#define XE2_REG_DBX_AUX_CH_CTL_RECEIVE_ERROR_MASK           xe2_reg_bit(25)
+#define XE2_REG_DBX_AUX_CH_CTL_MSG_SIZE_MASK                xe2_reg_genmask(24, 20)
+#define XE2_REG_DBX_AUX_CH_CTL_PRECHARGE_2US_MASK           xe2_reg_genmask(19, 16)
+#define XE2_REG_DBX_AUX_CH_CTL_AUX_AKSV_SELECT_MASK         xe2_reg_bit(15)
+#define XE2_REG_DBX_AUX_CH_CTL_MANCHESTER_MASK              xe2_reg_bit(14)
+#define XE2_REG_DBX_AUX_CH_CTL_PSR_DATA_AUX_SKL_MASK        xe2_reg_bit(14)
+#define XE2_REG_DBX_AUX_CH_CTL_SYNC_TEST_MASK               xe2_reg_bit(13)
+#define XE2_REG_DBX_AUX_CH_CTL_FS_DATA_AUX_SKL_MASK         xe2_reg_bit(13)
+#define XE2_REG_DBX_AUX_CH_CTL_DEGLITCH_TEST__MASK          xe2_reg_bit(12)
+#define XE2_REG_DBX_AUX_CH_CTL_GTC_DATA_AUX_REG_MASK        xe2_reg_bit(12)
+#define XE2_REG_DBX_AUX_CH_CTL_PRECHARGE_TEST_MASK          xe2_reg_bit(11)
+#define XE2_REG_DBX_AUX_CH_CTL_TBT_IO_MASK                  xe2_reg_bit(11)
+#define XE2_REG_DBX_AUX_CH_CTL_BIT_CLOCK_2X_MASK            xe2_reg_genmask(10, 0)
+#define XE2_REG_DBX_AUX_CH_CTL_FW_SYNC_PULSE_SKL_MASK       xe2_reg_genmask(9, 5)
+#define XE2_REG_DBX_AUX_CH_CTL_SYNC_PUSLE_SKL_MASK          xe2_reg_genmask(4, 0)
 
-#define XE2_REG_PP_STATUS                               0x61200 // Panel power sequence
-#define XE2_REG_PP_ON_MASK                              xe2_reg_bit(31)
-#define XE2_REG_PP_READY_MASK                           xe2_reg_bit(30)
-#define XE2_REG_PP_SEQUENCE_MASK                        xe2_reg_genmask(29, 28)
-#define XE2_REG_PP_CYCLE_DELAY_ACTIVE_MASK              xe2_reg_bit(27)
+#define XE2_REG_PP_STATUS                                   0x61200 // Panel power sequence
+#define XE2_REG_PP_ON_MASK                                  xe2_reg_bit(31)
+#define XE2_REG_PP_READY_MASK                               xe2_reg_bit(30)
+#define XE2_REG_PP_SEQUENCE_MASK                            xe2_reg_genmask(29, 28)
+#define XE2_REG_PP_CYCLE_DELAY_ACTIVE_MASK                  xe2_reg_bit(27)
 
-#define XE2_REG_PP_CONTROL                              0x61204
-#define XE2_REG_PP_CONTROL_UNLOCK_MASK                  xe2_reg_genmask(31, 16)
-#define XE2_REG_PP_CONTROL_POWER_CYCLE_DELAY_MASK       xe2_reg_genmask(8, 4)
-#define XE2_REG_PP_CONTROL_EPD_FORCE_VDD_MASK           xe2_reg_bit(3)
-#define XE2_REG_PP_CONTROL_EPD_BLC_ENABLE_MASK          xe2_reg_bit(2)
-#define XE2_REG_PP_CONTROL_POWER_RESET_MASK             xe2_reg_bit(1)
-#define XE2_REG_PP_CONTROL_POWER_ON_MASK                xe2_reg_bit(0)
+#define XE2_REG_PP_CONTROL                                  0x61204
+#define XE2_REG_PP_CONTROL_UNLOCK_MASK                      xe2_reg_genmask(31, 16)
+#define XE2_REG_PP_CONTROL_POWER_CYCLE_DELAY_MASK           xe2_reg_genmask(8, 4)
+#define XE2_REG_PP_CONTROL_EPD_FORCE_VDD_MASK               xe2_reg_bit(3)
+#define XE2_REG_PP_CONTROL_EPD_BLC_ENABLE_MASK              xe2_reg_bit(2)
+#define XE2_REG_PP_CONTROL_POWER_RESET_MASK                 xe2_reg_bit(1)
+#define XE2_REG_PP_CONTROL_POWER_ON_MASK                    xe2_reg_bit(0)
 
-#define XE2_REG_HSW_POWER_WELL_CTL1                     0x45400
-#define XE2_REG_HSW_POWER_WELL_CTL2                     0x45404
-#define XE2_REG_HSW_POWER_WELL_CTL3                     0x45408
-#define XE2_REG_HSW_POWER_WELL_CTL4                     0x4540C
+#define XE2_REG_HSW_POWER_WELL_CTL1                         0x45400
+#define XE2_REG_HSW_POWER_WELL_CTL2                         0x45404
+#define XE2_REG_HSW_POWER_WELL_CTL3                         0x45408
+#define XE2_REG_HSW_POWER_WELL_CTL4                         0x4540C
 
-#define XE2_REG_BXT_DE_PLL_ENABLE                       0x46070
-#define XE2_REG_BXT_DE_PLL_ENABLE_MASK                  xe2_reg_bit(31)
-#define XE2_REG_BXT_DE_PLL_ENABLE_LOCK_MASK             xe2_reg_bit(30)
-#define XE2_REG_BXT_DE_PLL_ENABLE_FREQ_REQ_MASK         xe2_reg_bit(23)
-#define XE2_REG_BXT_DE_PLL_ENABLE_FREQ_REQ_ACK_MASK     xe2_reg_bit(22)
+#define XE2_REG_BXT_DE_PLL_ENABLE                           0x46070
+#define XE2_REG_BXT_DE_PLL_ENABLE_MASK                      xe2_reg_bit(31)
+#define XE2_REG_BXT_DE_PLL_ENABLE_LOCK_MASK                 xe2_reg_bit(30)
+#define XE2_REG_BXT_DE_PLL_ENABLE_FREQ_REQ_MASK             xe2_reg_bit(23)
+#define XE2_REG_BXT_DE_PLL_ENABLE_FREQ_REQ_ACK_MASK         xe2_reg_bit(22)
 
-#define XE2_REG_SKL_FUSE_STATUS                         0x42000
-#define XE2_REG_SKL_FUSE_STATUS_DOWNLOAD_MASK           xe2_reg_bit(31)
+#define XE2_REG_SKL_FUSE_STATUS                             0x42000
+#define XE2_REG_SKL_FUSE_STATUS_DOWNLOAD_MASK               xe2_reg_bit(31)
 // Power gates:
 //   SKL_PG0 = 0
 //   SKL_PG1 = 1
@@ -150,6 +153,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_ILK_DPFC_CONTROL_1                          0x43208
 #define XE2_REG_ILK_DPFC_CONTROL_2                          0x43248
 #define XE2_REG_ILK_DPFC_CONTROL_X_EN_MASK                  xe2_reg_bit(31)
+
+#define XE2_REG_GUC_DMA_WOPCM_OFFSET                        0xC340
+#define XE2_REG_GUC_DMA_WOPCM_OFFSET_MASK                   xe2_reg_genmask(31, 14)
+#define XE2_REG_HUC_LOADING_AGENT_GUC_MASK                  xe2_reg_bit(1)
+#define XE2_REG_GUC_WOPCM_OFFSET_VALID                      xe2_reg_bit(0)
+
+#define XE2_REG_GUC_WOPCM_SIZE                              0xC050
+#define XE2_REG_GUC_PVC_TLB_INV_DESC0                       0xCF7C
+#define XE2_REG_GUC_PVC_TLB_INV_DESC1                       0xCF80
 
 typedef struct {
     pci_func_t *pci_func;
@@ -252,10 +264,6 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             //      ICL_PG3,
             //      ICL_PG4,
             // };
-            //
-            // #define SKL_FUSE_STATUS                  _MMIO(0x42000)
-            // #define  SKL_FUSE_DOWNLOAD_STATUS        (1 << 31)
-            // #define  SKL_FUSE_PG_DIST_STATUS(pg)     (1 << (27 - (pg)))
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_SKL_FUSE_STATUS_DOWNLOAD_MASK, 1)
                          | xe2_reg_field_prep(XE2_REG_SKL_FUSE_STATUS_DST_MASK(0), 1)
                          | xe2_reg_field_prep(XE2_REG_SKL_FUSE_STATUS_DST_MASK(1), 1)
