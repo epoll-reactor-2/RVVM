@@ -29,6 +29,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_DEVICE_ID_LUNAR_LAKE_IGPU                       0x6420
 #define XE2_CLASS_CODE                                      0x0300
 
+#define XE2_REG_FLUSH_PENDING                               0x130030 // Dummy register
+
 #define XE2_REG_GT_GMD_ID                                   0xD8C
 #define XE2_REG_GT_GMD_ID_ARCH_MASK                         xe2_reg_genmask(31, 22)
 #define XE2_REG_GT_GMD_ID_RELEASE_MASK                      xe2_reg_genmask(21, 14)
@@ -163,6 +165,30 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GUC_PVC_TLB_INV_DESC0                       0xCF7C
 #define XE2_REG_GUC_PVC_TLB_INV_DESC1                       0xCF80
 
+#define XE2_REG_GUC_STATUS                                  0xC000 // Probably RO
+#define XE2_REG_GUC_STATUS_MASK                             xe2_reg_genmask(31, 30)
+#define XE2_REG_GUC_STATUS_MIA_MASK                         xe2_reg_genmask(18, 16)
+#define XE2_REG_GUC_STATUS_UKERNEL_MASK                     xe2_reg_genmask(15, 8)
+#define XE2_REG_GUC_STATUS_BOOTROM_MASK                     xe2_reg_genmask(7, 1)
+#define XE2_REG_GUC_STATUS_MIA_IN_RESET_MASK                xe2_reg_bit(0)
+
+#define XE2_REG_STOLEN_RESERVED1                            0x1082c0 // Das war schön gestohlen mal...
+#define XE2_REG_STOLEN_RESERVED2                            0x1082c4
+#define XE2_REG_STOLEN_RESERVED_WOPCM_SIZE_MASK             xe2_reg_genmask(9, 7)
+
+#define XE2_DMC_FW_MAIN                                     0
+#define XE2_DMC_FW_PIPE_A                                   1
+#define XE2_DMC_FW_PIPE_B                                   2
+#define XE2_DMC_FW_PIPE_C                                   3
+#define XE2_DMC_FW_PIPE_D                                   4
+#define XE2_DMC_FW_PIPE_TOTAL                               5
+
+#define XE2_DMC_FW_MAIN_OFFSET                              0x80000
+#define XE2_DMC_FW_PIPE_A_OFFSET                            0x90000
+#define XE2_DMC_FW_PIPE_B_OFFSET                            0x98000
+#define XE2_DMC_FW_PIPE_C_OFFSET                            0x52000
+#define XE2_DMC_FW_PIPE_D_OFFSET                            0x59000
+
 typedef struct {
     pci_func_t *pci_func;
     uint32_t    forcewake_gsc;
@@ -179,6 +205,21 @@ typedef struct {
         uint32_t data[5];
         uint32_t ctl;
     } aux;
+
+    struct {
+        // These sizes come from firmware blob.
+        uint8_t main  [0x470C];
+        uint8_t pipe_a[0x2864];
+        uint8_t pipe_b[0x2D5C];
+        uint8_t pipe_c[0x07D8];
+        uint8_t pipe_d[0x07D8];
+
+        uint32_t main_loaded;
+        uint32_t pipe_a_loaded;
+        uint32_t pipe_b_loaded;
+        uint32_t pipe_c_loaded;
+        uint32_t pipe_d_loaded;
+    } firmware;
 } xe2_dev_t;
 
 static void xe2_remove(rvvm_mmio_dev_t* dev)
@@ -194,7 +235,8 @@ static rvvm_mmio_type_t xe2_type = {
 static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
 {
     UNUSED(size);
-    rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
+    if (offset != XE2_REG_FLUSH_PENDING)
+        rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
     xe2_dev_t *xe2 = dev->data;
 
@@ -345,15 +387,41 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
+        case XE2_REG_GUC_STATUS: {
+            // GuC (Graphics μcontroller) has read-only registers determining whether
+            // this GPU component initialized or not.
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_STATUS_MIA_IN_RESET_MASK, 1);
+            write_uint32_le(data, cmd);
+            break;
+        }
+        case XE2_REG_STEER_SEMAPHORE:
+            write_uint32_le(data, xe2->steer_semaphore);
+            break;
         case XE2_REG_DPA_AUX_CH_CTL:
         case XE2_REG_DPB_AUX_CH_CTL:
             write_uint32_le(data, xe2->aux.ctl);
             break;
-        case XE2_REG_STEER_SEMAPHORE:
-            write_uint32_le(data, xe2->steer_semaphore);
+
+        // There begin cursed decompiled part.
+        case 0x52000: // DMC program offset
+        case 0x59000: // DMC program offset
+        case 0x80000: // DMC program offset
+        case 0x90000: // DMC program offset
+        case 0x98000: // DMC program offset
+            write_uint32_le(data, 0xC0A4040); // DMC program size
+            break;
+
+        case XE2_REG_STOLEN_RESERVED1:
+        case XE2_REG_STOLEN_RESERVED2:
+            write_uint32_le(data, 0);
             break;
         default:
             break;
+    }
+
+    if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset <= (XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main))) {
+        uint32_t *word_ptr = (uint32_t *) &xe2->firmware.main[offset - XE2_DMC_FW_MAIN_OFFSET];
+        write_uint32_le(data, *word_ptr);
     }
 
     return true;
@@ -362,7 +430,9 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
 {
     UNUSED(size);
-    rvvm_info("PCI write: offset=%lx, data=%x", offset, read_uint32_le(data));
+
+    if (offset != XE2_REG_FLUSH_PENDING)
+        rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
 
@@ -426,6 +496,11 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         }
         default:
             break;
+    }
+
+    if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset <= (XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main))) {
+        memcpy(xe2->firmware.main + xe2->firmware.main_loaded, data, size);
+        xe2->firmware.main_loaded += size;
     }
 
     return true;
