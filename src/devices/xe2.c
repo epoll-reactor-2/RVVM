@@ -12,6 +12,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "compiler.h"
 #include "mem_ops.h"
 #include "utils.h"
+#include <stdint.h>
 
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
@@ -26,114 +27,25 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // #5 int          intel_display_driver_probe_nogem(struct intel_display *display)
 // #6 int          xe_display_init_early(struct xe_device *xe)
 // #7 int          xe_device_probe(struct xe_device *xe)
-
-// [    5.665556] xe 0000:00:01.0: [drm:intel_pps_vdd_on_unlocked [xe]] [ENCODER:261:DDI A/PHY A] PPS 0 turning VDD on
-// [    5.666728] xe 0000:00:01.0: [drm:intel_pps_vdd_on_unlocked [xe]] [ENCODER:261:DDI A/PHY A] PPS 0 PP_STATUS: 0xc0000000 PP_CONTROL: 0x00000008
-// [    5.668605] xe 0000:00:01.0: [drm:drm_dp_dpcd_read [drm_display_helper]] AUX A/DDI A/PHY A: 0x0002e AUX -> (ret=  1) 00
-// [    5.696760] xe 0000:00:01.0: [drm] Finished loading DMC firmware i915/bmg_dmc.bin (v2.6)
-// [    5.722651] xe 0000:00:01.0: [drm:drm_dp_dpcd_access [drm_display_helper]] AUX A/DDI A/PHY A: Too many retries, giving up. First error: -71
-// [    5.722931] xe 0000:00:01.0: [drm:drm_dp_dpcd_read [drm_display_helper]] AUX A/DDI A/PHY A: 0x00000 AUX -> (ret=-71)
-// [    5.723146] xe 0000:00:01.0: [drm] [ENCODER:261:DDI A/PHY A] failed to retrieve link info, disabling eDP
-// [    5.723455] xe 0000:00:01.0: [drm:intel_pps_vdd_off_sync_unlocked [xe]] [ENCODER:261:DDI A/PHY A] PPS 0 turning VDD off
-// [    5.724775] xe 0000:00:01.0: [drm:intel_pps_vdd_off_sync_unlocked [xe]] [ENCODER:261:DDI A/PHY A] PPS 0 PP_STATUS: 0xc0000000 PP_CONTROL: 0x00000000
-// [    5.725879] xe 0000:00:01.0: [drm:intel_power_well_disable [xe]] disabling AUX_A
-// [    5.728397] xe 0000:00:01.0: [drm:intel_vga_disable [xe]] Disabling VGA plane on pipe A
-// [    5.730642] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [CRTC:88:pipe A] hw state readout: disabled
-// [    5.732267] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [CRTC:145:pipe B] hw state readout: disabled
-// [    5.733586] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [CRTC:202:pipe C] hw state readout: disabled
-// [    5.735158] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [CRTC:259:pipe D] hw state readout: disabled
-// [    5.736567] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:33:plane 1A] hw state readout: disabled, pipe A
-// [    5.737700] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:43:plane 2A] hw state readout: disabled, pipe A
-// [    5.738847] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:53:plane 3A] hw state readout: disabled, pipe A
-// [    5.739988] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:63:plane 4A] hw state readout: disabled, pipe A
-// [    5.740990] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:73:plane 5A] hw state readout: disabled, pipe A
-// [    5.742015] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:83:cursor A] hw state readout: disabled, pipe A
-// [    5.742976] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:90:plane 1B] hw state readout: disabled, pipe B
-// [    5.743937] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:100:plane 2B] hw state readout: disabled, pipe B
-// [    5.744882] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:110:plane 3B] hw state readout: disabled, pipe B
-// [    5.745843] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:120:plane 4B] hw state readout: disabled, pipe B
-// [    5.746784] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:130:plane 5B] hw state readout: disabled, pipe B
-// [    5.748014] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:140:cursor B] hw state readout: disabled, pipe B
-// [    5.749164] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:147:plane 1C] hw state readout: disabled, pipe C
-// [    5.750259] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:157:plane 2C] hw state readout: disabled, pipe C
-// [    5.751493] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:167:plane 3C] hw state readout: disabled, pipe C
-// [    5.752657] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:177:plane 4C] hw state readout: disabled, pipe C
-// [    5.753966] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:187:plane 5C] hw state readout: disabled, pipe C
-// [    5.754945] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:197:cursor C] hw state readout: disabled, pipe C
-// [    5.755895] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:204:plane 1D] hw state readout: disabled, pipe D
-// [    5.756844] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:214:plane 2D] hw state readout: disabled, pipe D
-// [    5.757961] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:224:plane 3D] hw state readout: disabled, pipe D
-// [    5.758937] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:234:plane 4D] hw state readout: disabled, pipe D
-// [    5.759890] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:244:plane 5D] hw state readout: disabled, pipe D
-// [    5.760804] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:254:cursor D] hw state readout: disabled, pipe D
-// [    5.761817] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:33:plane 1A] min_cdclk 0 kHz
-// [    5.762676] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:43:plane 2A] min_cdclk 0 kHz
-// [    5.763562] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:53:plane 3A] min_cdclk 0 kHz
-// [    5.764735] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:63:plane 4A] min_cdclk 0 kHz
-// [    5.765764] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:73:plane 5A] min_cdclk 0 kHz
-// [    5.766730] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:83:cursor A] min_cdclk 0 kHz
-// [    5.767865] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:90:plane 1B] min_cdclk 0 kHz
-// [    5.769052] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:100:plane 2B] min_cdclk 0 kHz
-// [    5.770148] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:110:plane 3B] min_cdclk 0 kHz
-// [    5.771058] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:120:plane 4B] min_cdclk 0 kHz
-// [    5.771961] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:130:plane 5B] min_cdclk 0 kHz
-// [    5.772797] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:140:cursor B] min_cdclk 0 kHz
-// [    5.773670] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:147:plane 1C] min_cdclk 0 kHz
-// [    5.774635] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:157:plane 2C] min_cdclk 0 kHz
-// [    5.775592] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:167:plane 3C] min_cdclk 0 kHz
-// [    5.776475] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:177:plane 4C] min_cdclk 0 kHz
-// [    5.777319] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:187:plane 5C] min_cdclk 0 kHz
-// [    5.778179] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:197:cursor C] min_cdclk 0 kHz
-// [    5.779059] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:204:plane 1D] min_cdclk 0 kHz
-// [    5.779945] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:214:plane 2D] min_cdclk 0 kHz
-// [    5.780994] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:224:plane 3D] min_cdclk 0 kHz
-// [    5.782061] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:234:plane 4D] min_cdclk 0 kHz
-// [    5.782997] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:244:plane 5D] min_cdclk 0 kHz
-// [    5.783957] xe 0000:00:01.0: [drm:intel_modeset_setup_hw_state [xe]] [PLANE:254:cursor D] min_cdclk 0 kHz
-// [    5.785281] xe 0000:00:01.0: [drm:skl_wm_get_hw_state [xe]] [CRTC:88:pipe A] dbuf slices 0x0, ddb (0 - 0), active pipes 0x0, mbus joined: no
-// [    5.786505] xe 0000:00:01.0: [drm:skl_wm_get_hw_state [xe]] [CRTC:145:pipe B] dbuf slices 0x0, ddb (0 - 0), active pipes 0x0, mbus joined: no
-// [    5.787791] xe 0000:00:01.0: [drm:skl_wm_get_hw_state [xe]] [CRTC:202:pipe C] dbuf slices 0x0, ddb (0 - 0), active pipes 0x0, mbus joined: no
-// [    5.788740] xe 0000:00:01.0: [drm:skl_wm_get_hw_state [xe]] [CRTC:259:pipe D] dbuf slices 0x0, ddb (0 - 0), active pipes 0x0, mbus joined: no
-// [    5.789760] xe 0000:00:01.0: [drm:intel_bw_update_hw_state [xe]] pipe A data rate 0 num active planes 0
-// [    5.790698] xe 0000:00:01.0: [drm:intel_bw_update_hw_state [xe]] pipe B data rate 0 num active planes 0
-// [    5.791675] xe 0000:00:01.0: [drm:intel_bw_update_hw_state [xe]] pipe C data rate 0 num active planes 0
-// [    5.792653] xe 0000:00:01.0: [drm:intel_bw_update_hw_state [xe]] pipe D data rate 0 num active planes 0
-// [    5.793951] xe 0000:00:01.0: [drm:intel_cmtg_sanitize [xe]] CMTG readout: CMTG A: disabled, CMTG B: n/a, Transcoder A secondary: no, Transcoder B secondary: no
-// [    5.795127] xe 0000:00:01.0: [drm:drm_dbg_printer.constprop.0 [xe]] [CRTC:88:pipe A] enable: no [setup_hw_state]
-// [    5.796073] xe 0000:00:01.0: [drm:drm_dbg_printer.constprop.0 [xe]] [CRTC:145:pipe B] enable: no [setup_hw_state]
-// [    5.797075] xe 0000:00:01.0: [drm:drm_dbg_printer.constprop.0 [xe]] [CRTC:202:pipe C] enable: no [setup_hw_state]
-// [    5.798247] xe 0000:00:01.0: [drm:drm_dbg_printer.constprop.0 [xe]] [CRTC:259:pipe D] enable: no [setup_hw_state]
-// [    5.799615] xe 0000:00:01.0: [drm:intel_power_domains_sanitize_state [xe]] BIOS left unused AUX_B power well enabled, disabling it
-// [    5.800643] xe 0000:00:01.0: [drm:intel_power_well_disable [xe]] disabling AUX_B
-// [    5.804714] xe 0000:00:01.0: [drm:intel_power_domains_sanitize_state [xe]] BIOS left unused AUX_A power well enabled, disabling it
-// [    5.805778] xe 0000:00:01.0: [drm:intel_power_well_disable [xe]] disabling AUX_A
-// [    5.822698] flags & PCI_IRQ_MSIX. nvecs: 32
-// [    5.828356] xe 0000:00:01.0: [drm] Tile0: GT0: Using GuC firmware from xe/lnl_guc_70.bin version 70.60.0
-// [    5.879350] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 0] = 0x0035e3f7
-// [    5.880336] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 1] = 0x00000000
-// [    5.881512] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 2] = 0x00000000
-// [    5.882547] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 3] = 0x00000040
-// [    5.883479] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 4] = 0x000008e6
-// [    5.884381] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 5] = 0x64200000
-// [    5.885262] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 6] = 0x00000000
-// [    5.886172] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 7] = 0x00000000
-// [    5.887030] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 8] = 0x00000000
-// [    5.887899] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[ 9] = 0x00000000
-// [    5.888967] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[10] = 0x00000000
-// [    5.890058] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[11] = 0x00000000
-// [    5.891236] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[12] = 0x00000000
-// [    5.892215] xe 0000:00:01.0: [drm:guc_print_params [xe]] Tile0: GT0: GuC param[13] = 0x00000000
-// [    5.901569] xe 0000:00:01.0: [drm] Tile0: GT0: Using HuC firmware from xe/lnl_huc.bin version 9.4.13
-// [    5.913600] xe 0000:00:01.0: [drm] Tile0: GT0: Using GSC firmware from xe/lnl_gsc_1.bin version 104.0.5.1429
-// [    5.917596] xe 0000:00:01.0: [drm] Tile0: GT0: can't init GSC proxy due to missing mei component
-// [    5.917753] xe 0000:00:01.0: [drm:xe_wopcm_init [xe]] WOPCM: 2048K
-// [    5.918793] xe 0000:00:01.0: [drm:xe_wopcm_init [xe]] Calculated GuC WOPCM [640K, 1372K)
-// [    7.197316] xe 0000:00:01.0: [drm:__xe_guc_upload [xe]] Tile0: GT0: load still in progress, timeouts = 1, freq = 0MHz (req 0MHz), status = 0x00000001 [0x00/00]
-// [    8.261117] xe 0000:00:01.0: [drm:__xe_guc_upload [xe]] Tile0: GT0: load still in progress, timeouts = 2, freq = 0MHz (req 0MHz), status = 0x00000001 [0x00/00]
-// [    9.285796] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: load failed: status = 0x00000001, time = 3359ms, freq = 0MHz (req 0MHz), done = 0
-// [    9.286150] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: load failed: status: Reset = 1, BootROM = 0x00, UKernel = 0x00, MIA = 0x00, Auth = 0x00
-// [    9.286447] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-EPROTO)
-// [    9.286917] xe 0000:00:01.0: probe with driver xe failed with error -71
+//
+// Currently reads out this sequence with unknown requirements for it:
+//
+// #define XE2_REG_DPA_AUX_CH_DATA     0x64014
+// #define XE2_REG_DPB_AUX_CH_DATA     0x64114
+// #define XE2_REG_DPA_AUX_CH_CTL      0x64010
+// #define XE2_REG_DPB_AUX_CH_CTL      0x64110
+// #define XE2_REG_PP_STATUS           0x61200
+// #define XE2_REG_PP_CONTROL          0x61204
+//
+////////////////////////////////////////////////////////////////////////
+//
+// GuC failure:
+//
+// [    8.576459] xe 0000:00:01.0: [drm:__xe_guc_upload [xe]] Tile0: GT0: load still in progress, timeouts = 1, freq = 0MHz (req 0MHz), status = 0x00000000 [0x00/00]
+// [    9.601908] xe 0000:00:01.0: [drm:__xe_guc_upload [xe]] Tile0: GT0: load still in progress, timeouts = 2, freq = 0MHz (req 0MHz), status = 0x00000000 [0x00/00]
+// [   10.626517] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: load failed: status = 0x00000000, time = 3365ms, freq = 0MHz (req 0MHz), done = 0
+// [   10.626713] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: load failed: status: Reset = 0, BootROM = 0x00, UKernel = 0x00, MIA = 0x00, Auth = 0x00
+// [   10.626863] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-EPROTO)
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -179,6 +91,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_VF_CAP                                      0x1901F8
 #define XE2_REG_VF_CAP_MASK                                 xe2_reg_genmask(0, 0)
+
+#define XE2_REG_DPA_AUX_CH_DATA                             0x64014
+#define XE2_REG_DPB_AUX_CH_DATA                             0x64114
 
 #define XE2_REG_DPA_AUX_CH_CTL                              0x64010 // i915/display/intel_dp_aux_regs.h
 #define XE2_REG_DPB_AUX_CH_CTL                              0x64110
@@ -309,6 +224,27 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_DMC_FW_PIPE_C_OFFSET                            0x52000
 #define XE2_DMC_FW_PIPE_D_OFFSET                            0x59000
 
+#define XE2_REG_PLANE_CTL_1_A                               0x70180 // We assume post-icl graphics
+#define XE2_REG_PLANE_CTL_2_A                               0x70280
+#define XE2_REG_PLANE_CTL_1_B                               0x71180
+#define XE2_REG_PLANE_CTL_2_B                               0x71280
+#define XE2_REG_PLANE_CTL_X_ICL_FORMAT_MASK                 xe2_reg_genmask(27, 23)
+#define XE2_REG_PLANE_CTL_X_KEY_ENABLE_MASK                 xe2_reg_genmask(21, 22)
+#define XE2_REG_PLANE_CTL_X_ORDER_RGBX_MASK                 xe2_reg_bit(20)
+#define XE2_REG_PLANE_CTL_X_YUV420_Y_PLANE_MASK             xe2_reg_bit(19)
+#define XE2_REG_PLANE_CTL_X_YUV_TO_RGB_CSC_FORMAT_BT709_MASK \
+                                                            xe2_reg_bit(18)
+#define XE2_REG_PLANE_CTL_X_YUV422_ORDER_MASK               xe2_reg_genmask(17, 16)
+#define XE2_REG_PLANE_CTL_X_RENDER_DECOMPRESSION_ENABLE_MASK \
+                                                            xe2_reg_bit(15)
+#define XE2_REG_PLANE_CTL_X_TRICKLE_FEED_DISABLE_MASK       xe2_reg_bit(14)
+#define XE2_REG_PLANE_CTL_X_CLEAR_COLOR_DISABLE_MASK        xe2_reg_bit(13)
+#define XE2_REG_PLANE_CTL_X_TILED_MASK                      xe2_reg_genmask(12, 10)
+#define XE2_REG_PLANE_CTL_X_ASYNC_FLIP_MASK                 xe2_reg_bit(9)
+#define XE2_REG_PLANE_CTL_X_FLIP_HORIZONTAL_MASK            xe2_reg_bit(8)
+#define XE2_REG_PLANE_CTL_X_MEDIA_DECOMPRESSION_ENABLE_MASK xe2_reg_bit(4)
+#define XE2_REG_PLANE_CTL_X_ROTATE_MASK                     xe2_reg_genmask(1, 0)
+
 typedef struct {
     pci_func_t *pci_func;
     uint32_t    forcewake_gsc;
@@ -405,6 +341,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
         case XE2_REG_PP_CONTROL:
+            xe2->pp_control |= xe2_reg_field_prep(XE2_REG_PP_CONTROL_POWER_ON_MASK, 1);
             write_uint32_le(data, xe2->pp_control);
             break;
         case XE2_REG_HSW_POWER_WELL_CTL1:
@@ -514,7 +451,13 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_GUC_STATUS: {
             // GuC (Graphics μcontroller) has read-only registers determining whether
             // this GPU component initialized or not.
-            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_STATUS_MIA_IN_RESET_MASK, 1);
+            //
+            // We need more complext GuC logic that hardcode.
+            //
+            // uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_STATUS_MIA_IN_RESET_MASK, 1)
+            //              | xe2_reg_field_prep(XE2_REG_GUC_STATUS_BOOTROM_MASK, 0)
+            //              | xe2_reg_field_prep(XE2_REG_GUC_STATUS_UKERNEL_MASK, 0xF0); // enum xe_guc_load_status
+            uint32_t cmd = 0;
             write_uint32_le(data, cmd);
             break;
         }
@@ -538,7 +481,12 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         case XE2_REG_DPA_AUX_CH_CTL:
         case XE2_REG_DPB_AUX_CH_CTL:
+            xe2->aux.ctl |= XE2_REG_DBX_AUX_CH_CTL_SEND_BUSY_MASK;
             write_uint32_le(data, xe2->aux.ctl);
+            break;
+        case XE2_REG_DPA_AUX_CH_DATA:
+        case XE2_REG_DPB_AUX_CH_DATA:
+            write_uint32_le(data, xe2->aux.data[0]);
             break;
 
         // There begin cursed decompiled part.
@@ -554,6 +502,17 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_STOLEN_RESERVED2:
             write_uint32_le(data, 0);
             break;
+
+        case XE2_REG_PLANE_CTL_1_A:
+        case XE2_REG_PLANE_CTL_2_A:
+        case XE2_REG_PLANE_CTL_1_B:
+        case XE2_REG_PLANE_CTL_2_B: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_ICL_FORMAT_MASK, 14) // RGB565
+                         | xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_KEY_ENABLE_MASK, 1);
+            write_uint32_le(data, cmd);
+            break;
+        }
+
         default:
             break;
     }
@@ -590,9 +549,9 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             uint32_t cmd = read_uint32_le(data);
             xe2->aux.power_request = (cmd >> 19) & 1;
             if (cmd & (1U << 31)) {
-                xe2->aux.data[0] = 0x00000014;
-                xe2->aux.data[1] = 0x00000001;
-                xe2->aux.data[2] = 0x00000084;
+                // xe2->aux.data[0] = 0x00000014;
+                // xe2->aux.data[1] = 0x00000001;
+                // xe2->aux.data[2] = 0x00000084;
                 uint32_t out_cmd = cmd;
                 out_cmd &=  ~(1U << 31);
                 out_cmd |=   (1U << 30);
@@ -605,6 +564,10 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             }
             break;
         }
+        case XE2_REG_DPA_AUX_CH_DATA:
+        case XE2_REG_DPB_AUX_CH_DATA:
+            xe2->aux.data[0] = read_uint32_le(data);
+            break;
         case XE2_REG_BXT_DE_PLL_ENABLE: {
             uint32_t cmd = read_uint32_le(data);
             xe2->pll_enable = !!xe2_reg_field_get(XE2_REG_BXT_DE_PLL_ENABLE_MASK, cmd);
