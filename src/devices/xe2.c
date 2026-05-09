@@ -19,23 +19,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // Current status: GuC init. They have one extra command set for GUC:
 //
-// enum xe_guc_action {
-//     XE_GUC_ACTION_DEFAULT = 0x0,
-//     XE_GUC_ACTION_REQUEST_PREEMPTION = 0x2,
-//     XE_GUC_ACTION_REQUEST_ENGINE_RESET = 0x3,
-//     XE_GUC_ACTION_ALLOCATE_DOORBELL = 0x10,
-//     XE_GUC_ACTION_DEALLOCATE_DOORBELL = 0x20,
-//     XE_GUC_ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE = 0x30,
-//     XE_GUC_ACTION_UK_LOG_ENABLE_LOGGING = 0x40,
-//     XE_GUC_ACTION_FORCE_LOG_BUFFER_FLUSH = 0x302,
-//     XE_GUC_ACTION_ENTER_S_STATE = 0x501,
-//     XE_GUC_ACTION_EXIT_S_STATE = 0x502,
-//     ...
-//
-// They also use GGTT addresses.
-//
-// int xe_guc_hwconfig_init(struct xe_guc *guc)
-// static int guc_hwconfig_size(struct xe_guc *guc, u32 *size)
+// Note that this is a kernel parameter:
+// .. *ERROR* Tile0: GT0: Slice/Subslice counts missing from hwconfig table; using typical fallback values
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -63,6 +48,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GT_FORCEWAKE_GT                             0xA188
 #define XE2_REG_GT_FORCEWAKE_ACK_GT                         0x130044 // How these forcewakes are related?
 #define XE2_REG_GT_FORCEWAKE_ACK_GT_MTL                     0xDFC
+#define XE2_REG_GT_FORCEWAKE_RENDER                         0xA278
+#define XE2_REG_GT_FORCEWAKE_ACK_RENDER                     0xD84
+
+#define XE2_REG_GT_GDRST                                    0x941C
+
+#define XE2_REG_GT_POWERGATE_ENABLE                         0xA210
+#define XE2_REG_GT_POWERGATE_ENABLE_RENDER_MASK             xe2_reg_bit(0)
+#define XE2_REG_GT_POWERGATE_ENABLE_MEDIA_MASK              xe2_reg_bit(1)
+#define XE2_REG_GT_POWERGATE_ENABLE_MEDIA_SAMPLES_MASK      xe2_reg_bit(2)
+#define XE2_REG_GT_POWERGATE_ENABLE_VDN_HCP_MASK(n)         xe2_reg_bit(3 + 2 * (n))
+#define XE2_REG_GT_POWERGATE_ENABLE_VDN_MFXVDENC_MASK(n)    xe2_reg_bit(4 + 2 * (n))
 
 #define XE2_REG_MTL_MEM_SS_INFO                             0x45700 // Memory subsystem configuration
 #define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_MASK             xe2_reg_genmask(11, 8)
@@ -203,6 +199,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GUC_FW_SW_4                                 0x19024C
 #define XE2_REG_GUC_FW_SW_X_MSG_0_ORIGIN_MASK               xe2_reg_bit(31)
 #define XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK                 xe2_reg_genmask(30, 28)
+#define XE2_REG_GUC_FW_SW_X_MSG_0_DATA_MASK                 xe2_reg_genmask(27, 0)
 
 #define XE2_REG_GUC_HOST_INTERRUPT                          0x1901F0
 
@@ -244,10 +241,102 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_PLANE_CTL_X_MEDIA_DECOMPRESSION_ENABLE_MASK xe2_reg_bit(4)
 #define XE2_REG_PLANE_CTL_X_ROTATE_MASK                     xe2_reg_genmask(1, 0)
 
+#define XE2_GUC_ACTION_DEFAULT                              0x0
+#define XE2_GUC_ACTION_REQUEST_PREEMPTION                   0x2
+#define XE2_GUC_ACTION_REQUEST_ENGINE_RESET                 0x3
+#define XE2_GUC_ACTION_ALLOCATE_DOORBELL                    0x10
+#define XE2_GUC_ACTION_DEALLOCATE_DOORBELL                  0x20
+#define XE2_GUC_ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE       0x30
+#define XE2_GUC_ACTION_UK_LOG_ENABLE_LOGGING                0x40
+#define XE2_GUC_ACTION_FORCE_LOG_BUFFER_FLUSH               0x302
+#define XE2_GUC_ACTION_ENTER_S_STATE                        0x501
+#define XE2_GUC_ACTION_EXIT_S_STATE                         0x502
+#define XE2_GUC_ACTION_GLOBAL_SCHED_POLICY_CHANGE           0x506
+#define XE2_GUC_ACTION_HOST2GUC_SELF_CFG                    0x508
+#define XE2_GUC_ACTION_UPDATE_SCHEDULING_POLICIES_KLV       0x509
+#define XE2_GUC_ACTION_SCHED_CONTEXT                        0x1000
+#define XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET               0x1001
+#define XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE              0x1002
+#define XE2_GUC_ACTION_SCHED_ENGINE_MODE_SET                0x1003
+#define XE2_GUC_ACTION_SCHED_ENGINE_MODE_DONE               0x1004
+#define XE2_GUC_ACTION_SET_CONTEXT_PRIORITY                 0x1005
+#define XE2_GUC_ACTION_SET_CONTEXT_EXECUTION_QUANTUM        0x1006
+#define XE2_GUC_ACTION_SET_CONTEXT_PREEMPTION_TIMEOUT       0x1007
+#define XE2_GUC_ACTION_CONTEXT_RESET_NOTIFICATION           0x1008
+#define XE2_GUC_ACTION_ENGINE_FAILURE_NOTIFICATION          0x1009
+#define XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES     0x100B
+#define XE2_GUC_ACTION_AUTHENTICATE_HUC                     0x4000
+#define XE2_GUC_ACTION_GET_HWCONFIG                         0x4100
+#define XE2_GUC_ACTION_REGISTER_CONTEXT                     0x4502
+#define XE2_GUC_ACTION_DEREGISTER_CONTEXT                   0x4503
+#define XE2_GUC_ACTION_REGISTER_COMMAND_TRANSPORT_BUFFER    0x4505
+#define XE2_GUC_ACTION_DEREGISTER_COMMAND_TRANSPORT_BUFFER  0x4506
+#define XE2_GUC_ACTION_REGISTER_G2G                         0x4507
+#define XE2_GUC_ACTION_DEREGISTER_G2G                       0x4508
+#define XE2_GUC_ACTION_DEREGISTER_CONTEXT_DONE              0x4600
+#define XE2_GUC_ACTION_REGISTER_CONTEXT_MULTI_LRC           0x4601
+#define XE2_GUC_ACTION_CLIENT_SOFT_RESET                    0x5507
+#define XE2_GUC_ACTION_SET_ENG_UTIL_BUFF                    0x550A
+#define XE2_GUC_ACTION_SET_DEVICE_ENGINE_ACTIVITY_BUFFER    0x550C
+#define XE2_GUC_ACTION_SET_FUNCTION_ENGINE_ACTIVITY_BUFFER  0x550D
+#define XE2_GUC_ACTION_OPT_IN_FEATURE_KLV                   0x550E
+#define XE2_GUC_ACTION_NOTIFY_MEMORY_CAT_ERROR              0x6000
+#define XE2_GUC_ACTION_REPORT_PAGE_FAULT_REQ_DESC           0x6002
+#define XE2_GUC_ACTION_PAGE_FAULT_RES_DESC                  0x6003
+#define XE2_GUC_ACTION_ACCESS_COUNTER_NOTIFY                0x6004
+#define XE2_GUC_ACTION_TLB_INVALIDATION                     0x7000
+#define XE2_GUC_ACTION_TLB_INVALIDATION_DONE                0x7001
+#define XE2_GUC_ACTION_TLB_INVALIDATION_ALL                 0x7002
+#define XE2_GUC_ACTION_STATE_CAPTURE_NOTIFICATION           0x8002
+#define XE2_GUC_ACTION_NOTIFY_FLUSH_LOG_BUFFER_TO_FILE      0x8003
+#define XE2_GUC_ACTION_NOTIFY_CRASH_DUMP_POSTED             0x8004
+#define XE2_GUC_ACTION_NOTIFY_EXCEPTION                     0x8005
+#define XE2_GUC_ACTION_TEST_G2G_SEND                        0xF001
+#define XE2_GUC_ACTION_TEST_G2G_RECV                        0xF002
+
+#define XE2_HW_ENGINE_RENDER_RING_BASE                      0x02000
+#define XE2_HW_ENGINE_BSD_RING_BASE                         0x1C0000
+#define XE2_HW_ENGINE_BSD2_RING_BASE                        0x1C4000
+#define XE2_HW_ENGINE_BSD3_RING_BASE                        0x1D0000
+#define XE2_HW_ENGINE_BSD4_RING_BASE                        0x1D4000
+#define XE2_HW_ENGINE_XEHP_BSD5_RING_BASE                   0x1E0000
+#define XE2_HW_ENGINE_XEHP_BSD6_RING_BASE                   0x1E4000
+#define XE2_HW_ENGINE_XEHP_BSD7_RING_BASE                   0x1F0000
+#define XE2_HW_ENGINE_XEHP_BSD8_RING_BASE                   0x1F4000
+#define XE2_HW_ENGINE_VEBOX_RING_BASE                       0x1C8000
+#define XE2_HW_ENGINE_VEBOX2_RING_BASE                      0x1D8000
+#define XE2_HW_ENGINE_XEHP_VEBOX3_RING_BASE                 0x1E8000
+#define XE2_HW_ENGINE_XEHP_VEBOX4_RING_BASE                 0x1F8000
+#define XE2_HW_ENGINE_COMPUTE0_RING_BASE                    0x1A000
+#define XE2_HW_ENGINE_COMPUTE1_RING_BASE                    0x1C000
+#define XE2_HW_ENGINE_COMPUTE2_RING_BASE                    0x1E000
+#define XE2_HW_ENGINE_COMPUTE3_RING_BASE                    0x26000
+#define XE2_HW_ENGINE_BLT_RING_BASE                         0x22000
+#define XE2_HW_ENGINE_XEHPC_BCS1_RING_BASE                  0x3E0000
+#define XE2_HW_ENGINE_XEHPC_BCS2_RING_BASE                  0x3E2000
+#define XE2_HW_ENGINE_XEHPC_BCS3_RING_BASE                  0x3E4000
+#define XE2_HW_ENGINE_XEHPC_BCS4_RING_BASE                  0x3E6000
+#define XE2_HW_ENGINE_XEHPC_BCS5_RING_BASE                  0x3E8000
+#define XE2_HW_ENGINE_XEHPC_BCS6_RING_BASE                  0x3EA000
+#define XE2_HW_ENGINE_XEHPC_BCS7_RING_BASE                  0x3EC000
+#define XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE                  0x3EE000
+#define XE2_HW_ENGINE_GSCCS_RING_BASE                       0x11A000
+
+#define XE2_REG_HW_ENGINE_RING_IDLEDLY(base)                (base + 0x23C)
+#define XE2_REG_HW_ENGINE_RING_IDLEDLY_INHIBIT_SWITCH_UNTIL_PREEMPTED_MASK \
+                                                            xe2_reg_bit(31)
+#define XE2_REG_HW_ENGINE_RING_IDLEDLY_IDLE_DELAY_MASK      xe2_reg_genmask(20, 0)
+
+#define XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT(base)          (base + 0x54)
+#define XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT_IDLE_WAIT_TIME_MASK \
+                                                            xe2_reg_genmask(19, 0)
+
 typedef struct {
     pci_func_t *pci_func;
     uint32_t    forcewake_gsc;
     uint32_t    forcewake_gt_mtl;
+    uint32_t    forcewake_renderer;
+    uint32_t    gt_gdrst;
     uint32_t    pll_enable;
     uint32_t    dbuf_ctl[4];
     uint32_t    pp_control;
@@ -258,6 +347,8 @@ typedef struct {
     uint32_t    wopcm_size;
     uint32_t    wopcm_offset;
     uint32_t    wopcm_locked;
+
+    uint32_t    guc_actions[4];
 
     struct {
         uint8_t power_request;
@@ -291,10 +382,48 @@ static rvvm_mmio_type_t xe2_type = {
     .remove = xe2_remove,
 };
 
+// GuC commands pipeline:
+//
+// write (GUC FW SW 1): 32 bit header
+// write (GUC FW SW 2): 32 bit payload
+// write (GUC FW SW 3): 32 bit payload
+// write (GUC FW SW 4): 32 bit payload
+// ...
+// Length of payload depends on header.
+//
+// write: offset=XE2_REG_GUC_FW_SW_1, data=508,     size = 4    GUC_ACTION_HOST2GUC_SELF_CFG (0x0508)
+// write: offset=XE2_REG_GUC_FW_SW_2, data=9030002, size = 4    GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY (0x0903) | len (2 words)
+// write: offset=XE2_REG_GUC_FW_SW_3, data=cf7000,  size = 4    Lower 32 bits of payload
+// write: offset=XE2_REG_GUC_FW_SW_4, data=0,       size = 4    Upper 32 bits of payload
+static inline void xe2_guc_fw_action(void *data, uint32_t action, uint32_t index)
+{
+    UNUSED(index);
+
+    uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_ORIGIN_MASK, 1) // Origin GUC
+                 | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7);  // Success
+    uint32_t arg = 0U;
+
+    if (index == 0)
+        switch (action) {
+            case XE2_GUC_ACTION_GET_HWCONFIG:
+                arg = 0x10000;
+                break;
+            case XE2_GUC_ACTION_HOST2GUC_SELF_CFG:
+                arg = 1;
+                break;
+            default:
+                break;
+        }
+
+    cmd |= xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_DATA_MASK, arg);
+
+    write_uint32_le(data, cmd);
+}
+
 static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
 {
     UNUSED(size);
-    if (offset != XE2_REG_FLUSH_PENDING)
+    if (offset != XE2_REG_FLUSH_PENDING && offset < 800000)
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
     xe2_dev_t *xe2 = dev->data;
@@ -332,6 +461,15 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_GT_FORCEWAKE_ACK_GT_MTL:
         case XE2_REG_GT_FORCEWAKE_ACK_GT:
             write_uint32_le(data, xe2->forcewake_gt_mtl);
+            break;
+        case XE2_REG_GT_FORCEWAKE_RENDER:
+            break;
+        case XE2_REG_GT_FORCEWAKE_ACK_RENDER:
+            write_uint32_le(data, xe2->forcewake_renderer);
+            break;
+        case XE2_REG_GT_GDRST:
+            xe2->gt_gdrst = 0;
+            write_uint32_le(data, xe2->gt_gdrst);
             break;
         case XE2_REG_PP_STATUS: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_PP_ON_MASK, 1)
@@ -460,14 +598,17 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
         case XE2_REG_GUC_FW_SW_1:
-        case XE2_REG_GUC_FW_SW_2:
-        case XE2_REG_GUC_FW_SW_3:
-        case XE2_REG_GUC_FW_SW_4: {
-            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_ORIGIN_MASK, 1) // Origin GUC
-                         | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7);  // Success
-            write_uint32_le(data, cmd);
+            xe2_guc_fw_action(data, xe2->guc_actions[0], 0);
             break;
-        }
+        case XE2_REG_GUC_FW_SW_2:
+            xe2_guc_fw_action(data, xe2->guc_actions[1], 1);
+            break;
+        case XE2_REG_GUC_FW_SW_3:
+            xe2_guc_fw_action(data, xe2->guc_actions[2], 2);
+            break;
+        case XE2_REG_GUC_FW_SW_4:
+            xe2_guc_fw_action(data, xe2->guc_actions[3], 3);
+            break;
 
         case XE2_REG_GUC_WOPCM_SIZE: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_WOPCM_SIZE_MASK, xe2->wopcm_size)
@@ -520,6 +661,30 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
+        // Hardware engines:
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_BLT_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_RENDER_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE): {
+            // In kernel: gt->info.timestamp_base = 83333
+            //            idledly_units_ps = 8 * gt->info.timestamp_base
+            //            idledly = DIV_ROUND_CLOSEST(idledly * idledly_units_ps, 1000)
+            //            -> 0xd05
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_HW_ENGINE_RING_IDLEDLY_INHIBIT_SWITCH_UNTIL_PREEMPTED_MASK, 0)
+                         | xe2_reg_field_prep(XE2_REG_HW_ENGINE_RING_IDLEDLY_IDLE_DELAY_MASK, 5);
+            write_uint32_le(data, cmd);
+            break;
+        }
+
+        case XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT(XE2_HW_ENGINE_BLT_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT(XE2_HW_ENGINE_RENDER_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE): {
+            // In kernel: maxcnt = 10 * 640 (maxcnt_units_ns)
+            //            -> 0x1900
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT_IDLE_WAIT_TIME_MASK, 10);
+            write_uint32_le(data, cmd);
+            break;
+        }
+
         default:
             break;
     }
@@ -536,7 +701,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING)
+    if (offset != XE2_REG_FLUSH_PENDING && offset < 800000)
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
@@ -547,6 +712,12 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             break;
         case XE2_REG_GT_FORCEWAKE_GT:
             xe2->forcewake_gt_mtl = read_uint32_le(data);
+            break;
+        case XE2_REG_GT_FORCEWAKE_RENDER:
+            xe2->forcewake_renderer = read_uint32_le(data);
+            break;
+        case XE2_REG_GT_GDRST:
+            xe2->gt_gdrst = read_uint32_le(data);
             break;
         case XE2_REG_STEER_SEMAPHORE:
             xe2->steer_semaphore = read_uint32_le(data);
@@ -614,6 +785,18 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->wopcm_offset = xe2_reg_field_get(XE2_REG_GUC_WOPCM_OFFSET_MASK, cmd);
             break;
         }
+        case XE2_REG_GUC_FW_SW_1:
+            xe2->guc_actions[0] = read_uint32_le(data);
+            break;
+        case XE2_REG_GUC_FW_SW_2:
+            xe2->guc_actions[1] = read_uint32_le(data);
+            break;
+        case XE2_REG_GUC_FW_SW_3:
+            xe2->guc_actions[2] = read_uint32_le(data);
+            break;
+        case XE2_REG_GUC_FW_SW_4:
+            xe2->guc_actions[3] = read_uint32_le(data);
+            break;
         default:
             break;
     }
