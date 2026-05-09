@@ -17,35 +17,25 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: WOPCM configured, driver lookups for some display info
+// Current status: GuC init. They have one extra command set for GUC:
 //
-// #0 static bool  intel_edp_init_connector(struct intel_dp *intel_dp, struct intel_connector *connector)
-// #1 bool         intel_dp_init_connector(struct intel_digital_port *dig_port, struct intel_connector *connector)
-// #2 static int   intel_ddi_init_dp_connector(struct intel_digital_port *dig_port)
-// #3 void         intel_ddi_init(struct intel_display *display, const struct intel_bios_encoder_data *devdata)
-// #4 void         intel_setup_outputs(struct intel_display *display)
-// #5 int          intel_display_driver_probe_nogem(struct intel_display *display)
-// #6 int          xe_display_init_early(struct xe_device *xe)
-// #7 int          xe_device_probe(struct xe_device *xe)
+// enum xe_guc_action {
+//     XE_GUC_ACTION_DEFAULT = 0x0,
+//     XE_GUC_ACTION_REQUEST_PREEMPTION = 0x2,
+//     XE_GUC_ACTION_REQUEST_ENGINE_RESET = 0x3,
+//     XE_GUC_ACTION_ALLOCATE_DOORBELL = 0x10,
+//     XE_GUC_ACTION_DEALLOCATE_DOORBELL = 0x20,
+//     XE_GUC_ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE = 0x30,
+//     XE_GUC_ACTION_UK_LOG_ENABLE_LOGGING = 0x40,
+//     XE_GUC_ACTION_FORCE_LOG_BUFFER_FLUSH = 0x302,
+//     XE_GUC_ACTION_ENTER_S_STATE = 0x501,
+//     XE_GUC_ACTION_EXIT_S_STATE = 0x502,
+//     ...
 //
-// Currently reads out this sequence with unknown requirements for it:
+// They also use GGTT addresses.
 //
-// #define XE2_REG_DPA_AUX_CH_DATA     0x64014
-// #define XE2_REG_DPB_AUX_CH_DATA     0x64114
-// #define XE2_REG_DPA_AUX_CH_CTL      0x64010
-// #define XE2_REG_DPB_AUX_CH_CTL      0x64110
-// #define XE2_REG_PP_STATUS           0x61200
-// #define XE2_REG_PP_CONTROL          0x61204
-//
-////////////////////////////////////////////////////////////////////////
-//
-// GuC failure:
-//
-// [    8.576459] xe 0000:00:01.0: [drm:__xe_guc_upload [xe]] Tile0: GT0: load still in progress, timeouts = 1, freq = 0MHz (req 0MHz), status = 0x00000000 [0x00/00]
-// [    9.601908] xe 0000:00:01.0: [drm:__xe_guc_upload [xe]] Tile0: GT0: load still in progress, timeouts = 2, freq = 0MHz (req 0MHz), status = 0x00000000 [0x00/00]
-// [   10.626517] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: load failed: status = 0x00000000, time = 3365ms, freq = 0MHz (req 0MHz), done = 0
-// [   10.626713] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: load failed: status: Reset = 0, BootROM = 0x00, UKernel = 0x00, MIA = 0x00, Auth = 0x00
-// [   10.626863] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-EPROTO)
+// int xe_guc_hwconfig_init(struct xe_guc *guc)
+// static int guc_hwconfig_size(struct xe_guc *guc, u32 *size)
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -207,8 +197,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GUC_STATUS_BOOTROM_MASK                     xe2_reg_genmask(7, 1)
 #define XE2_REG_GUC_STATUS_MIA_IN_RESET_MASK                xe2_reg_bit(0)
 
-#define XE2_REG_STOLEN_RESERVED1                            0x1082c0 // Das war schön gestohlen mal...
-#define XE2_REG_STOLEN_RESERVED2                            0x1082c4
+#define XE2_REG_GUC_FW_SW_1                                 0x190240
+#define XE2_REG_GUC_FW_SW_2                                 0x190244
+#define XE2_REG_GUC_FW_SW_3                                 0x190248
+#define XE2_REG_GUC_FW_SW_4                                 0x19024C
+#define XE2_REG_GUC_FW_SW_X_MSG_0_ORIGIN_MASK               xe2_reg_bit(31)
+#define XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK                 xe2_reg_genmask(30, 28)
+
+#define XE2_REG_GUC_HOST_INTERRUPT                          0x1901F0
+
+#define XE2_REG_STOLEN_RESERVED1                            0x1082C0 // Das war schön gestohlen mal...
+#define XE2_REG_STOLEN_RESERVED2                            0x1082C4
 #define XE2_REG_STOLEN_RESERVED_WOPCM_SIZE_MASK             xe2_reg_genmask(9, 7)
 
 #define XE2_DMC_FW_MAIN                                     0
@@ -229,7 +228,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_PLANE_CTL_1_B                               0x71180
 #define XE2_REG_PLANE_CTL_2_B                               0x71280
 #define XE2_REG_PLANE_CTL_X_ICL_FORMAT_MASK                 xe2_reg_genmask(27, 23)
-#define XE2_REG_PLANE_CTL_X_KEY_ENABLE_MASK                 xe2_reg_genmask(21, 22)
+#define XE2_REG_PLANE_CTL_X_KEY_ENABLE_MASK                 xe2_reg_genmask(22, 21)
 #define XE2_REG_PLANE_CTL_X_ORDER_RGBX_MASK                 xe2_reg_bit(20)
 #define XE2_REG_PLANE_CTL_X_YUV420_Y_PLANE_MASK             xe2_reg_bit(19)
 #define XE2_REG_PLANE_CTL_X_YUV_TO_RGB_CSC_FORMAT_BT709_MASK \
@@ -454,10 +453,18 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             //
             // We need more complext GuC logic that hardcode.
             //
-            // uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_STATUS_MIA_IN_RESET_MASK, 1)
-            //              | xe2_reg_field_prep(XE2_REG_GUC_STATUS_BOOTROM_MASK, 0)
-            //              | xe2_reg_field_prep(XE2_REG_GUC_STATUS_UKERNEL_MASK, 0xF0); // enum xe_guc_load_status
-            uint32_t cmd = 0;
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_STATUS_MIA_IN_RESET_MASK, 1)
+                         | xe2_reg_field_prep(XE2_REG_GUC_STATUS_BOOTROM_MASK, 0)
+                         | xe2_reg_field_prep(XE2_REG_GUC_STATUS_UKERNEL_MASK, 0xF0); // enum xe_guc_load_status
+            write_uint32_le(data, cmd);
+            break;
+        }
+        case XE2_REG_GUC_FW_SW_1:
+        case XE2_REG_GUC_FW_SW_2:
+        case XE2_REG_GUC_FW_SW_3:
+        case XE2_REG_GUC_FW_SW_4: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_ORIGIN_MASK, 1) // Origin GUC
+                         | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7);  // Success
             write_uint32_le(data, cmd);
             break;
         }
