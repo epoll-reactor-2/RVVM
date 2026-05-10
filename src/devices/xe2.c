@@ -19,8 +19,53 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // Current status: GuC init. They have one extra command set for GUC:
 //
-// Note that this is a kernel parameter:
-// .. *ERROR* Tile0: GT0: Slice/Subslice counts missing from hwconfig table; using typical fallback values
+// INFO: PCI write: offset=a024   (XE2_REG_RP_CONTROL),               data=400
+// INFO: PCI write: offset=a008   (XE2_REG_RPNSWREQ),                 data=0
+// INFO: PCI write: offset=a024   (XE2_REG_RP_CONTROL),               data=0
+// INFO: PCI write: offset=a188   (XE2_REG_GT_FORCEWAKE_GT),          data=10000
+// INFO: PCI write: offset=a278   (XE2_REG_GT_FORCEWAKE_RENDER),      data=10000
+// INFO: PCI read: offset=dfc     (XE2_REG_GT_FORCEWAKE_ACK_GT_MTL),  data=0
+// INFO: PCI read: offset=d84     (XE2_REG_GT_FORCEWAKE_ACK_RENDER),  data=0
+// INFO: PCI write: offset=a188   (XE2_REG_GT_FORCEWAKE_GT),          data=10001
+// INFO: PCI read: offset=dfc     (XE2_REG_GT_FORCEWAKE_ACK_GT_MTL),  data=0
+// INFO: PCI write: offset=cf80   (XE2_REG_GUC_TLB_INV_DESC1),        data=40
+// INFO: PCI write: offset=cf7c   (XE2_REG_GUC_TLB_INV_DESC0),        data=1
+// INFO: PCI write: offset=a188   (XE2_REG_GT_FORCEWAKE_GT),          data=10000
+// INFO: PCI read: offset=dfc     (XE2_REG_GT_FORCEWAKE_ACK_GT_MTL),  data=0
+//
+// [    4.596096] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: CT state is XE_GUC_CT_STATE_DISABLED
+// [    4.596232] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: GuC RC enable mode=0 failed: -ENODEV
+//
+// Driver interacts with iosys memory:
+//
+// #define xe_map_rd_field(xe__, map__, struct_offset__, struct_type__, field__) ({
+//      struct xe_device *__xe = xe__;
+//      xe_device_assert_mem_access(__xe);
+//      iosys_map_rd_field(map__, struct_offset__, struct_type__, field__);
+// })
+//
+// #define desc_read(xe_, guc_ctb__, field_)
+//      xe_map_rd_field(xe_, &guc_ctb__->desc, 0,
+//      		struct guc_ct_buffer_desc, field_)
+// static int h2g_write(struct xe_guc_ct *ct, const u32 *action, u32 len,
+//                      u32 ct_fence_value, bool want_response)
+//
+// static int __guc_ct_send_locked(struct xe_guc_ct *ct, const u32 *action,
+//                                 u32 len, u32 g2h_len, u32 num_g2h,
+//                                 struct g2h_fence *g2h_fence)
+//
+// ** What the fuck is this? **
+//
+// static struct xe_bo *
+// __xe_bo_create_locked(struct xe_device *xe,
+//                       struct xe_tile *tile, struct xe_vm *vm,
+//                       size_t size, u64 start, u64 end,
+//                       u16 cpu_caching, enum ttm_bo_type type, u32 flags,
+//                       u64 alignment, struct drm_exec *exec)
+//
+// *************************************************************
+//
+// Maybe root cause of all of this GuC problems is power management.
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -52,6 +97,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GT_FORCEWAKE_ACK_RENDER                     0xD84
 
 #define XE2_REG_GT_GDRST                                    0x941C
+#define XE2_REG_GT_GDRST_GRDOM_GUC                          xe2_reg_bit(3)
+#define XE2_REG_GT_GDRST_GRDOM_FULL                         xe2_reg_bit(0)
 
 #define XE2_REG_GT_POWERGATE_ENABLE                         0xA210
 #define XE2_REG_GT_POWERGATE_ENABLE_RENDER_MASK             xe2_reg_bit(0)
@@ -70,8 +117,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GGC_GMS_MASK                                xe2_reg_genmask(15, 8)
 #define XE2_REG_GGC_GGMS_MASK                               xe2_reg_genmask(7, 6)
 
-#define XE2_REG_GUC_TLB_INV_DESC0                           0xCF7C
-#define XE2_REG_GUC_TLB_INV_DESC1                           0xCF80
+#define XE2_REG_GUC_TLB_INV_DESC0                           0xCF7C // Write-only for OS
+#define XE2_REG_GUC_TLB_INV_DESC1                           0xCF80 // Write-only for OS
+
 #define XE2_REG_GU_CNTL_PROTECTED                           0x10100C // This being used from i915
 #define XE2_REG_GU_CNTL_PROTECTED_PRESENT_MASK              xe2_reg_genmask(9, 9)
 
@@ -83,26 +131,26 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_DPA_AUX_CH_CTL                              0x64010 // i915/display/intel_dp_aux_regs.h
 #define XE2_REG_DPB_AUX_CH_CTL                              0x64110
-#define XE2_REG_DBX_AUX_CH_CTL_SEND_BUSY_MASK               xe2_reg_bit(31)
-#define XE2_REG_DBX_AUX_CH_CTL_DONE_MASK                    xe2_reg_bit(30)
-#define XE2_REG_DBX_AUX_CH_CTL_INTERRUPT_MASK               xe2_reg_bit(29)
-#define XE2_REG_DBX_AUX_CH_CTL_TIME_OUT_ERROR_MASK          xe2_reg_bit(28)
-#define XE2_REG_DBX_AUX_CH_CTL_TIME_OUT_MASK                xe2_reg_genmask(27, 26)
-#define XE2_REG_DBX_AUX_CH_CTL_RECEIVE_ERROR_MASK           xe2_reg_bit(25)
-#define XE2_REG_DBX_AUX_CH_CTL_MSG_SIZE_MASK                xe2_reg_genmask(24, 20)
-#define XE2_REG_DBX_AUX_CH_CTL_PRECHARGE_2US_MASK           xe2_reg_genmask(19, 16)
-#define XE2_REG_DBX_AUX_CH_CTL_AUX_AKSV_SELECT_MASK         xe2_reg_bit(15)
-#define XE2_REG_DBX_AUX_CH_CTL_MANCHESTER_MASK              xe2_reg_bit(14)
-#define XE2_REG_DBX_AUX_CH_CTL_PSR_DATA_AUX_SKL_MASK        xe2_reg_bit(14)
-#define XE2_REG_DBX_AUX_CH_CTL_SYNC_TEST_MASK               xe2_reg_bit(13)
-#define XE2_REG_DBX_AUX_CH_CTL_FS_DATA_AUX_SKL_MASK         xe2_reg_bit(13)
-#define XE2_REG_DBX_AUX_CH_CTL_DEGLITCH_TEST__MASK          xe2_reg_bit(12)
-#define XE2_REG_DBX_AUX_CH_CTL_GTC_DATA_AUX_REG_MASK        xe2_reg_bit(12)
-#define XE2_REG_DBX_AUX_CH_CTL_PRECHARGE_TEST_MASK          xe2_reg_bit(11)
-#define XE2_REG_DBX_AUX_CH_CTL_TBT_IO_MASK                  xe2_reg_bit(11)
-#define XE2_REG_DBX_AUX_CH_CTL_BIT_CLOCK_2X_MASK            xe2_reg_genmask(10, 0)
-#define XE2_REG_DBX_AUX_CH_CTL_FW_SYNC_PULSE_SKL_MASK       xe2_reg_genmask(9, 5)
-#define XE2_REG_DBX_AUX_CH_CTL_SYNC_PUSLE_SKL_MASK          xe2_reg_genmask(4, 0)
+#define XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK               xe2_reg_bit(31)
+#define XE2_REG_DPX_AUX_CH_CTL_DONE_MASK                    xe2_reg_bit(30)
+#define XE2_REG_DPX_AUX_CH_CTL_INTERRUPT_MASK               xe2_reg_bit(29)
+#define XE2_REG_DPX_AUX_CH_CTL_TIME_OUT_ERROR_MASK          xe2_reg_bit(28)
+#define XE2_REG_DPX_AUX_CH_CTL_TIME_OUT_MASK                xe2_reg_genmask(27, 26)
+#define XE2_REG_DPX_AUX_CH_CTL_RECEIVE_ERROR_MASK           xe2_reg_bit(25)
+#define XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK                xe2_reg_genmask(24, 20)
+#define XE2_REG_DPX_AUX_CH_CTL_PRECHARGE_2US_MASK           xe2_reg_genmask(19, 16)
+#define XE2_REG_DPX_AUX_CH_CTL_AUX_AKSV_SELECT_MASK         xe2_reg_bit(15)
+#define XE2_REG_DPX_AUX_CH_CTL_MANCHESTER_MASK              xe2_reg_bit(14)
+#define XE2_REG_DPX_AUX_CH_CTL_PSR_DATA_AUX_SKL_MASK        xe2_reg_bit(14)
+#define XE2_REG_DPX_AUX_CH_CTL_SYNC_TEST_MASK               xe2_reg_bit(13)
+#define XE2_REG_DPX_AUX_CH_CTL_FS_DATA_AUX_SKL_MASK         xe2_reg_bit(13)
+#define XE2_REG_DPX_AUX_CH_CTL_DEGLITCH_TEST__MASK          xe2_reg_bit(12)
+#define XE2_REG_DPX_AUX_CH_CTL_GTC_DATA_AUX_REG_MASK        xe2_reg_bit(12)
+#define XE2_REG_DPX_AUX_CH_CTL_PRECHARGE_TEST_MASK          xe2_reg_bit(11)
+#define XE2_REG_DPX_AUX_CH_CTL_TBT_IO_MASK                  xe2_reg_bit(11)
+#define XE2_REG_DPX_AUX_CH_CTL_BIT_CLOCK_2X_MASK            xe2_reg_genmask(10, 0)
+#define XE2_REG_DPX_AUX_CH_CTL_FW_SYNC_PULSE_SKL_MASK       xe2_reg_genmask(9, 5)
+#define XE2_REG_DPX_AUX_CH_CTL_SYNC_PUSLE_SKL_MASK          xe2_reg_genmask(4, 0)
 
 #define XE2_REG_PP_STATUS                                   0x61200 // Panel power sequence
 #define XE2_REG_PP_ON_MASK                                  xe2_reg_bit(31)
@@ -117,6 +165,14 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_PP_CONTROL_EPD_BLC_ENABLE_MASK              xe2_reg_bit(2)
 #define XE2_REG_PP_CONTROL_POWER_RESET_MASK                 xe2_reg_bit(1)
 #define XE2_REG_PP_CONTROL_POWER_ON_MASK                    xe2_reg_bit(0)
+
+#define XE2_REG_RP_CONTROL                                  0xA024
+#define XE2_REG_RP_CONTROL_RPSWCTL_MASK                     xe2_reg_genmask(10, 9)
+
+#define XE2_REG_RC_CONTROL                                  0xA090
+#define XE2_REG_RC_CONTROL_CTL_HW_ENABLE_MASK               xe2_reg_bit(31)
+#define XE2_REG_RC_CONTROL_CTL_TO_MODE_MASK                 xe2_reg_bit(28)
+#define XE2_REG_RC_CONTROL_CTL_RC6_ENABLE_MASK              xe2_reg_bit(18)
 
 #define XE2_REG_HSW_POWER_WELL_CTL1                         0x45400
 #define XE2_REG_HSW_POWER_WELL_CTL2                         0x45404
@@ -462,8 +518,6 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_GT_FORCEWAKE_ACK_GT:
             write_uint32_le(data, xe2->forcewake_gt_mtl);
             break;
-        case XE2_REG_GT_FORCEWAKE_RENDER:
-            break;
         case XE2_REG_GT_FORCEWAKE_ACK_RENDER:
             write_uint32_le(data, xe2->forcewake_renderer);
             break;
@@ -629,7 +683,6 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         case XE2_REG_DPA_AUX_CH_CTL:
         case XE2_REG_DPB_AUX_CH_CTL:
-            xe2->aux.ctl |= XE2_REG_DBX_AUX_CH_CTL_SEND_BUSY_MASK;
             write_uint32_le(data, xe2->aux.ctl);
             break;
         case XE2_REG_DPA_AUX_CH_DATA:
@@ -701,7 +754,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset < 800000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 800000)
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
@@ -725,20 +778,15 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         case XE2_REG_DPA_AUX_CH_CTL:
         case XE2_REG_DPB_AUX_CH_CTL: {
             uint32_t cmd = read_uint32_le(data);
-            xe2->aux.power_request = (cmd >> 19) & 1;
-            if (cmd & (1U << 31)) {
-                // xe2->aux.data[0] = 0x00000014;
-                // xe2->aux.data[1] = 0x00000001;
-                // xe2->aux.data[2] = 0x00000084;
-                uint32_t out_cmd = cmd;
-                out_cmd &=  ~(1U << 31);
-                out_cmd |=   (1U << 30);
-                out_cmd |=   (1U << 18);
-                out_cmd &= ~((1U << 28) | (1U << 25));
-                write_uint32_le(data, out_cmd);
-                xe2->aux.ctl = out_cmd;
-            } else {
-                write_uint32_le(data, cmd | (1U << 18));
+            xe2->aux.ctl &= ~(
+                xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_DONE_MASK, 1) |
+                xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1) |
+                xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_RECEIVE_ERROR_MASK, 1)
+            );
+            if (cmd & xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1)) {
+                xe2->aux.ctl = cmd;
+                xe2->aux.ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1);
+                xe2->aux.ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_DONE_MASK, 1);
             }
             break;
         }
