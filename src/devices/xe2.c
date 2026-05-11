@@ -126,10 +126,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_VF_CAP                                      0x1901F8
 #define XE2_REG_VF_CAP_MASK                                 xe2_reg_genmask(0, 0)
 
-#define XE2_REG_DPA_AUX_CH_DATA                             0x64014
-#define XE2_REG_DPB_AUX_CH_DATA                             0x64114
+#define XE2_REG_DPA_AUX_CH_DATA(n)                          (0x64014 + 4 * (n))
+#define XE2_REG_DPB_AUX_CH_DATA(n)                          (0x64114 + 4 * (n))
+#define XE2_REG_DPX_AUX_CH_DATA_INDEX(reg)                  ((reg - 0x64014) / 4)
 
-#define XE2_REG_DPA_AUX_CH_CTL                              0x64010 // i915/display/intel_dp_aux_regs.h
+#define XE2_REG_DPA_AUX_CH_CTL                              0x64010
 #define XE2_REG_DPB_AUX_CH_CTL                              0x64110
 #define XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK               xe2_reg_bit(31)
 #define XE2_REG_DPX_AUX_CH_CTL_DONE_MASK                    xe2_reg_bit(30)
@@ -409,8 +410,9 @@ typedef struct {
     struct {
         uint8_t power_request;
         uint32_t data[5];
+        uint32_t message_size;
         uint32_t ctl;
-    } aux;
+    } aux[2];
 
     struct {
         // These sizes come from firmware blob.
@@ -476,6 +478,36 @@ static inline void xe2_guc_fw_action(void *data, uint32_t action, uint32_t index
     write_uint32_le(data, cmd);
 }
 
+static void xe2_emulate_aux_transfer(xe2_dev_t *xe2)
+{
+    uint32_t cmd = xe2->aux[0].data[0];
+
+    uint32_t header_request   = xe2_reg_field_get(xe2_reg_genmask(31, 28), cmd);
+    uint32_t header_address   = xe2_reg_field_get(xe2_reg_genmask(27,  8), cmd);
+    uint32_t header_size      = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
+
+    rvvm_info("AUX parse:       0x%x", xe2->aux[0].data[0]);
+    rvvm_info("AUX request:     0x%x", header_request);
+    rvvm_info("AUX address:     0x%x", header_address);
+    rvvm_info("AUX size:        %u", header_size);
+
+    xe2->aux[0].ctl |= xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, header_size);
+    // Upper 8 bits of data[0] used to store reply. 0 represents ACK.
+    xe2->aux[0].data[0] = 0x00; // ACK
+    // All other bits of data[0] used to store payload.
+    switch (header_address) {
+        case 0x00:
+            xe2->aux[0].data[0] = 0x13 << 16; // DPCD rev 13
+            break;
+        case 0x2E:
+            xe2->aux[0].data[1] = 0x01 << 16; // DP_ALPM_CAP
+            break;
+        case 0x60:
+            xe2->aux[0].data[1] = 0x03 << 16; // DP_DSC_DECOMPRESSION_IS_SUPPORTED and DP_DSC_PASSTHROUGH_IS_SUPPORTED
+            break;
+    }
+}
+
 static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
 {
     UNUSED(size);
@@ -532,7 +564,8 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
         case XE2_REG_PP_CONTROL:
-            xe2->pp_control |= xe2_reg_field_prep(XE2_REG_PP_CONTROL_POWER_ON_MASK, 1);
+            xe2->pp_control |= xe2_reg_field_prep(XE2_REG_PP_CONTROL_POWER_ON_MASK, 1)
+                            |  xe2_reg_field_prep(XE2_REG_PP_CONTROL_EPD_FORCE_VDD_MASK, 1);
             write_uint32_le(data, xe2->pp_control);
             break;
         case XE2_REG_HSW_POWER_WELL_CTL1:
@@ -681,14 +714,31 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_STEER_SEMAPHORE:
             write_uint32_le(data, xe2->steer_semaphore);
             break;
-        case XE2_REG_DPA_AUX_CH_CTL:
-        case XE2_REG_DPB_AUX_CH_CTL:
-            write_uint32_le(data, xe2->aux.ctl);
+        // DPB seems to be unused.
+        case XE2_REG_DPA_AUX_CH_CTL: {
+            xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_RECEIVE_ERROR_MASK, 1);
+            xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_TIME_OUT_MASK, 1);
+            xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_TIME_OUT_ERROR_MASK, 1);
+
+            if (xe2->aux[0].ctl & xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1)) {
+                xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1);
+                xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_DONE_MASK, 1);
+                // ???
+                xe2_emulate_aux_transfer(xe2);
+                xe2->aux[0].ctl |= xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, xe2->aux[0].message_size);
+            }
+            write_uint32_le(data, xe2->aux[0].ctl);
             break;
-        case XE2_REG_DPA_AUX_CH_DATA:
-        case XE2_REG_DPB_AUX_CH_DATA:
-            write_uint32_le(data, xe2->aux.data[0]);
+        }
+        case XE2_REG_DPA_AUX_CH_DATA(0):
+        case XE2_REG_DPA_AUX_CH_DATA(1):
+        case XE2_REG_DPA_AUX_CH_DATA(2):
+        case XE2_REG_DPA_AUX_CH_DATA(3):
+        case XE2_REG_DPA_AUX_CH_DATA(4): {
+            size_t index = XE2_REG_DPX_AUX_CH_DATA_INDEX(offset);
+            write_uint32_le(data, xe2->aux[0].data[index]);
             break;
+        }
 
         // There begin cursed decompiled part.
         case XE2_DMC_FW_MAIN_OFFSET:   // DMC program offset
@@ -775,25 +825,22 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         case XE2_REG_STEER_SEMAPHORE:
             xe2->steer_semaphore = read_uint32_le(data);
             break;
+
         case XE2_REG_DPA_AUX_CH_CTL:
-        case XE2_REG_DPB_AUX_CH_CTL: {
-            uint32_t cmd = read_uint32_le(data);
-            xe2->aux.ctl &= ~(
-                xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_DONE_MASK, 1) |
-                xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1) |
-                xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_RECEIVE_ERROR_MASK, 1)
-            );
-            if (cmd & xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1)) {
-                xe2->aux.ctl = cmd;
-                xe2->aux.ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1);
-                xe2->aux.ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_DONE_MASK, 1);
-            }
+            xe2->aux[0].ctl = read_uint32_le(data);
+            break;
+
+        case XE2_REG_DPA_AUX_CH_DATA(0):
+        case XE2_REG_DPA_AUX_CH_DATA(1):
+        case XE2_REG_DPA_AUX_CH_DATA(2):
+        case XE2_REG_DPA_AUX_CH_DATA(3):
+        case XE2_REG_DPA_AUX_CH_DATA(4): {
+            size_t index = XE2_REG_DPX_AUX_CH_DATA_INDEX(offset);
+            xe2->aux[0].data[index] = read_uint32_le(data);
+            xe2->aux[0].message_size = ((index + 1) * 4);
             break;
         }
-        case XE2_REG_DPA_AUX_CH_DATA:
-        case XE2_REG_DPB_AUX_CH_DATA:
-            xe2->aux.data[0] = read_uint32_le(data);
-            break;
+
         case XE2_REG_BXT_DE_PLL_ENABLE: {
             uint32_t cmd = read_uint32_le(data);
             xe2->pll_enable = !!xe2_reg_field_get(XE2_REG_BXT_DE_PLL_ENABLE_MASK, cmd);
