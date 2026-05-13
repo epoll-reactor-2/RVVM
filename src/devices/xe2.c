@@ -17,55 +17,32 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: GuC init. They have one extra command set for GUC:
+// Current status: Driver disgorged invalid EDID:
 //
-// INFO: PCI write: offset=a024   (XE2_REG_RP_CONTROL),               data=400
-// INFO: PCI write: offset=a008   (XE2_REG_RPNSWREQ),                 data=0
-// INFO: PCI write: offset=a024   (XE2_REG_RP_CONTROL),               data=0
-// INFO: PCI write: offset=a188   (XE2_REG_GT_FORCEWAKE_GT),          data=10000
-// INFO: PCI write: offset=a278   (XE2_REG_GT_FORCEWAKE_RENDER),      data=10000
-// INFO: PCI read: offset=dfc     (XE2_REG_GT_FORCEWAKE_ACK_GT_MTL),  data=0
-// INFO: PCI read: offset=d84     (XE2_REG_GT_FORCEWAKE_ACK_RENDER),  data=0
-// INFO: PCI write: offset=a188   (XE2_REG_GT_FORCEWAKE_GT),          data=10001
-// INFO: PCI read: offset=dfc     (XE2_REG_GT_FORCEWAKE_ACK_GT_MTL),  data=0
-// INFO: PCI write: offset=cf80   (XE2_REG_GUC_TLB_INV_DESC1),        data=40
-// INFO: PCI write: offset=cf7c   (XE2_REG_GUC_TLB_INV_DESC0),        data=1
-// INFO: PCI write: offset=a188   (XE2_REG_GT_FORCEWAKE_GT),          data=10000
-// INFO: PCI read: offset=dfc     (XE2_REG_GT_FORCEWAKE_ACK_GT_MTL),  data=0
+// [    5.528378] xe 0000:00:01.0: [drm:connector_bad_edid [drm]] [CONNECTOR:262:eDP-1] EDID is invalid:
+// [    5.528669] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+// [    5.528765] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+// [    5.528830] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+// [    5.528885] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+// [    5.528954] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+// [    5.529012] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+// [    5.529074] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+// [    5.529129] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+// [    5.529276] xe 0000:00:01.0: [drm:intel_bios_init_panel [xe]] Panel type (fallback): 0
+// [    5.530347] xe 0000:00:01.0: [drm:intel_bios_init_panel [xe]] Selected panel type (fallback): 0
+// [    5.531425] xe 0000:00:01.0: [drm:intel_bios_init_panel [xe]] No PSR BDB found.
+// [    5.532894] xe 0000:00:01.0: [drm] [ENCODER:261:DDI A/PHY A] failed to find fixed mode for the panel, disabling eDP
 //
-// [    4.596096] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: CT state is XE_GUC_CT_STATE_DISABLED
-// [    4.596232] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: GuC RC enable mode=0 failed: -ENODEV
+// In opposite to valid EDID:
 //
-// Driver interacts with iosys memory:
-//
-// #define xe_map_rd_field(xe__, map__, struct_offset__, struct_type__, field__) ({
-//      struct xe_device *__xe = xe__;
-//      xe_device_assert_mem_access(__xe);
-//      iosys_map_rd_field(map__, struct_offset__, struct_type__, field__);
-// })
-//
-// #define desc_read(xe_, guc_ctb__, field_)
-//      xe_map_rd_field(xe_, &guc_ctb__->desc, 0,
-//      		struct guc_ct_buffer_desc, field_)
-// static int h2g_write(struct xe_guc_ct *ct, const u32 *action, u32 len,
-//                      u32 ct_fence_value, bool want_response)
-//
-// static int __guc_ct_send_locked(struct xe_guc_ct *ct, const u32 *action,
-//                                 u32 len, u32 g2h_len, u32 num_g2h,
-//                                 struct g2h_fence *g2h_fence)
-//
-// ** What the fuck is this? **
-//
-// static struct xe_bo *
-// __xe_bo_create_locked(struct xe_device *xe,
-//                       struct xe_tile *tile, struct xe_vm *vm,
-//                       size_t size, u64 start, u64 end,
-//                       u16 cpu_caching, enum ttm_bo_type type, u32 flags,
-//                       u64 alignment, struct drm_exec *exec)
-//
-// *************************************************************
-//
-// Maybe root cause of all of this GuC problems is power management.
+// 00000000: 00ff ffff ffff ff00 09e5 a307 0000 0000  ................
+// 00000010: 011b 0104 9522 1378 02b0 9097 5854 9226  .....".x....XT.&
+// 00000020: 1d50 5400 0000 0101 0101 0101 0101 0101  .PT.............
+// 00000030: 0101 0101 0101 3b37 80b8 7038 2840 3020  ......;7..p8(@0 
+// 00000040: 3600 58c1 1000 001a 0000 0000 0000 0000  6.X.............
+// 00000050: 0000 0000 0000 0000 0000 0000 00fe 0042  ...............B
+// 00000060: 4f45 2043 510a 2020 2020 2020 0000 00fe  OE CQ.      ....
+// 00000070: 004e 5431 3536 4648 4d2d 4e34 310a 0027  .NT156FHM-N41..'
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -388,6 +365,22 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT_IDLE_WAIT_TIME_MASK \
                                                             xe2_reg_genmask(19, 0)
 
+// DPCD (DispalyPort configuration data) is GPU-independent standard.
+// May be applied elsewhere.
+#define DPCD_REG_REV                                        0x00
+#define DPCD_REG_RECEIVER_ALPM_CAP                          0x2E
+#define DPCD_REG_DSC_SUPPORT                                0x60
+#define DPCD_REG_PSR_SUPPORT                                0x70
+#define DPCD_REG_PANEL_REPLAY_CAP_SUPPORT                   0xB0
+#define DPCD_REG_SOURCE_OUI                                 0x300
+
+#define DPCD_REQ_I2C_WRITE                                  0x1
+#define DPCD_REQ_I2C_READ                                   0x2
+#define DPCD_REQ_I2C_WRITE_STATUS_UPDATE                    0x3
+#define DPCD_REQ_I2C_MOT                                    0x4 // Middle of transaction
+#define DPCD_REQ_NATIVE_WRITE                               0x5
+#define DPCD_REQ_NATIVE_READ                                0x6
+
 typedef struct {
     pci_func_t *pci_func;
     uint32_t    forcewake_gsc;
@@ -478,40 +471,63 @@ static inline void xe2_guc_fw_action(void *data, uint32_t action, uint32_t index
     write_uint32_le(data, cmd);
 }
 
-static void xe2_emulate_aux_transfer(xe2_dev_t *xe2)
+static inline uint32_t xe2_dpcd_config(uint32_t cmd)
+{
+    // Upper 8 bits of data[0] used to store reply. 0 represents ACK.
+    // All other bits of data[0] used to store payload.
+    switch (cmd) {
+        case DPCD_REG_REV:
+            return 0x13 << 16; // DPCD rev 13
+
+        case DPCD_REG_RECEIVER_ALPM_CAP:
+            return 0x01 << 16; // DP_ALPM_CAP
+
+        case DPCD_REG_DSC_SUPPORT:
+            return 0x03 << 16; // DP_DSC_DECOMPRESSION_IS_SUPPORTED & DP_DSC_PASSTHROUGH_IS_SUPPORTED
+
+        case DPCD_REG_PSR_SUPPORT:
+            return 1 << 16;
+
+        case DPCD_REG_PANEL_REPLAY_CAP_SUPPORT:
+            return 1 << 16; // DP_PANEL_REPLAY_SUPPORT
+
+        case DPCD_REG_SOURCE_OUI:
+            return 0xAA01 << 8;
+
+        // Offset 0x50: No PSR BDB found. (unspecified in DP_*).
+        case 0x50:
+            return 0x1 << 16;
+
+        default:
+            // Unhandled command. No reason to emit error or warning.
+            return 0x00;
+    }
+}
+
+static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2)
 {
     uint32_t cmd = xe2->aux[0].data[0];
 
-    uint32_t header_request   = xe2_reg_field_get(xe2_reg_genmask(31, 28), cmd);
-    uint32_t header_address   = xe2_reg_field_get(xe2_reg_genmask(27,  8), cmd);
-    uint32_t header_size      = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
+    uint32_t header_request = xe2_reg_field_get(xe2_reg_genmask(31, 28), cmd);
+    uint32_t header_address = xe2_reg_field_get(xe2_reg_genmask(27,  8), cmd);
+    uint32_t header_size    = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
 
     rvvm_info("AUX parse:       0x%x", xe2->aux[0].data[0]);
     rvvm_info("AUX request:     0x%x", header_request);
     rvvm_info("AUX address:     0x%x", header_address);
     rvvm_info("AUX size:        %u", header_size);
 
-    xe2->aux[0].ctl |= xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, header_size);
-    // Upper 8 bits of data[0] used to store reply. 0 represents ACK.
-    xe2->aux[0].data[0] = 0x00; // ACK
-    // All other bits of data[0] used to store payload.
-    switch (header_address) {
-        case 0x00:
-            xe2->aux[0].data[0] = 0x13 << 16; // DPCD rev 13
-            break;
-        case 0x2E:
-            xe2->aux[0].data[1] = 0x01 << 16; // DP_ALPM_CAP
-            break;
-        case 0x60:
-            xe2->aux[0].data[1] = 0x03 << 16; // DP_DSC_DECOMPRESSION_IS_SUPPORTED and DP_DSC_PASSTHROUGH_IS_SUPPORTED
-            break;
-    }
+    xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, 0xF);
+    xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, header_size);
+
+    // I2C multi-write transactions should be handled.
+    xe2->aux[0].data[0] = xe2_dpcd_config(header_address);
 }
 
 static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
 {
     UNUSED(size);
-    if (offset != XE2_REG_FLUSH_PENDING && offset < 800000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset < 80000)
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
     xe2_dev_t *xe2 = dev->data;
@@ -723,9 +739,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             if (xe2->aux[0].ctl & xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1)) {
                 xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1);
                 xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_DONE_MASK, 1);
-                // ???
                 xe2_emulate_aux_transfer(xe2);
-                xe2->aux[0].ctl |= xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, xe2->aux[0].message_size);
             }
             write_uint32_le(data, xe2->aux[0].ctl);
             break;
@@ -804,7 +818,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 800000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 80000)
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
