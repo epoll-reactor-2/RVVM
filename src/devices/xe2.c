@@ -17,32 +17,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: Driver disgorged invalid EDID:
-//
-// [    5.528378] xe 0000:00:01.0: [drm:connector_bad_edid [drm]] [CONNECTOR:262:eDP-1] EDID is invalid:
-// [    5.528669] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-// [    5.528765] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-// [    5.528830] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-// [    5.528885] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-// [    5.528954] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-// [    5.529012] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-// [    5.529074] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-// [    5.529129] 	[00] BAD  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-// [    5.529276] xe 0000:00:01.0: [drm:intel_bios_init_panel [xe]] Panel type (fallback): 0
-// [    5.530347] xe 0000:00:01.0: [drm:intel_bios_init_panel [xe]] Selected panel type (fallback): 0
-// [    5.531425] xe 0000:00:01.0: [drm:intel_bios_init_panel [xe]] No PSR BDB found.
-// [    5.532894] xe 0000:00:01.0: [drm] [ENCODER:261:DDI A/PHY A] failed to find fixed mode for the panel, disabling eDP
-//
-// In opposite to valid EDID:
-//
-// 00000000: 00ff ffff ffff ff00 09e5 a307 0000 0000  ................
-// 00000010: 011b 0104 9522 1378 02b0 9097 5854 9226  .....".x....XT.&
-// 00000020: 1d50 5400 0000 0101 0101 0101 0101 0101  .PT.............
-// 00000030: 0101 0101 0101 3b37 80b8 7038 2840 3020  ......;7..p8(@0 
-// 00000040: 3600 58c1 1000 001a 0000 0000 0000 0000  6.X.............
-// 00000050: 0000 0000 0000 0000 0000 0000 00fe 0042  ...............B
-// 00000060: 4f45 2043 510a 2020 2020 2020 0000 00fe  OE CQ.      ....
-// 00000070: 004e 5431 3536 4648 4d2d 4e34 310a 0027  .NT156FHM-N41..'
+// Current status: EDID initialized.
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -374,12 +349,29 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define DPCD_REG_PANEL_REPLAY_CAP_SUPPORT                   0xB0
 #define DPCD_REG_SOURCE_OUI                                 0x300
 
-#define DPCD_REQ_I2C_WRITE                                  0x1
-#define DPCD_REQ_I2C_READ                                   0x2
-#define DPCD_REQ_I2C_WRITE_STATUS_UPDATE                    0x3
-#define DPCD_REQ_I2C_MOT                                    0x4 // Middle of transaction
-#define DPCD_REQ_NATIVE_WRITE                               0x5
-#define DPCD_REQ_NATIVE_READ                                0x6
+// EDID address and size is not part of DPCD.
+#define DPCD_INTEL_EDID_ADDR                                0x50
+#define DPCD_INTEL_EDID_SIZE                                128
+
+// https://docs.amd.com/r/en-US/pg199-displayport-tx-subsystem/I2C-Over-AUX-Transactions
+//
+// Pay attention: Driver natively emulates I2C transactions. Thus, pseudo-I2C
+// commands goes through PCI.
+#define DPCD_REQ_I2C_WRITE                                  0x0
+#define DPCD_REQ_I2C_READ                                   0x1
+#define DPCD_REQ_I2C_WRITE_STATUS_UPDATE                    0x2
+#define DPCD_REQ_I2C_WRITE_MOT                              0x4 // Middle of transaction
+#define DPCD_REQ_I2C_READ_MOT                               0x5 // Middle of transaction
+#define DPCD_REQ_NATIVE_WRITE                               0x8
+#define DPCD_REQ_NATIVE_READ                                0x9
+
+// Auxiliary channel entry.
+typedef struct {
+    uint32_t data[5];       // Auxiliary channel data (5 dwords).
+    uint32_t message_size;  // Size of AUX message. Encoded in incoming data[0].
+    uint32_t ctl;           // DP(X)_AUX_CH_CTL register.
+    uint32_t edid_written;  // Internal variable.
+} xe2_aux_t;
 
 typedef struct {
     pci_func_t *pci_func;
@@ -391,21 +383,14 @@ typedef struct {
     uint32_t    dbuf_ctl[4];
     uint32_t    pp_control;
     uint32_t    dc_state;
-    // I don't understand now what exactly this semaphore
-    // shall lock.
+
     uint32_t    steer_semaphore;
     uint32_t    wopcm_size;
     uint32_t    wopcm_offset;
     uint32_t    wopcm_locked;
 
     uint32_t    guc_actions[4];
-
-    struct {
-        uint8_t power_request;
-        uint32_t data[5];
-        uint32_t message_size;
-        uint32_t ctl;
-    } aux[2];
+    xe2_aux_t   aux[1]; // We assume one display with one AUX channel.
 
     struct {
         // These sizes come from firmware blob.
@@ -422,6 +407,47 @@ typedef struct {
         uint32_t pipe_d_loaded;
     } firmware;
 } xe2_dev_t;
+
+// Encoded configuration:
+// | Block 0, Base EDID:
+// |   EDID Structure Version & Revision: 1.4
+// |   Vendor & Product Identification:
+// |     Manufacturer: BOE
+// |     Model: 1955
+// |     Made in: week 1 of 2017
+// |   Basic Display Parameters & Features:
+// |     Digital display
+// |     Bits per primary color channel: 6
+// |     DisplayPort interface
+// |     Maximum image size: 34 cm x 19 cm
+// |     Gamma: 2.20
+// |     Supported color formats: RGB 4:4:4
+// |     First detailed timing includes the native pixel format and preferred refresh rate
+// |   Color Characteristics:
+// |     Red  : 0.5917, 0.3466
+// |     Green: 0.3281, 0.5703
+// |     Blue : 0.1503, 0.1142
+// |     White: 0.3125, 0.3281
+// |   Established Timings I & II: none
+// |   Standard Timings: none
+// |   Detailed Timing Descriptors:
+// |     DTD 1:  1920x1080   60.000509 Hz  16:9     67.201 kHz    141.390000 MHz (344 mm x 193 mm)
+// |                  Hfront   48 Hsync  32 Hback  104 Hpol P
+// |                  Vfront    3 Vsync   6 Vback   31 Vpol N
+// |     Empty Descriptor
+// |     Alphanumeric Data String: 'BOE CQ'
+// |     Alphanumeric Data String: 'NT156FHM-N41'
+// | Checksum: 0x27
+static const uint8_t xe2_edid[] = {
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x09, 0xE5, 0xA3, 0x07, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x1B, 0x01, 0x04, 0x95, 0x22, 0x13, 0x78, 0x02, 0xB0, 0x90, 0x97, 0x58, 0x54, 0x92, 0x26,
+    0x1D, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x3B, 0x37, 0x80, 0xB8, 0x70, 0x38, 0x28, 0x40, 0x30, 0x20,
+    0x36, 0x00, 0x58, 0xC1, 0x10, 0x00, 0x00, 0x1A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x00, 0x42,
+    0x4F, 0x45, 0x20, 0x43, 0x51, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xFE,
+    0x00, 0x4E, 0x54, 0x31, 0x35, 0x36, 0x46, 0x48, 0x4D, 0x2D, 0x4E, 0x34, 0x31, 0x0A, 0x00, 0x27,
+};
 
 static void xe2_remove(rvvm_mmio_dev_t* dev)
 {
@@ -471,62 +497,107 @@ static inline void xe2_guc_fw_action(void *data, uint32_t action, uint32_t index
     write_uint32_le(data, cmd);
 }
 
-static inline uint32_t xe2_dpcd_config(uint32_t cmd)
+static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
 {
-    // Upper 8 bits of data[0] used to store reply. 0 represents ACK.
-    // All other bits of data[0] used to store payload.
+    // Outgoing AUX request layout:
+    // [0]: [********........................]
+    //      31  ACK | data                   0
+    //
+    // [1]: [................................]
+    //      31        data                   0
+    //
+    // [2]: [................................]
+    //      31        data                   0
+    //
+    // [3]: [................................]
+    //      31        data                   0
+    //
+    // [4]: [........************************]
+    //      31 data | unused                 0
+    //
+    // 16 bytes total.
     switch (cmd) {
         case DPCD_REG_REV:
-            return 0x13 << 16; // DPCD rev 13
-
+            aux->data[0] = 0x13 << 16; // DPCD rev 13
+            break;
         case DPCD_REG_RECEIVER_ALPM_CAP:
-            return 0x01 << 16; // DP_ALPM_CAP
-
+            aux->data[0] = 0x01 << 16; // DP_ALPM_CAP
+            break;
         case DPCD_REG_DSC_SUPPORT:
-            return 0x03 << 16; // DP_DSC_DECOMPRESSION_IS_SUPPORTED & DP_DSC_PASSTHROUGH_IS_SUPPORTED
-
+            aux->data[0] = 0x03 << 16; // DP_DSC_DECOMPRESSION_IS_SUPPORTED & DP_DSC_PASSTHROUGH_IS_SUPPORTED
+            break;
         case DPCD_REG_PSR_SUPPORT:
-            return 1 << 16;
-
+            aux->data[0] = 0x01 << 16; // DP_PSR_IS_SUPPORTED
+            break;
         case DPCD_REG_PANEL_REPLAY_CAP_SUPPORT:
-            return 1 << 16; // DP_PANEL_REPLAY_SUPPORT
-
+            aux->data[0] = 0x01 << 16; // DP_PANEL_REPLAY_SUPPORT
+            break;
         case DPCD_REG_SOURCE_OUI:
-            return 0xAA01 << 8;
+            aux->data[0] = 0xAA01 << 8; // Probably hardcoded value
+            break;
+        case DPCD_INTEL_EDID_ADDR: {
+            uint32_t header  = read_uint32_be_m(&xe2_edid[aux->edid_written +  0]) >> 8;
+            uint32_t chunk_1 = read_uint32_be_m(&xe2_edid[aux->edid_written +  3]);
+            uint32_t chunk_2 = read_uint32_be_m(&xe2_edid[aux->edid_written +  7]);
+            uint32_t chunk_3 = read_uint32_be_m(&xe2_edid[aux->edid_written + 11]);
+            uint32_t chunk_4 = read_uint32_be_m(&xe2_edid[aux->edid_written + 15]) & 0xFF << 24;
 
-        // Offset 0x50: No PSR BDB found. (unspecified in DP_*).
-        case 0x50:
-            return 0x1 << 16;
+            switch (request) {
+                case DPCD_REQ_I2C_WRITE_MOT:
+                    // When driver writes I2C-over-AUX, it expects this kind of ACK,
+                    // which is different from read ACK (upper 8 bits = 0x00).
+                    write_uint32_le(&aux->data[0], xe2_reg_field_prep(xe2_reg_genmask(23, 0), 0x110000));
+                    // This represents sequenced interface. We can assume that
+                    // I2C write-MOT could serve as reset condition, despite this
+                    // is not formally defined in DisplayPort IP.
+                    aux->edid_written = 0;
+                    break;
+                case DPCD_REQ_I2C_READ_MOT:
+                    if (size == 16 && aux->edid_written < (sizeof(xe2_edid) - 16)) {
+                        aux->edid_written += 16;
+                    }
+                    write_uint32_le(&aux->data[0], header);
+                    break;
+                default:
+                    write_uint32_le(&aux->data[0], header);
+                    break;
+            }
 
+            write_uint32_le(&aux->data[1], chunk_1);
+            write_uint32_le(&aux->data[2], chunk_2);
+            write_uint32_le(&aux->data[3], chunk_3);
+            write_uint32_le(&aux->data[4], chunk_4);
+            break;
+        }
         default:
             // Unhandled command. No reason to emit error or warning.
-            return 0x00;
+            aux->data[0] = 0x00;
+            break;
     }
 }
 
-static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2)
+static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
 {
-    uint32_t cmd = xe2->aux[0].data[0];
+    xe2_aux_t *aux = &xe2->aux[aux_no];
+    uint32_t   cmd = aux->data[0];
 
-    uint32_t header_request = xe2_reg_field_get(xe2_reg_genmask(31, 28), cmd);
-    uint32_t header_address = xe2_reg_field_get(xe2_reg_genmask(27,  8), cmd);
-    uint32_t header_size    = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
-
-    rvvm_info("AUX parse:       0x%x", xe2->aux[0].data[0]);
-    rvvm_info("AUX request:     0x%x", header_request);
-    rvvm_info("AUX address:     0x%x", header_address);
-    rvvm_info("AUX size:        %u", header_size);
+    uint32_t request = xe2_reg_field_get(xe2_reg_genmask(31, 28), cmd);
+    uint32_t address = xe2_reg_field_get(xe2_reg_genmask(27,  8), cmd);
+    uint32_t size    = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
+    // Linux manipulates with AUX transfer size taking header (1 byte)
+    // into the account. Finally, GPU returns size equal len(payload) + 2(headers).
+    uint32_t payload_size   = size - 1;
 
     xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, 0xF);
-    xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, header_size);
+    xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, size);
 
-    // I2C multi-write transactions should be handled.
-    xe2->aux[0].data[0] = xe2_dpcd_config(header_address);
+    xe2_dpcd_aux_config(address, request, payload_size, aux);
 }
 
 static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
 {
     UNUSED(size);
+
     if (offset != XE2_REG_FLUSH_PENDING && offset < 80000)
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
@@ -739,7 +810,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             if (xe2->aux[0].ctl & xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1)) {
                 xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1);
                 xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_DONE_MASK, 1);
-                xe2_emulate_aux_transfer(xe2);
+                xe2_emulate_aux_transfer(xe2, 0);
             }
             write_uint32_le(data, xe2->aux[0].ctl);
             break;
@@ -921,6 +992,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
 {
     xe2_dev_t *xe2 = safe_new_obj(xe2_dev_t);
+    xe2->aux[0].edid_written = 0;
     xe2->steer_semaphore = 1; // Begin with unlocked state.
 
     pci_func_desc_t xe2_desc = {
