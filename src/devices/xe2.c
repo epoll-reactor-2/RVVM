@@ -17,7 +17,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: EDID initialized.
+// Current status: RPNSWREQ, RP_CONTROL, RC_CONTROL, RC_STATE needs to be handled.
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -113,11 +113,24 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_PP_CONTROL                                  0x61204
 #define XE2_REG_PP_CONTROL_UNLOCK_MASK                      xe2_reg_genmask(31, 16)
-#define XE2_REG_PP_CONTROL_POWER_CYCLE_DELAY_MASK           xe2_reg_genmask(8, 4)
+#define XE2_REG_PP_CONTROL_POWER_CYCLE_DELAY_MASK           xe2_reg_genmask( 8,  4)
 #define XE2_REG_PP_CONTROL_EPD_FORCE_VDD_MASK               xe2_reg_bit(3)
 #define XE2_REG_PP_CONTROL_EPD_BLC_ENABLE_MASK              xe2_reg_bit(2)
 #define XE2_REG_PP_CONTROL_POWER_RESET_MASK                 xe2_reg_bit(1)
 #define XE2_REG_PP_CONTROL_POWER_ON_MASK                    xe2_reg_bit(0)
+
+#define XE2_REG_PP_ON_DELAYS                                0x61208
+#define XE2_REG_PP_ON_DELAYS_PORT_SELECT_MASK               xe2_reg_genmask(31, 30)
+#define XE2_REG_PP_ON_DELAYS_POWER_ON_DELAY_MASK            xe2_reg_genmask(28, 16)
+#define XE2_REG_PP_ON_DELAYS_LIGHT_ON_DELAY_MASK            xe2_reg_genmask(12,  0)
+
+#define XE2_REG_PP_OFF_DELAYS                               0x6120C
+#define XE2_REG_PP_OFF_DELAYS_POWER_DOWN_DELAY_MASK         xe2_reg_genmask(28, 16)
+#define XE2_REG_PP_OFF_DELAYS_LIGHT_OFF_DELAY_MASK          xe2_reg_genmask(12,  0)
+
+#define XE2_REG_PP_DIVISOR                                  0x61210
+#define XE2_REG_PP_DIVISOR_REF_DIVIDER_MASK                 xe2_reg_genmask(31,  8)
+#define XE2_REG_PP_DIVISOR_POWER_CYCLE_DELAY_MASK           xe2_reg_genmask( 4,  0)
 
 #define XE2_REG_RP_CONTROL                                  0xA024
 #define XE2_REG_RP_CONTROL_RPSWCTL_MASK                     xe2_reg_genmask(10, 9)
@@ -382,6 +395,9 @@ typedef struct {
     uint32_t    pll_enable;
     uint32_t    dbuf_ctl[4];
     uint32_t    pp_control;
+    uint32_t    pp_status;
+    uint32_t    pp_on_delays;
+    uint32_t    pp_off_delays;
     uint32_t    dc_state;
 
     uint32_t    steer_semaphore;
@@ -598,7 +614,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset < 80000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset < 0x80000)
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
     xe2_dev_t *xe2 = dev->data;
@@ -644,17 +660,22 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             xe2->gt_gdrst = 0;
             write_uint32_le(data, xe2->gt_gdrst);
             break;
-        case XE2_REG_PP_STATUS: {
-            uint32_t cmd = xe2_reg_field_prep(XE2_REG_PP_ON_MASK, 1)
-                         | xe2_reg_field_prep(XE2_REG_PP_READY_MASK, 1);
-            write_uint32_le(data, cmd);
+
+        case XE2_REG_PP_STATUS:
+            write_uint32_le(data, xe2->pp_status);
             break;
-        }
         case XE2_REG_PP_CONTROL:
             xe2->pp_control |= xe2_reg_field_prep(XE2_REG_PP_CONTROL_POWER_ON_MASK, 1)
                             |  xe2_reg_field_prep(XE2_REG_PP_CONTROL_EPD_FORCE_VDD_MASK, 1);
             write_uint32_le(data, xe2->pp_control);
             break;
+        case XE2_REG_PP_ON_DELAYS:
+            write_uint32_le(data, xe2->pp_on_delays);
+            break;
+        case XE2_REG_PP_OFF_DELAYS:
+            write_uint32_le(data, xe2->pp_off_delays);
+            break;
+
         case XE2_REG_HSW_POWER_WELL_CTL1:
         case XE2_REG_HSW_POWER_WELL_CTL2:
         case XE2_REG_HSW_POWER_WELL_CTL3:
@@ -763,8 +784,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             // GuC (Graphics μcontroller) has read-only registers determining whether
             // this GPU component initialized or not.
             //
-            // We need more complext GuC logic that hardcode.
-            //
+            // We need more complex GuC logic than hardcode.
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_STATUS_MIA_IN_RESET_MASK, 1)
                          | xe2_reg_field_prep(XE2_REG_GUC_STATUS_BOOTROM_MASK, 0)
                          | xe2_reg_field_prep(XE2_REG_GUC_STATUS_UKERNEL_MASK, 0xF0); // enum xe_guc_load_status
@@ -889,7 +909,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 80000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 0x80000)
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
@@ -931,9 +951,20 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->pll_enable = !!xe2_reg_field_get(XE2_REG_BXT_DE_PLL_ENABLE_MASK, cmd);
             break;
         }
+
+        case XE2_REG_PP_STATUS:
+            xe2->pp_status = read_uint32_le(data);
+            break;
         case XE2_REG_PP_CONTROL:
             xe2->pp_control = read_uint32_le(data);
             break;
+        case XE2_REG_PP_ON_DELAYS:
+            xe2->pp_on_delays = read_uint32_le(data);
+            break;
+        case XE2_REG_PP_OFF_DELAYS:
+            xe2->pp_off_delays = read_uint32_le(data);
+            break;
+
         case XE2_REG_DBUF_CTL_S0:
             xe2->dbuf_ctl[0] = read_uint32_le(data);
             break;
