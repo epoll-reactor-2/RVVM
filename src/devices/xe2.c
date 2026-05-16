@@ -17,7 +17,49 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: RPNSWREQ, RP_CONTROL, RC_CONTROL, RC_STATE needs to be handled.
+// [0] Current status: RPNSWREQ, RP_CONTROL, RC_CONTROL, RC_STATE needs to be handled.
+// [1] Current status: GuC
+//
+// [    5.028456] xe 0000:00:01.0: [drm:__xe_guc_upload [xe]] Tile0: GT0: init took 0ms, freq = 0MHz (req = 0MHz), before = 0MHz, status = 0x0000F001, timeouts = 0
+// [    5.030417] xe 0000:00:01.0: [drm] Tile0: GT0: xe_guc_ct_enable() called...
+// [    5.030686] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: guc_ct_ctb_h2g_register() failed
+// [    5.030783] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: Failed to enable GuC CT (-EPROTO)
+// [    5.039072] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-EINFO: PCI write: offset=a188, data=10000, size = 4
+//
+// Driver finds no suitable hardware engine for XE_ENGINE_CLASS_OTHER.
+//
+//    /* The GSC uC is only available on the media GT */
+//    if (tile->media_gt && (gt != tile->media_gt)) {
+//        xe_uc_fw_change_status(&gsc->fw, XE_UC_FIRMWARE_NOT_SUPPORTED);
+//        return 0;
+//    }
+//
+// int xe_gsc_init_post_hwconfig(struct xe_gsc *gsc)
+// {
+//     struct xe_gt *gt = gsc_to_gt(gsc);
+//     struct xe_tile *tile = gt_to_tile(gt);
+//     struct xe_device *xe = gt_to_xe(gt);
+//     struct xe_hw_engine *hwe = xe_gt_hw_engine(gt, XE_ENGINE_CLASS_OTHER, 0, true);
+//     struct xe_exec_queue *q;
+//     struct workqueue_struct *wq;
+//     struct xe_bo *bo;
+//     int err;
+//
+//     // BUG: This returns 1. That's the problem.
+//
+//     if (!xe_uc_fw_is_available(&gsc->fw))
+//         return 0;
+// 
+//     if (!hwe) {
+//         xe_gt_err(gt, "!hwe\n");
+//         return -ENODEV;
+//
+// [    4.525930] xe 0000:00:01.0: [drm] Tile0: GT0: can't init GSC proxy due to missing mei component
+//
+// To enable GSC, CONFIG_INTEL_MEI_GSC_PROXY kernel parameter must be set,
+// but it depends on INTEL_GTT, which depends on X86.
+//
+// I think we cannot emulate Lunar Lake iGPU...
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -25,7 +67,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define xe2_reg_field_prep(mask, val)   (((val) << __builtin_ctz(mask)) & (mask))
 
 #define XE2_VENDOR_ID_INTEL                                 0x8086
-#define XE2_DEVICE_ID_LUNAR_LAKE_IGPU                       0x6420
+#define XE2_DEVICE_ID_LUNAR_LAKE_IGPU                       0xE20B
 #define XE2_CLASS_CODE                                      0x0300
 
 #define XE2_REG_FLUSH_PENDING                               0x130030 // Dummy register
@@ -131,6 +173,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_PP_DIVISOR                                  0x61210
 #define XE2_REG_PP_DIVISOR_REF_DIVIDER_MASK                 xe2_reg_genmask(31,  8)
 #define XE2_REG_PP_DIVISOR_POWER_CYCLE_DELAY_MASK           xe2_reg_genmask( 4,  0)
+
+#define XE2_REG_PCH_PP_STATUS                               0xC7200
+#define XE2_REG_PCH_PP_CONTROL                              0xC7204
+#define XE2_REG_PCH_PP_ON_DELAYS                            0xC7208
+#define XE2_REG_PCH_PP_OFF_DELAYS                           0xC720c
+#define XE2_REG_PCH_PP_DIVISOR                              0xC7210
 
 #define XE2_REG_RP_CONTROL                                  0xA024
 #define XE2_REG_RP_CONTROL_RPSWCTL_MASK                     xe2_reg_genmask(10, 9)
@@ -295,6 +343,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_ACTION_DEREGISTER_COMMAND_TRANSPORT_BUFFER  0x4506
 #define XE2_GUC_ACTION_REGISTER_G2G                         0x4507
 #define XE2_GUC_ACTION_DEREGISTER_G2G                       0x4508
+#define XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB                 0x4509
 #define XE2_GUC_ACTION_DEREGISTER_CONTEXT_DONE              0x4600
 #define XE2_GUC_ACTION_REGISTER_CONTEXT_MULTI_LRC           0x4601
 #define XE2_GUC_ACTION_CLIENT_SOFT_RESET                    0x5507
@@ -344,14 +393,20 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE                  0x3EE000
 #define XE2_HW_ENGINE_GSCCS_RING_BASE                       0x11A000
 
+#define XE2_REG_HW_ENGINE_CLASS(base)                       (base + 0x8C)
+#define XE2_REG_HW_ENGINE_CLASS_INSTANCE_ID_MASK            xe2_reg_genmask(9, 4)
+#define XE2_REG_HW_ENGINE_CLASS_ID_MASK                     xe2_reg_genmask(2, 0)
+
 #define XE2_REG_HW_ENGINE_RING_IDLEDLY(base)                (base + 0x23C)
 #define XE2_REG_HW_ENGINE_RING_IDLEDLY_INHIBIT_SWITCH_UNTIL_PREEMPTED_MASK \
                                                             xe2_reg_bit(31)
 #define XE2_REG_HW_ENGINE_RING_IDLEDLY_IDLE_DELAY_MASK      xe2_reg_genmask(20, 0)
 
-#define XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT(base)          (base + 0x54)
-#define XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT_IDLE_WAIT_TIME_MASK \
+#define XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(base)          (base + 0x54)
+#define XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT_IDLE_WAIT_TIME_MASK \
                                                             xe2_reg_genmask(19, 0)
+
+#define XE2_REG_HW_ENGINE_RING_MI_MODE_MASK(base)           (base + 0x9C)
 
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
@@ -488,7 +543,7 @@ static rvvm_mmio_type_t xe2_type = {
 // write: offset=XE2_REG_GUC_FW_SW_2, data=9030002, size = 4    GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY (0x0903) | len (2 words)
 // write: offset=XE2_REG_GUC_FW_SW_3, data=cf7000,  size = 4    Lower 32 bits of payload
 // write: offset=XE2_REG_GUC_FW_SW_4, data=0,       size = 4    Upper 32 bits of payload
-static inline void xe2_guc_fw_action(void *data, uint32_t action, uint32_t index)
+static inline void xe2_guc_fw_action(void *data, uint32_t *actions, uint32_t index)
 {
     UNUSED(index);
 
@@ -496,14 +551,29 @@ static inline void xe2_guc_fw_action(void *data, uint32_t action, uint32_t index
                  | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7);  // Success
     uint32_t arg = 0U;
 
+    // rvvm_info("GUC action (request):   %08x", actions[0]);
+    // rvvm_info("GUC action (key | len): %08x", actions[1]);
+    // rvvm_info("GUC action (value hi):  %08x", actions[2]);
+    // rvvm_info("GUC action (value lo):  %08x", actions[3]);
+    // rvvm_info(" ");
+
     if (index == 0)
-        switch (action) {
+        switch (actions[0]) {
             case XE2_GUC_ACTION_GET_HWCONFIG:
-                arg = 0x10000;
+                arg = 0x1000;
                 break;
             case XE2_GUC_ACTION_HOST2GUC_SELF_CFG:
-                arg = 1;
+                arg = (1 << 31) // GUC_HXG_ORIGIN_GUC
+                    | (7 << 28) // GUC_HXG_TYPE_RESPONSE_SUCCESS
+                    | (1 <<  0) // AUX data (1)
+                    ;
                 break;
+            case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB:
+                if (actions[1] == 1) {
+                    arg = 0; // GUC_CTB_CONTROL_ENABLE
+                } else {
+                    arg = 0; // GUC_CTB_CONTROL_DISABLE
+                }
             default:
                 break;
         }
@@ -614,7 +684,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset < 0x80000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset < 0x800000)
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
     xe2_dev_t *xe2 = dev->data;
@@ -640,6 +710,13 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             //      { 30,  0, &xe2_lpd_display },
             //      { 30,  2, &xe2_lpd_display },
             // };
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GT_GMD_ID_DISPLAY_ARCH_MASK, 14)
+                         | xe2_reg_field_prep(XE2_REG_GT_GMD_ID_DISPLAY_RELEASE_MASK, 1)
+                         | xe2_reg_field_prep(XE2_REG_GT_GMD_ID_DISPLAY_REVID_MASK, 0);
+            write_uint32_le(data, cmd);
+            break;
+        }
+        case 0x380000 + XE2_REG_GT_GMD_ID_DISPLAY: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_GT_GMD_ID_DISPLAY_ARCH_MASK, 14)
                          | xe2_reg_field_prep(XE2_REG_GT_GMD_ID_DISPLAY_RELEASE_MASK, 1)
                          | xe2_reg_field_prep(XE2_REG_GT_GMD_ID_DISPLAY_REVID_MASK, 0);
@@ -673,6 +750,21 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, xe2->pp_on_delays);
             break;
         case XE2_REG_PP_OFF_DELAYS:
+            write_uint32_le(data, xe2->pp_off_delays);
+            break;
+
+        case XE2_REG_PCH_PP_STATUS:
+            write_uint32_le(data, xe2->pp_status);
+            break;
+        case XE2_REG_PCH_PP_CONTROL:
+            xe2->pp_control |= xe2_reg_field_prep(XE2_REG_PP_CONTROL_POWER_ON_MASK, 1)
+                            |  xe2_reg_field_prep(XE2_REG_PP_CONTROL_EPD_FORCE_VDD_MASK, 1);
+            write_uint32_le(data, xe2->pp_control);
+            break;
+        case XE2_REG_PCH_PP_ON_DELAYS:
+            write_uint32_le(data, xe2->pp_on_delays);
+            break;
+        case XE2_REG_PCH_PP_OFF_DELAYS:
             write_uint32_le(data, xe2->pp_off_delays);
             break;
 
@@ -792,16 +884,16 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
         case XE2_REG_GUC_FW_SW_1:
-            xe2_guc_fw_action(data, xe2->guc_actions[0], 0);
+            xe2_guc_fw_action(data, xe2->guc_actions, 0);
             break;
         case XE2_REG_GUC_FW_SW_2:
-            xe2_guc_fw_action(data, xe2->guc_actions[1], 1);
+            xe2_guc_fw_action(data, xe2->guc_actions, 1);
             break;
         case XE2_REG_GUC_FW_SW_3:
-            xe2_guc_fw_action(data, xe2->guc_actions[2], 2);
+            xe2_guc_fw_action(data, xe2->guc_actions, 2);
             break;
         case XE2_REG_GUC_FW_SW_4:
-            xe2_guc_fw_action(data, xe2->guc_actions[3], 3);
+            xe2_guc_fw_action(data, xe2->guc_actions, 3);
             break;
 
         case XE2_REG_GUC_WOPCM_SIZE: {
@@ -872,7 +964,15 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         // Hardware engines:
         case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_BLT_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_RENDER_RING_BASE):
-        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE): {
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS1_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS2_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS3_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS4_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS5_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS6_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS7_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_GSCCS_RING_BASE): {
             // In kernel: gt->info.timestamp_base = 83333
             //            idledly_units_ps = 8 * gt->info.timestamp_base
             //            idledly = DIV_ROUND_CLOSEST(idledly * idledly_units_ps, 1000)
@@ -883,12 +983,23 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
-        case XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT(XE2_HW_ENGINE_BLT_RING_BASE):
-        case XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT(XE2_HW_ENGINE_RENDER_RING_BASE):
-        case XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE): {
+        // (MTL_MEDIA_GSI_BASE): 380000
+        // Media offset:            d8c
+        //                       380d8c
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_BLT_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_RENDER_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS1_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS2_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS3_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS4_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS5_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS6_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS7_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_GSCCS_RING_BASE): {
             // In kernel: maxcnt = 10 * 640 (maxcnt_units_ns)
             //            -> 0x1900
-            uint32_t cmd = xe2_reg_field_prep(XE2_REG_HW_ENGINE_RING_PRWCTX_MAXCNT_IDLE_WAIT_TIME_MASK, 10);
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT_IDLE_WAIT_TIME_MASK, 10);
             write_uint32_le(data, cmd);
             break;
         }
@@ -909,7 +1020,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 0x80000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 0x800000)
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
@@ -962,6 +1073,19 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->pp_on_delays = read_uint32_le(data);
             break;
         case XE2_REG_PP_OFF_DELAYS:
+            xe2->pp_off_delays = read_uint32_le(data);
+            break;
+
+        case XE2_REG_PCH_PP_STATUS:
+            xe2->pp_status = read_uint32_le(data);
+            break;
+        case XE2_REG_PCH_PP_CONTROL:
+            xe2->pp_control = read_uint32_le(data);
+            break;
+        case XE2_REG_PCH_PP_ON_DELAYS:
+            xe2->pp_on_delays = read_uint32_le(data);
+            break;
+        case XE2_REG_PCH_PP_OFF_DELAYS:
             xe2->pp_off_delays = read_uint32_le(data);
             break;
 
