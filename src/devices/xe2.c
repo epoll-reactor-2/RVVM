@@ -17,49 +17,28 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// [0] Current status: RPNSWREQ, RP_CONTROL, RC_CONTROL, RC_STATE needs to be handled.
-// [1] Current status: GuC
+// Current status: CTB is dead.
 //
-// [    5.028456] xe 0000:00:01.0: [drm:__xe_guc_upload [xe]] Tile0: GT0: init took 0ms, freq = 0MHz (req = 0MHz), before = 0MHz, status = 0x0000F001, timeouts = 0
-// [    5.030417] xe 0000:00:01.0: [drm] Tile0: GT0: xe_guc_ct_enable() called...
-// [    5.030686] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: guc_ct_ctb_h2g_register() failed
-// [    5.030783] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: Failed to enable GuC CT (-EPROTO)
-// [    5.039072] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: Failed to initialize uC (-EINFO: PCI write: offset=a188, data=10000, size = 4
-//
-// Driver finds no suitable hardware engine for XE_ENGINE_CLASS_OTHER.
-//
-//    /* The GSC uC is only available on the media GT */
-//    if (tile->media_gt && (gt != tile->media_gt)) {
-//        xe_uc_fw_change_status(&gsc->fw, XE_UC_FIRMWARE_NOT_SUPPORTED);
-//        return 0;
-//    }
-//
-// int xe_gsc_init_post_hwconfig(struct xe_gsc *gsc)
-// {
-//     struct xe_gt *gt = gsc_to_gt(gsc);
-//     struct xe_tile *tile = gt_to_tile(gt);
-//     struct xe_device *xe = gt_to_xe(gt);
-//     struct xe_hw_engine *hwe = xe_gt_hw_engine(gt, XE_ENGINE_CLASS_OTHER, 0, true);
-//     struct xe_exec_queue *q;
-//     struct workqueue_struct *wq;
-//     struct xe_bo *bo;
-//     int err;
-//
-//     // BUG: This returns 1. That's the problem.
-//
-//     if (!xe_uc_fw_is_available(&gsc->fw))
-//         return 0;
-// 
-//     if (!hwe) {
-//         xe_gt_err(gt, "!hwe\n");
-//         return -ENODEV;
-//
-// [    4.525930] xe 0000:00:01.0: [drm] Tile0: GT0: can't init GSC proxy due to missing mei component
-//
-// To enable GSC, CONFIG_INTEL_MEI_GSC_PROXY kernel parameter must be set,
-// but it depends on INTEL_GTT, which depends on X86.
-//
-// I think we cannot emulate Lunar Lake iGPU...
+// [    6.578243] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.1: **** Xe Device Coredump ****
+// [    6.578455] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.2: Reason: CTB is dead - 0xA
+// [    6.578550] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.3: PCI ID: 0xe20c
+// [    6.578679] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.4: PCI revision: 0x00
+// [    6.578765] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.5: GT id: 0
+// [    6.578829] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.6: 	Tile: 0
+// [    6.578893] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.7: 	Type: main
+// [    6.578977] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.8: 	IP ver: 20.1.1
+// [    6.579045] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.9: 	CS reference clock: 0
+// [    6.579142] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.10: **** GT #0 ****
+// [    6.579230] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.11: 	Tile: 0
+// [    6.579297] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.12: **** GuC Log ****
+// [    6.579370] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.13: GuC firmware: xe/bmg_guc_70.bin
+// [    6.579476] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.14: GuC version: 70.60.0 (wanted 70.49.4)
+// [    6.579550] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.15: Kernel timestamp: 0x17E3FC1D4 [6413074900]
+// [    6.579674] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.16: GuC timestamp: 0x00000000 [0]
+// [    6.579746] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.17: Log level: 3
+// [    6.579814] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.18: [LOG].length: 0xb01000
+// [    6.580080] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.19: [LOG].data: zzzzzzzzzzzzzzzzzzzzzzzzz... (Very long)
+//                                                                             ^ Around 3700 times
 
 #define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
@@ -67,10 +46,27 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define xe2_reg_field_prep(mask, val)   (((val) << __builtin_ctz(mask)) & (mask))
 
 #define XE2_VENDOR_ID_INTEL                                 0x8086
-#define XE2_DEVICE_ID_LUNAR_LAKE_IGPU                       0xE20B
+#define XE2_DEVICE_ID_ARC_B570_GRAPHICS                     0xE20C
 #define XE2_CLASS_CODE                                      0x0300
 
 #define XE2_REG_FLUSH_PENDING                               0x130030 // Dummy register
+
+#define XE2_REG_PCODE_MAILBOX                               0x138124
+#define XE2_REG_PCODE_MAILBOX_READY_MASK                    xe2_reg_bit(31)
+#define XE2_REG_PCODE_MAILBOX_MB_PARAM2_MASK                xe2_reg_genmask(23, 16)
+#define XE2_REG_PCODE_MAILBOX_MB_PARAM1_MASK                xe2_reg_genmask(15,  8)
+#define XE2_REG_PCODE_MAILBOX_MB_COMMAND_MASK               xe2_reg_genmask( 7,  0)
+
+#define XE2_REG_PCODE_DATA0                                 0x138128
+#define XE2_REG_PCODE_DATA1                                 0x13812C
+
+#define XE2_REG_PCODE_SCRATCH(n)                            (0x138320 + (n) * 4)
+#define XE2_REG_PCODE_SCRATCH_AUXINFO_REG_OFFSET_MASK       xe2_reg_genmask(17, 15)
+#define XE2_REG_PCODE_SCRATCH_OVERFLOW_REG_OFFSET_MASK      xe2_reg_genmask(14, 12)
+#define XE2_REG_PCODE_SCRATCH_HISTORY_TRACKING_MASK         xe2_reg_bit(11)
+#define XE2_REG_PCODE_SCRATCH_OVERFLOW_SUPPORT_MASK         xe2_reg_bit(10)
+#define XE2_REG_PCODE_SCRATCH_AUXINFO_SUPPORT_MASK          xe2_reg_bit( 9)
+#define XE2_REG_PCODE_SCRATCH_BOOT_STATUS_MASK              xe2_reg_genmask(3, 1)
 
 #define XE2_REG_GT_GMD_ID                                   0xD8C
 #define XE2_REG_GT_GMD_ID_ARCH_MASK                         xe2_reg_genmask(31, 22)
@@ -81,6 +77,13 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GT_GMD_ID_DISPLAY_ARCH_MASK                 xe2_reg_genmask(31, 22)
 #define XE2_REG_GT_GMD_ID_DISPLAY_RELEASE_MASK              xe2_reg_genmask(21, 14)
 #define XE2_REG_GT_GMD_ID_DISPLAY_REVID_MASK                xe2_reg_genmask(5, 0)
+
+#define XE2_REG_GU_CNTL                                     0x101010
+#define XE2_REG_GU_CNTL_LMEM_INIT_MASK                      xe2_reg_bit(7)
+#define XE2_REG_GU_CNTL_DRIVERFLR_MASK                      xe2_reg_bit(31)
+
+#define XE2_REG_PRIMARY_SPI_ADDRESS                         0x102080
+#define XE2_REG_PRIMARY_SPI_TRIGGER                         0x102040
 
 #define XE2_REG_GT_FORCEWAKE_GSC                            0xA618
 #define XE2_REG_GT_FORCEWAKE_ACK_GSC                        0xDF8
@@ -463,6 +466,9 @@ typedef struct {
     uint32_t    guc_actions[4];
     xe2_aux_t   aux[1]; // We assume one display with one AUX channel.
 
+    uint32_t    spi_address;
+    uint32_t    spi_trigger;
+
     struct {
         // These sizes come from firmware blob.
         uint8_t main  [0x470C];
@@ -572,7 +578,7 @@ static inline void xe2_guc_fw_action(void *data, uint32_t *actions, uint32_t ind
                 if (actions[1] == 1) {
                     arg = 0; // GUC_CTB_CONTROL_ENABLE
                 } else {
-                    arg = 0; // GUC_CTB_CONTROL_DISABLE
+                    arg = 1; // GUC_CTB_CONTROL_DISABLE
                 }
             default:
                 break;
@@ -684,7 +690,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset < 0x800000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset < 0x800000 && offset != 0x102040 && offset != 0x102080)
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
     xe2_dev_t *xe2 = dev->data;
@@ -723,6 +729,37 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
+        case XE2_REG_PCODE_MAILBOX: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_PCODE_MAILBOX_READY_MASK, 0);
+            cmd |= 0x0;
+            rvvm_info("PCODE error mask: %x", cmd & 0xFF);
+            write_uint32_le(data, cmd);
+            break;
+        }
+        case XE2_REG_PCODE_DATA0: {
+            write_uint32_le(data, 0xFF);
+            break;
+        }
+        case XE2_REG_PCODE_DATA1: {
+            write_uint32_le(data, 0xFF);
+            break;
+        }
+        case XE2_REG_PCODE_SCRATCH(0): {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_PCODE_SCRATCH_BOOT_STATUS_MASK, 0);
+            write_uint32_le(data, cmd);
+            break;
+        }
+        case XE2_REG_GU_CNTL: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GU_CNTL_LMEM_INIT_MASK, 1);
+            write_uint32_le(data, cmd);
+            break;
+        }
+        case XE2_REG_PRIMARY_SPI_TRIGGER:
+            write_uint32_le(data, xe2->spi_trigger);
+            break;
+        case XE2_REG_PRIMARY_SPI_ADDRESS:
+            write_uint32_le(data, xe2->spi_address);
+            break;
         case XE2_REG_GT_FORCEWAKE_ACK_GSC:
             write_uint32_le(data, xe2->forcewake_gsc);
             break;
@@ -1020,7 +1057,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 0x800000)
+    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 0x800000 && offset != 0x102040 && offset != 0x102080)
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
@@ -1040,6 +1077,12 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             break;
         case XE2_REG_STEER_SEMAPHORE:
             xe2->steer_semaphore = read_uint32_le(data);
+            break;
+        case XE2_REG_PRIMARY_SPI_TRIGGER:
+            xe2->spi_trigger = read_uint32_le(data);
+            break;
+        case XE2_REG_PRIMARY_SPI_ADDRESS:
+            xe2->spi_address = read_uint32_le(data);
             break;
 
         case XE2_REG_DPA_AUX_CH_CTL:
@@ -1152,7 +1195,7 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
 
     pci_func_desc_t xe2_desc = {
         .vendor_id  = XE2_VENDOR_ID_INTEL,
-        .device_id  = XE2_DEVICE_ID_LUNAR_LAKE_IGPU,
+        .device_id  = XE2_DEVICE_ID_ARC_B570_GRAPHICS,
         .class_code = XE2_CLASS_CODE,
         .prog_if    = 0,
         .irq_pin    = PCI_IRQ_PIN_INTA,
