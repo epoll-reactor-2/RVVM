@@ -10,9 +10,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "xe2.h"
 #include "atomics.h"
 #include "compiler.h"
+#include "devices/pci-bus.h"
 #include "mem_ops.h"
+#include "rvvm/rvvm_base.h"
 #include "utils.h"
 #include "vma_ops.h"
+#include <stdint.h>
 
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
@@ -291,6 +294,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GUC_DMA_ADDR_1_HI                           0xC30C
 #define XE2_REG_GUC_DMA_COPY_SIZE                           0xC310
 #define XE2_REG_GUC_DMA_CTRL                                0xC314
+#define XE2_REG_GUC_DMA_CTRL_HUC_UKERNEL                    xe2_reg_bit(9)
+#define XE2_REG_GUC_DMA_CTRL_UOS_MOVE                       xe2_reg_bit(4)
+#define XE2_REG_GUC_DMA_CTRL_START_DMA                      xe2_reg_bit(0)
 
 #define XE2_REG_STOLEN_RESERVED1                            0x1082C0 // Das war schön gestohlen mal...
 #define XE2_REG_STOLEN_RESERVED2                            0x1082C4
@@ -425,7 +431,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT_IDLE_WAIT_TIME_MASK \
                                                             xe2_reg_genmask(19, 0)
 
-#define XE2_REG_HW_ENGINE_RING_MI_MODE_MASK(base)           (base + 0x9C)
+#define XE2_REG_HW_ENGINE_RING_MI_MODE(base)                (base + 0x9C)
+
+#define XE2_REG_HW_ENGINE_RING_TAIL(base)                   (base + 0x30)
+#define XE2_REG_HW_ENGINE_RING_HEAD(base)                   (base + 0x34)
+#define XE2_REG_HW_ENGINE_RING_START(base)                  (base + 0x38)
+#define XE2_REG_HW_ENGINE_RING_CTL(base)                    (base + 0x38)
 
 #define XE2_CFG_VRAM_SIZE                                   0x10000000
 
@@ -486,6 +497,10 @@ typedef struct {
 
     uint32_t    spi_address;
     uint32_t    spi_trigger;
+
+    rvvm_addr_t dma_0;
+    rvvm_addr_t dma_1;
+    uint32_t    dma_copy_size;
 
     uint8_t     *vram;
 
@@ -569,48 +584,69 @@ static rvvm_mmio_type_t xe2_type = {
 // write: offset=XE2_REG_GUC_FW_SW_2, data=9030002, size = 4    GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY (0x0903) | len (2 words)
 // write: offset=XE2_REG_GUC_FW_SW_3, data=cf7000,  size = 4    Lower 32 bits of payload
 // write: offset=XE2_REG_GUC_FW_SW_4, data=0,       size = 4    Upper 32 bits of payload
+//
+// How this communicates with Linux?
+//
+// xe_bo_vmap()?
+//
+// static int xe_dma_buf_attach(struct dma_buf *dmabuf,
+//                              struct dma_buf_attachment *attach)
+//
+// iosys addresses:
+// [    5.504551] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(2): 00000000c94d0978, 00000000c94d0978
+// [    5.504935] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(1): 00000000c94d0978, 00000000c94d0978
 static inline void xe2_guc_fw_action(void *data, uint32_t *actions, uint32_t index)
 {
     UNUSED(index);
 
-    uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_ORIGIN_MASK, 1) // Origin GUC
-                 | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7);  // Success
     uint32_t arg = 0U;
 
+    // GuC reports addresses of CTB, CTB descriptor (for both directions)
     rvvm_info("GUC action (request):   %08x", actions[0]);
     rvvm_info("GUC action (key | len): %08x", actions[1]);
     rvvm_info("GUC action (value hi):  %08x", actions[2]);
     rvvm_info("GUC action (value lo):  %08x", actions[3]);
-    rvvm_info(" ");
 
     if (index == 0)
         switch (actions[0]) {
-            case XE2_GUC_ACTION_GET_HWCONFIG:
+            case XE2_GUC_ACTION_GET_HWCONFIG: // 0x4100
                 arg = 0x1000;
                 break;
-            case XE2_GUC_ACTION_HOST2GUC_SELF_CFG:
+            case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: { // 0x508
+                uint32_t key  = xe2_reg_field_get(xe2_reg_genmask(31, 16), actions[1]);
+                uint32_t val  = xe2_reg_field_get(xe2_reg_genmask(15,  0), actions[1]);
+                uint64_t addr = (uint64_t) actions[2]
+                              | (uint64_t) actions[3] << 32;
+
+                rvvm_info("GUC action (self cfg): key=%x val=%x, addr=%lx", key, val, addr);
+
                 arg = (1 << 31) // GUC_HXG_ORIGIN_GUC
                     | (7 << 28) // GUC_HXG_TYPE_RESPONSE_SUCCESS
                     | (1 <<  0) // AUX data (1)
                     ;
                 break;
-            case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB:
+            }
+            case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB: // 0x4509
                 if (actions[1] == 1) {
                     arg = 0; // GUC_CTB_CONTROL_DISABLE
                 } else {
                     arg = 1; // GUC_CTB_CONTROL_ENABLE
                 }
                 break;
-            case XE2_GUC_ACTION_OPT_IN_FEATURE_KLV:
+            case XE2_GUC_ACTION_OPT_IN_FEATURE_KLV: // 0x550E
                 arg = 1;
                 break;
             default:
                 break;
         }
 
-    cmd |= xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_DATA_MASK, arg);
+    uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_ORIGIN_MASK, 1) // Origin GUC
+                 | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7)   // Success
+                 | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_DATA_MASK, arg);
 
     write_uint32_le(data, cmd);
+
+    rvvm_info(" ");
 }
 
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
@@ -989,6 +1025,11 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
+        case XE2_REG_GUC_DMA_CTRL: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_DMA_CTRL, 1);
+            write_uint32_le(data, cmd);
+            break;
+        }
 
         case XE2_REG_STEER_SEMAPHORE:
             write_uint32_le(data, xe2->steer_semaphore);
@@ -1083,6 +1124,22 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
+
+        case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_RENDER_RING_BASE):
+            rvvm_info("Read ring head: HW engine renderer");
+            break;
+
+        case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_RENDER_RING_BASE):
+            rvvm_info("Read ring tail: HW engine renderer");
+            break;
+
+        case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
+            rvvm_info("Read ring head: HW engine BCS8");
+            break;
+
+        case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
+            rvvm_info("Read ring tail: HW engine BCS8");
+            break;
 
         default:
             break;
@@ -1218,6 +1275,68 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         case XE2_REG_GUC_FW_SW_4:
             xe2->guc_actions[3] = read_uint32_le(data);
             break;
+
+        case XE2_REG_GUC_DMA_ADDR_0_LO:
+            xe2->dma_0 = read_uint32_le(data);
+            break;
+        case XE2_REG_GUC_DMA_ADDR_0_HI: {
+            uint32_t cmd = read_uint32_le(data);
+            rvvm_addr_t dma = cmd & ~xe2_reg_field_prep(xe2_reg_genmask(20, 16), 0x1F);
+            xe2->dma_0 |= dma << 32;
+            break;
+        }
+
+        case XE2_REG_GUC_DMA_ADDR_1_LO:
+            xe2->dma_1  = (rvvm_addr_t) read_uint32_le(data);
+            break;
+        case XE2_REG_GUC_DMA_ADDR_1_HI: {
+            uint32_t cmd = read_uint32_le(data);
+            rvvm_addr_t dma = cmd & ~xe2_reg_field_prep(xe2_reg_genmask(20, 16), 0x1F);
+            xe2->dma_1 |= dma << 32;
+            break;
+        }
+        case XE2_REG_GUC_DMA_COPY_SIZE:
+            xe2->dma_copy_size = read_uint32_le(data);
+            break;
+
+        case XE2_REG_GUC_HOST_INTERRUPT: {
+            // DMA out-of-the box doesn't work. Most probably we dealing with
+            // GGTT offsets, not raw DMA ones. We need some translation mechanism
+            // for GGTT :-> raw DMA.
+            uint64_t dmas[] = {
+                xe2->dma_0,
+                xe2->dma_1
+            };
+            for (uint64_t i = 0; i < STATIC_ARRAY_SIZE(dmas); ++i) {
+                rvvm_info("XE2 emitted host interrupt");
+                uint32_t *dma = pci_get_dma_ptr(xe2->pci_func, 0xc94d0978, sizeof(uint32_t) * 1);
+                if (dma == NULL) {
+                    rvvm_warn("DMA is NULL!");
+                } else {
+                    for (size_t j = 0; j < 1; ++j) {
+                        rvvm_info("DMA[%lu]: %x", j, dma[j]);
+                    }
+                }
+            }
+            break;
+        }
+
+        case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_RENDER_RING_BASE):
+            rvvm_info("Write ring head: HW engine renderer");
+            break;
+
+        case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_RENDER_RING_BASE):
+            rvvm_info("Write ring tail: HW engine renderer");
+            break;
+
+        case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
+            rvvm_info("Write ring head: HW engine BCS8");
+            break;
+
+        case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
+            rvvm_info("Write ring tail: HW engine BCS8");
+            break;
+
         default:
             break;
     }
