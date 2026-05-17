@@ -12,7 +12,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "compiler.h"
 #include "mem_ops.h"
 #include "utils.h"
-#include <stdint.h>
+#include "vma_ops.h"
 
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
@@ -40,7 +40,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // [    6.580080] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.19: [LOG].data: zzzzzzzzzzzzzzzzzzzzzzzzz... (Very long)
 //                                                                             ^ Around 3700 times
 
-#define xe2_reg_genmask(h, l)           (((~0U) << (l)) & (~0U >> (31 - (h))))
+#define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
+#define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
 #define xe2_reg_field_get(mask, val)    (((val) & (mask)) >> __builtin_ctz(mask))
 #define xe2_reg_field_prep(mask, val)   (((val) << __builtin_ctz(mask)) & (mask))
@@ -113,6 +114,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GGC                                         0x108040 // Graphics control
 #define XE2_REG_GGC_GMS_MASK                                xe2_reg_genmask(15, 8)
 #define XE2_REG_GGC_GGMS_MASK                               xe2_reg_genmask(7, 6)
+
+#define XE2_REG_DSMBASE_64                                  0x1080C0
+#define XE2_REG_DSMBASE_64_MASK                             xe2_reg_genmask64(63, 20)
+
+#define XE2_REG_GSMBASE                                     0x108100
 
 #define XE2_REG_GUC_TLB_INV_DESC0                           0xCF7C // Write-only for OS
 #define XE2_REG_GUC_TLB_INV_DESC1                           0xCF80 // Write-only for OS
@@ -276,6 +282,16 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_GUC_HOST_INTERRUPT                          0x1901F0
 
+#define XE2_REG_GUC_PMTIMESTAMP_LO                          0xC3E8
+#define XE2_REG_GUC_PMTIMESTAMP_HI                          0xC3EC
+
+#define XE2_REG_GUC_DMA_ADDR_0_LO                           0xC300
+#define XE2_REG_GUC_DMA_ADDR_0_HI                           0xC304
+#define XE2_REG_GUC_DMA_ADDR_1_LO                           0xC308
+#define XE2_REG_GUC_DMA_ADDR_1_HI                           0xC30C
+#define XE2_REG_GUC_DMA_COPY_SIZE                           0xC310
+#define XE2_REG_GUC_DMA_CTRL                                0xC314
+
 #define XE2_REG_STOLEN_RESERVED1                            0x1082C0 // Das war schön gestohlen mal...
 #define XE2_REG_STOLEN_RESERVED2                            0x1082C4
 #define XE2_REG_STOLEN_RESERVED_WOPCM_SIZE_MASK             xe2_reg_genmask(9, 7)
@@ -411,6 +427,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_HW_ENGINE_RING_MI_MODE_MASK(base)           (base + 0x9C)
 
+#define XE2_CFG_VRAM_SIZE                                   0x10000000
+
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
 #define DPCD_REG_REV                                        0x00
@@ -468,6 +486,8 @@ typedef struct {
 
     uint32_t    spi_address;
     uint32_t    spi_trigger;
+
+    uint8_t     *vram;
 
     struct {
         // These sizes come from firmware blob.
@@ -557,11 +577,11 @@ static inline void xe2_guc_fw_action(void *data, uint32_t *actions, uint32_t ind
                  | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7);  // Success
     uint32_t arg = 0U;
 
-    // rvvm_info("GUC action (request):   %08x", actions[0]);
-    // rvvm_info("GUC action (key | len): %08x", actions[1]);
-    // rvvm_info("GUC action (value hi):  %08x", actions[2]);
-    // rvvm_info("GUC action (value lo):  %08x", actions[3]);
-    // rvvm_info(" ");
+    rvvm_info("GUC action (request):   %08x", actions[0]);
+    rvvm_info("GUC action (key | len): %08x", actions[1]);
+    rvvm_info("GUC action (value hi):  %08x", actions[2]);
+    rvvm_info("GUC action (value lo):  %08x", actions[3]);
+    rvvm_info(" ");
 
     if (index == 0)
         switch (actions[0]) {
@@ -576,10 +596,14 @@ static inline void xe2_guc_fw_action(void *data, uint32_t *actions, uint32_t ind
                 break;
             case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB:
                 if (actions[1] == 1) {
-                    arg = 0; // GUC_CTB_CONTROL_ENABLE
+                    arg = 0; // GUC_CTB_CONTROL_DISABLE
                 } else {
-                    arg = 1; // GUC_CTB_CONTROL_DISABLE
+                    arg = 1; // GUC_CTB_CONTROL_ENABLE
                 }
+                break;
+            case XE2_GUC_ACTION_OPT_IN_FEATURE_KLV:
+                arg = 1;
+                break;
             default:
                 break;
         }
@@ -775,6 +799,16 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, xe2->gt_gdrst);
             break;
 
+        case XE2_REG_DSMBASE_64:
+            // BUG: ???
+            write_uint64_le(data, 0x1000000ULL);
+            break;
+        case XE2_REG_GSMBASE:
+            // BUG: ???
+            write_uint64_le(data, 0x10000000ULL);
+            break;
+            break;
+
         case XE2_REG_PP_STATUS:
             write_uint32_le(data, xe2->pp_status);
             break;
@@ -932,6 +966,15 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_GUC_FW_SW_4:
             xe2_guc_fw_action(data, xe2->guc_actions, 3);
             break;
+
+        case XE2_REG_GUC_PMTIMESTAMP_LO: {
+            write_uint32_le(data, 1779018398);
+            break;
+        }
+        case XE2_REG_GUC_PMTIMESTAMP_HI: {
+            write_uint32_le(data, 0);
+            break;
+        }
 
         case XE2_REG_GUC_WOPCM_SIZE: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_WOPCM_SIZE_MASK, xe2->wopcm_size)
@@ -1192,6 +1235,7 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
     xe2_dev_t *xe2 = safe_new_obj(xe2_dev_t);
     xe2->aux[0].edid_written = 0;
     xe2->steer_semaphore = 1; // Begin with unlocked state.
+    xe2->vram = vma_alloc(NULL, XE2_CFG_VRAM_SIZE, VMA_RDWR);
 
     pci_func_desc_t xe2_desc = {
         .vendor_id  = XE2_VENDOR_ID_INTEL,
@@ -1211,9 +1255,11 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
         },
         // VRAM
         .bar[2]         = {
-            .size           = 0x10000000,
+            .size           = XE2_CFG_VRAM_SIZE,
             .min_op_size    = 1,
             .max_op_size    = 4,
+            .data           = xe2,
+            .mapping        = xe2->vram
         }
     };
 
