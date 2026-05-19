@@ -298,6 +298,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GUC_DMA_CTRL_UOS_MOVE                       xe2_reg_bit(4)
 #define XE2_REG_GUC_DMA_CTRL_START_DMA                      xe2_reg_bit(0)
 
+#define XE2_REG_GUC_SOFT_SCRATCH(n)                         (0xC180 + (n) * 4)
+#define XE2_REG_GUC_SOFT_SCRATCH_INDEX(reg)                 ((reg - 0xC180) / 4)
+#define XE2_GUC_SOFT_SCRATCH_COUNT                          16
+
 #define XE2_REG_STOLEN_RESERVED1                            0x1082C0 // Das war schön gestohlen mal...
 #define XE2_REG_STOLEN_RESERVED2                            0x1082C4
 #define XE2_REG_STOLEN_RESERVED_WOPCM_SIZE_MASK             xe2_reg_genmask(9, 7)
@@ -389,6 +393,24 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_ACTION_NOTIFY_EXCEPTION                     0x8005
 #define XE2_GUC_ACTION_TEST_G2G_SEND                        0xF001
 #define XE2_GUC_ACTION_TEST_G2G_RECV                        0xF002
+
+#define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY         0x900
+#define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_LEN         2
+#define GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY         0x901
+#define GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_LEN         2
+#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY               0x902
+#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_LEN               2
+#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY    0x903
+#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_LEN    2
+#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY               0x904
+#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_LEN               1
+#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY               0x905
+#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_LEN               2
+#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY    0x906
+#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_LEN    2
+#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY               0x907
+#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_LEN               1
+
 
 #define XE2_HW_ENGINE_RENDER_RING_BASE                      0x02000
 #define XE2_HW_ENGINE_BSD_RING_BASE                         0x1C0000
@@ -595,7 +617,23 @@ static rvvm_mmio_type_t xe2_type = {
 // iosys addresses:
 // [    5.504551] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(2): 00000000c94d0978, 00000000c94d0978
 // [    5.504935] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(1): 00000000c94d0978, 00000000c94d0978
-static inline void xe2_guc_action(void *data, uint32_t *actions)
+//
+// GuC writes:
+//
+// RVVM: PCI write: offset=3ee050, data=10001000, size = 4
+// RVVM: PCI write: offset=3ee0c4, data=3f7e0306, size = 4
+// [   43.363143] xe 0000:00:01.0: [drm:xe_reg_sr_apply_mmio [xe]] Tile0: GT0: REG[0x3ee050] = 0x10001000
+// [   43.364366] xe 0000:00:01.0: [drm:xe_reg_sr_apply_mmio [xe]] Tile0: GT0: REG[0x3ee0c4] = 0x3f7e0306
+// ...
+//
+// As I understood, this is large sequence with configuration registers. Have no idea,
+// is it needed or not.
+//
+// static const struct xe_rtp_entry_sr gt_tunings[] = {
+// ...
+#define XE2_GUC_GGTT_TOP 0xFEE00000
+
+static inline void xe2_guc_action(pci_func_t *pci_func, void *data, uint32_t *actions)
 {
     uint32_t arg = 0U;
 
@@ -611,11 +649,28 @@ static inline void xe2_guc_action(void *data, uint32_t *actions)
             break;
         case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: { // 0x508
             uint32_t key  = xe2_reg_field_get(xe2_reg_genmask(31, 16), actions[1]);
-            uint32_t val  = xe2_reg_field_get(xe2_reg_genmask(15,  0), actions[1]);
             uint64_t addr = (uint64_t) actions[2]
                           | (uint64_t) actions[3] << 32;
 
-            rvvm_info("GUC action (self cfg): key=%x val=%x, addr=%lx", key, val, addr);
+            switch (key) {
+                case GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY: // 0x900
+                case GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY: // 0x901
+                case GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY: // 0x902
+                case GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY: // 0x903
+                case GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY: // 0x905
+                case GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY: { // 0x906
+                    // Typical physical address is: 0x806db988.
+                    rvvm_addr_t dma_addr = addr << 12;
+                    rvvm_info("GuC: DMA try access %lx (raw: %lx)", dma_addr, addr);
+                    uint32_t *dma = pci_get_dma_ptr(pci_func, dma_addr, 4);
+                    if (dma == NULL) {
+                        rvvm_warn("GuC: DMA error");
+                    } else {
+                        rvvm_info("GuC: DMA: %x", *dma);
+                    }
+                    break;
+                }
+            }
 
             arg = (1 << 31) // GUC_HXG_ORIGIN_GUC
                 | (7 << 28) // GUC_HXG_TYPE_RESPONSE_SUCCESS
@@ -747,7 +802,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset < 0x800000 && offset != 0x102040 && offset != 0x102080)
+    // if (offset != XE2_REG_FLUSH_PENDING && offset < 0x800000 && offset != 0x102040 && offset != 0x102080)
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
     xe2_dev_t *xe2 = dev->data;
@@ -990,7 +1045,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         // Note that guest needs read access only for the first of
         // 4 GuC action registers to read the response.
         case XE2_REG_GUC_FW_SW_1:
-            xe2_guc_action(data, xe2->guc_actions);
+            xe2_guc_action(xe2->pci_func, data, xe2->guc_actions);
             break;
 
         case XE2_REG_GUC_PMTIMESTAMP_LO: {
@@ -1147,7 +1202,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 {
     UNUSED(size);
 
-    if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 0x800000 && offset != 0x102040 && offset != 0x102080)
+    // if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 0x800000 && offset != 0x102040 && offset != 0x102080)
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
@@ -1326,6 +1381,27 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
             rvvm_info("Write ring tail: HW engine BCS8");
             break;
+
+        case XE2_REG_GUC_SOFT_SCRATCH( 0):
+        case XE2_REG_GUC_SOFT_SCRATCH( 1):
+        case XE2_REG_GUC_SOFT_SCRATCH( 2):
+        case XE2_REG_GUC_SOFT_SCRATCH( 3):
+        case XE2_REG_GUC_SOFT_SCRATCH( 4):
+        case XE2_REG_GUC_SOFT_SCRATCH( 5):
+        case XE2_REG_GUC_SOFT_SCRATCH( 6):
+        case XE2_REG_GUC_SOFT_SCRATCH( 7):
+        case XE2_REG_GUC_SOFT_SCRATCH( 8):
+        case XE2_REG_GUC_SOFT_SCRATCH( 9):
+        case XE2_REG_GUC_SOFT_SCRATCH(10):
+        case XE2_REG_GUC_SOFT_SCRATCH(11):
+        case XE2_REG_GUC_SOFT_SCRATCH(12):
+        case XE2_REG_GUC_SOFT_SCRATCH(13):
+        case XE2_REG_GUC_SOFT_SCRATCH(14):
+        case XE2_REG_GUC_SOFT_SCRATCH(15): {
+            size_t index = XE2_REG_GUC_SOFT_SCRATCH_INDEX(offset);
+            rvvm_info("soft scratch write[%lu]: %08x", index, read_uint32_le(data));
+            break;
+        }
 
         default:
             break;
