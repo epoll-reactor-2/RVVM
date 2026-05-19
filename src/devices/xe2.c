@@ -595,10 +595,8 @@ static rvvm_mmio_type_t xe2_type = {
 // iosys addresses:
 // [    5.504551] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(2): 00000000c94d0978, 00000000c94d0978
 // [    5.504935] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(1): 00000000c94d0978, 00000000c94d0978
-static inline void xe2_guc_fw_action(void *data, uint32_t *actions, uint32_t index)
+static inline void xe2_guc_action(void *data, uint32_t *actions)
 {
-    UNUSED(index);
-
     uint32_t arg = 0U;
 
     // GuC reports addresses of CTB, CTB descriptor (for both directions)
@@ -607,38 +605,37 @@ static inline void xe2_guc_fw_action(void *data, uint32_t *actions, uint32_t ind
     rvvm_info("GUC action (value hi):  %08x", actions[2]);
     rvvm_info("GUC action (value lo):  %08x", actions[3]);
 
-    if (index == 0)
-        switch (actions[0]) {
-            case XE2_GUC_ACTION_GET_HWCONFIG: // 0x4100
-                arg = 0x1000;
-                break;
-            case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: { // 0x508
-                uint32_t key  = xe2_reg_field_get(xe2_reg_genmask(31, 16), actions[1]);
-                uint32_t val  = xe2_reg_field_get(xe2_reg_genmask(15,  0), actions[1]);
-                uint64_t addr = (uint64_t) actions[2]
-                              | (uint64_t) actions[3] << 32;
+    switch (actions[0]) {
+        case XE2_GUC_ACTION_GET_HWCONFIG: // 0x4100
+            arg = 0x1000;
+            break;
+        case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: { // 0x508
+            uint32_t key  = xe2_reg_field_get(xe2_reg_genmask(31, 16), actions[1]);
+            uint32_t val  = xe2_reg_field_get(xe2_reg_genmask(15,  0), actions[1]);
+            uint64_t addr = (uint64_t) actions[2]
+                          | (uint64_t) actions[3] << 32;
 
-                rvvm_info("GUC action (self cfg): key=%x val=%x, addr=%lx", key, val, addr);
+            rvvm_info("GUC action (self cfg): key=%x val=%x, addr=%lx", key, val, addr);
 
-                arg = (1 << 31) // GUC_HXG_ORIGIN_GUC
-                    | (7 << 28) // GUC_HXG_TYPE_RESPONSE_SUCCESS
-                    | (1 <<  0) // AUX data (1)
-                    ;
-                break;
-            }
-            case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB: // 0x4509
-                if (actions[1] == 1) {
-                    arg = 0; // GUC_CTB_CONTROL_DISABLE
-                } else {
-                    arg = 1; // GUC_CTB_CONTROL_ENABLE
-                }
-                break;
-            case XE2_GUC_ACTION_OPT_IN_FEATURE_KLV: // 0x550E
-                arg = 1;
-                break;
-            default:
-                break;
+            arg = (1 << 31) // GUC_HXG_ORIGIN_GUC
+                | (7 << 28) // GUC_HXG_TYPE_RESPONSE_SUCCESS
+                | (1 <<  0) // AUX data (1)
+                ;
+            break;
         }
+        case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB: // 0x4509
+            if (actions[1] == 1) {
+                arg = 0; // GUC_CTB_CONTROL_DISABLE
+            } else {
+                arg = 1; // GUC_CTB_CONTROL_ENABLE
+            }
+            break;
+        case XE2_GUC_ACTION_OPT_IN_FEATURE_KLV: // 0x550E
+            arg = 1;
+            break;
+        default:
+            break;
+    }
 
     uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_ORIGIN_MASK, 1) // Origin GUC
                  | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7)   // Success
@@ -990,17 +987,10 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
+        // Note that guest needs read access only for the first of
+        // 4 GuC action registers to read the response.
         case XE2_REG_GUC_FW_SW_1:
-            xe2_guc_fw_action(data, xe2->guc_actions, 0);
-            break;
-        case XE2_REG_GUC_FW_SW_2:
-            xe2_guc_fw_action(data, xe2->guc_actions, 1);
-            break;
-        case XE2_REG_GUC_FW_SW_3:
-            xe2_guc_fw_action(data, xe2->guc_actions, 2);
-            break;
-        case XE2_REG_GUC_FW_SW_4:
-            xe2_guc_fw_action(data, xe2->guc_actions, 3);
+            xe2_guc_action(data, xe2->guc_actions);
             break;
 
         case XE2_REG_GUC_PMTIMESTAMP_LO: {
