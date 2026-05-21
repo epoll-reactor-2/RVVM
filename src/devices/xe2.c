@@ -20,28 +20,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: CTB is dead.
+// Current status: DMA still not configured.
 //
-// [    6.578243] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.1: **** Xe Device Coredump ****
-// [    6.578455] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.2: Reason: CTB is dead - 0xA
-// [    6.578550] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.3: PCI ID: 0xe20c
-// [    6.578679] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.4: PCI revision: 0x00
-// [    6.578765] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.5: GT id: 0
-// [    6.578829] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.6: 	Tile: 0
-// [    6.578893] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.7: 	Type: main
-// [    6.578977] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.8: 	IP ver: 20.1.1
-// [    6.579045] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.9: 	CS reference clock: 0
-// [    6.579142] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.10: **** GT #0 ****
-// [    6.579230] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.11: 	Tile: 0
-// [    6.579297] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.12: **** GuC Log ****
-// [    6.579370] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.13: GuC firmware: xe/bmg_guc_70.bin
-// [    6.579476] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.14: GuC version: 70.60.0 (wanted 70.49.4)
-// [    6.579550] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.15: Kernel timestamp: 0x17E3FC1D4 [6413074900]
-// [    6.579674] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.16: GuC timestamp: 0x00000000 [0]
-// [    6.579746] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.17: Log level: 3
-// [    6.579814] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.18: [LOG].length: 0xb01000
-// [    6.580080] xe 0000:00:01.0: [drm] Tile0: GT0: Capture 1.19: [LOG].data: zzzzzzzzzzzzzzzzzzzzzzzzz... (Very long)
-//                                                                             ^ Around 3700 times
+// [    7.032183] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_bb_create_job: Create BB job for address 409000
+// [    7.032991] xe 0000:00:01.0: [drm] Tile0: GT0: Batch address: 409000
+// [    8.042990] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: !timeout (0)
+// [    8.043478] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: emit_wa_job: emit_job_sync() returned: -ETIME
+// [    8.043991] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: hwe rcs0: emit_wa_job failed (-ETIME) guc_id=1
+// [    8.044325] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_uc_load_hw: xe_gt_record_default_lrcs() failed
+// [    8.044526] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_guc_ct_disable: Set DISABLED
+// [    8.044940] ------------[ cut here ]------------
+// [    8.045143] xe 0000:00:01.0: [drm] Assertion `ct->g2h_outstanding == 0 || state == XE_GUC_CT_STATE_STOPPED` failed!
 
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -113,15 +102,27 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_MTL_MEM_SS_INFO_N_CHANNELS_MASK             xe2_reg_genmask(7, 4)
 #define XE2_REG_MTL_MEM_SS_INFO_DDR_TYPE_MASK               xe2_reg_genmask(3, 0)
 
+#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_LO(n)            (0x45710 + (n) * 8)
+#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_LO_TRCD_MASK     xe2_reg_genmask(31, 24)
+#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_LO_TRP_MASK      xe2_reg_genmask(23, 16)
+#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_LO_DCLK_MASK     xe2_reg_genmask(15,  0)
+#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_HI(n)            (0x45710 + (n) * 8 + 4)
+#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_HI_TRAS_MASK     xe2_reg_genmask(16, 8)
+#define XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_HI_TRDPRE_MASK   xe2_reg_genmask( 7, 0)
+
 #define XE2_REG_STEER_SEMAPHORE                             0xFD0
 #define XE2_REG_GGC                                         0x108040 // Graphics control
 #define XE2_REG_GGC_GMS_MASK                                xe2_reg_genmask(15, 8)
 #define XE2_REG_GGC_GGMS_MASK                               xe2_reg_genmask(7, 6)
 
-#define XE2_REG_DSMBASE_64                                  0x1080C0
+#define XE2_REG_DSMBASE_LO                                  0x1080C0
+#define XE2_REG_DSMBASE_HI                                  0x1080C4
 #define XE2_REG_DSMBASE_64_MASK                             xe2_reg_genmask64(63, 20)
 
-#define XE2_REG_GSMBASE                                     0x108100
+#define XE2_REG_XEHP_TILE_ADDRESS_RANGE(n)                  (0x4900 + (n) * 4)
+
+#define XE2_REG_GSMBASE_LO                                  0x108100
+#define XE2_REG_GSMBASE_HI                                  0x108104
 
 #define XE2_REG_GUC_TLB_INV_DESC0                           0xCF7C // Write-only for OS
 #define XE2_REG_GUC_TLB_INV_DESC1                           0xCF80 // Write-only for OS
@@ -131,6 +132,26 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_VF_CAP                                      0x1901F8
 #define XE2_REG_VF_CAP_MASK                                 xe2_reg_genmask(0, 0)
+
+#define XE2_REG_SDEISR                                      0xC4000
+#define XE2_REG_SDEIMR                                      0xC4004
+#define XE2_REG_SDEIIR                                      0xC4008
+#define XE2_REG_SDEIER                                      0xC400C
+
+#define XE2_REG_DE_PIPE_ISR(pipe)                           (0x44400 + (0x10 * (pipe)))
+#define XE2_REG_DE_PIPE_IMR(pipe)                           (0x44404 + (0x10 * (pipe)))
+#define XE2_REG_DE_PIPE_IIR(pipe)                           (0x44408 + (0x10 * (pipe)))
+#define XE2_REG_DE_PIPE_IER(pipe)                           (0x4440C + (0x10 * (pipe)))
+
+#define XE2_PIPE_A                                          0x0
+#define XE2_PIPE_B                                          0x1
+#define XE2_PIPE_C                                          0x2
+#define XE2_PIPE_D                                          0x3
+
+#define XE2_REG_DE_MISC_ISR                                 0x44460
+#define XE2_REG_DE_MISC_IMR                                 0x44464
+#define XE2_REG_DE_MISC_IIR                                 0x44468
+#define XE2_REG_DE_MISC_IER                                 0x4446C
 
 #define XE2_REG_DPA_AUX_CH_DATA(n)                          (0x64014 + 4 * (n))
 #define XE2_REG_DPB_AUX_CH_DATA(n)                          (0x64114 + 4 * (n))
@@ -189,7 +210,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_PCH_PP_STATUS                               0xC7200
 #define XE2_REG_PCH_PP_CONTROL                              0xC7204
 #define XE2_REG_PCH_PP_ON_DELAYS                            0xC7208
-#define XE2_REG_PCH_PP_OFF_DELAYS                           0xC720c
+#define XE2_REG_PCH_PP_OFF_DELAYS                           0xC720C
 #define XE2_REG_PCH_PP_DIVISOR                              0xC7210
 
 #define XE2_REG_RP_CONTROL                                  0xA024
@@ -302,8 +323,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_GUC_SOFT_SCRATCH_INDEX(reg)                 ((reg - 0xC180) / 4)
 #define XE2_GUC_SOFT_SCRATCH_COUNT                          16
 
-#define XE2_REG_STOLEN_RESERVED1                            0x1082C0 // Das war schön gestohlen mal...
-#define XE2_REG_STOLEN_RESERVED2                            0x1082C4
+#define XE2_REG_STOLEN_RESERVED_LO                          0x1082C0 // Das war schön gestohlen mal...
+#define XE2_REG_STOLEN_RESERVED_HI                          0x1082C4
 #define XE2_REG_STOLEN_RESERVED_WOPCM_SIZE_MASK             xe2_reg_genmask(9, 7)
 
 #define XE2_DMC_FW_MAIN                                     0
@@ -318,6 +339,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_DMC_FW_PIPE_B_OFFSET                            0x98000
 #define XE2_DMC_FW_PIPE_C_OFFSET                            0x52000
 #define XE2_DMC_FW_PIPE_D_OFFSET                            0x59000
+
+#define XE2_REG_DMC_SSP_BASE                                0x8F074
 
 #define XE2_REG_PLANE_CTL_1_A                               0x70180 // We assume post-icl graphics
 #define XE2_REG_PLANE_CTL_2_A                               0x70280
@@ -394,22 +417,22 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_ACTION_TEST_G2G_SEND                        0xF001
 #define XE2_GUC_ACTION_TEST_G2G_RECV                        0xF002
 
-#define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY         0x900
-#define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_LEN         2
-#define GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY         0x901
-#define GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_LEN         2
-#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY               0x902
-#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_LEN               2
-#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY    0x903
-#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_LEN    2
-#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY               0x904
-#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_LEN               1
-#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY               0x905
-#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_LEN               2
-#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY    0x906
-#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_LEN    2
-#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY               0x907
-#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_LEN               1
+#define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY             0x900
+#define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_LEN             2
+#define GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY             0x901
+#define GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_LEN             2
+#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY                   0x902
+#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_LEN                   2
+#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY        0x903
+#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_LEN        2
+#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY                   0x904
+#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_LEN                   1
+#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY                   0x905
+#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_LEN                   2
+#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY        0x906
+#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_LEN        2
+#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY                   0x907
+#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_LEN                   1
 
 
 #define XE2_HW_ENGINE_RENDER_RING_BASE                      0x02000
@@ -539,6 +562,8 @@ typedef struct {
         uint32_t pipe_b_loaded;
         uint32_t pipe_c_loaded;
         uint32_t pipe_d_loaded;
+
+        uint32_t dmc_base;
     } firmware;
 } xe2_dev_t;
 
@@ -631,6 +656,42 @@ static rvvm_mmio_type_t xe2_type = {
 //
 // static const struct xe_rtp_entry_sr gt_tunings[] = {
 // ...
+//
+// -----------------------------------------------------------------------
+//
+// GGTT addressing API:
+//
+// static inline u32 __xe_bo_ggtt_addr(struct xe_bo *bo, u8 tile_id)
+// {
+//     struct xe_ggtt_node *ggtt_node = bo->ggtt_node[tile_id];
+// 
+//     if (XE_WARN_ON(!ggtt_node))
+//         return 0;
+//
+//     // [    5.802035] __xe_bo_ggtt_addr: size=9000, start=f4c000
+//     printk(KERN_INFO "%s: size=%llx, start=%llx\n", __FUNCTION__, ggtt_node->base.size, ggtt_node->base.start);
+// 
+//     XE_WARN_ON(ggtt_node->base.size > xe_bo_size(bo));
+//     XE_WARN_ON(ggtt_node->base.start + ggtt_node->base.size > (1ull << 32));
+//     return ggtt_node->base.start;
+// }
+//
+// /**
+//  * xe_sa_manager_gpu_addr - Retrieve GPU address of a back storage BO
+//  * within suballocator.
+//  * @sa_manager: the &xe_sa_manager struct instance
+//  * Return: GGTT address of the back storage BO.
+//  */
+// static inline u64 xe_sa_manager_gpu_addr(struct xe_sa_manager *sa_manager)
+// {
+//     return xe_bo_ggtt_addr(sa_manager->bo);
+// }
+//
+// static inline u64 xe_sa_bo_gpu_addr(struct drm_suballoc *sa)
+// {
+//     return xe_sa_manager_gpu_addr(to_xe_sa_manager(sa->manager)) +
+//         drm_suballoc_soffset(sa);
+// }
 #define XE2_GUC_GGTT_TOP 0xFEE00000
 
 static inline void xe2_guc_action(pci_func_t *pci_func, void *data, uint32_t *actions)
@@ -798,11 +859,30 @@ static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
     xe2_dpcd_aux_config(address, request, payload_size, aux);
 }
 
+static inline bool xe2_skip_mmio_range(size_t offset)
+{
+    bool skip = 0;
+    skip |= offset >= 0x800000 && offset <= 0x8FFFFF;
+    skip |= offset >= 0x900000 && offset <= 0x9FFFFF;
+    skip |= offset >= 0xA00000 && offset <= 0xAFFFFF;
+    skip |= offset >= 0xB00000 && offset <= 0xBFFFFF;
+    skip |= offset >= 0xC00000 && offset <= 0xCFFFFF;
+    skip |= offset >= 0xD00000 && offset <= 0xDFFFFF;
+    skip |= offset >= 0xE00000 && offset <= 0xEFFFFF;
+    skip |= offset >= 0xF00000 && offset <= 0xFFFFFF;
+    skip |= offset == XE2_REG_FLUSH_PENDING;
+    skip |= offset == XE2_REG_GT_GMD_ID;
+    skip |= offset == XE2_REG_FLUSH_PENDING;
+    skip |= offset == XE2_REG_PRIMARY_SPI_ADDRESS;
+    skip |= offset == XE2_REG_PRIMARY_SPI_TRIGGER;
+    return skip;
+}
+
 static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
 {
     UNUSED(size);
 
-    // if (offset != XE2_REG_FLUSH_PENDING && offset < 0x800000 && offset != 0x102040 && offset != 0x102080)
+    if (!xe2_skip_mmio_range(offset))
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
 
     xe2_dev_t *xe2 = dev->data;
@@ -848,14 +928,13 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
-        case XE2_REG_PCODE_DATA0: {
+        case XE2_REG_PCODE_DATA0:
             write_uint32_le(data, 0xFF);
             break;
-        }
-        case XE2_REG_PCODE_DATA1: {
+        case XE2_REG_PCODE_DATA1:
             write_uint32_le(data, 0xFF);
             break;
-        }
+
         case XE2_REG_PCODE_SCRATCH(0): {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_PCODE_SCRATCH_BOOT_STATUS_MASK, 0);
             write_uint32_le(data, cmd);
@@ -887,14 +966,66 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, xe2->gt_gdrst);
             break;
 
-        case XE2_REG_DSMBASE_64:
-            // BUG: ???
-            write_uint64_le(data, 0x1000000ULL);
+        // For now initialize interrupt registers with zero.
+        // Shall be handled later.
+        case XE2_REG_SDEISR:
+        case XE2_REG_SDEIER:
+        case XE2_REG_SDEIIR:
+        case XE2_REG_SDEIMR:
+            write_uint32_le(data, 0x0);
             break;
-        case XE2_REG_GSMBASE:
-            // BUG: ???
-            write_uint64_le(data, 0x10000000ULL);
+
+        case XE2_REG_DE_MISC_ISR:
+        case XE2_REG_DE_MISC_IER:
+        case XE2_REG_DE_MISC_IIR:
+        case XE2_REG_DE_MISC_IMR:
+            write_uint32_le(data, 0x0);
             break;
+
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_D):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_D):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_D):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_D):
+            write_uint32_le(data, 0x0);
+            break;
+
+        case XE2_REG_GSMBASE_LO:
+            write_uint32_le(data, 0x00000000);
+            break;
+        case XE2_REG_GSMBASE_HI:
+            write_uint32_le(data, 0x00000001);
+            break;
+        case XE2_REG_DSMBASE_LO:
+            write_uint32_le(data, 0x00800000); // DSMBASE = GSMBASE + 8MB
+            break;
+        case XE2_REG_DSMBASE_HI:
+            write_uint32_le(data, 0x00000001);
+            break;
+
+        case XE2_REG_XEHP_TILE_ADDRESS_RANGE(0): {
+            uint32_t cmd = xe2_reg_field_prep(xe2_reg_genmask(14, 8), 0x40)  // Tile size
+                         | xe2_reg_field_prep(xe2_reg_genmask( 7, 1), 0x00); // Tile offset
+            write_uint32_le(data, cmd);
+            break;
+        }
+
+        case XE2_REG_STOLEN_RESERVED_LO:
+            write_uint32_le(data, 0x1000);
+            break;
+        case XE2_REG_STOLEN_RESERVED_HI:
+            write_uint32_le(data, 0x0);
             break;
 
         case XE2_REG_PP_STATUS:
@@ -1002,10 +1133,24 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             // QGV:        I don't know what the fuck is this
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_DDR_TYPE_MASK, 2)
                          | xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_N_CHANNELS_MASK, 1)
-                         | xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_MASK, 1);
+                         | xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_MASK, 2);
             write_uint32_le(data, cmd);
             break;
         }
+        case XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_LO(0): {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_LO_DCLK_MASK, 3200)
+                         | xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_LO_TRCD_MASK, 32)
+                         | xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_LO_TRP_MASK, 32);
+            write_uint32_le(data, cmd);
+            break;
+        }
+        case XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_HI(0): {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_HI_TRAS_MASK, 64)
+                         | xe2_reg_field_prep(XE2_REG_MTL_MEM_SS_INFO_QGV_POINTS_HI_TRDPRE_MASK, 16);
+            write_uint32_le(data, cmd);
+            break;
+        }
+
         case XE2_REG_GU_CNTL_PROTECTED: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_GU_CNTL_PROTECTED_PRESENT_MASK, 1);
             write_uint32_le(data, cmd);
@@ -1103,6 +1248,9 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
+        // PCI write: offset=80000, data=c0a4040, size = 4
+        //
+        //
         // There begin cursed decompiled part.
         case XE2_DMC_FW_MAIN_OFFSET:   // DMC program offset
         case XE2_DMC_FW_PIPE_A_OFFSET: // DMC program offset
@@ -1112,9 +1260,8 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, 0xC0A4040); // DMC program size
             break;
 
-        case XE2_REG_STOLEN_RESERVED1:
-        case XE2_REG_STOLEN_RESERVED2:
-            write_uint32_le(data, 0);
+        case XE2_REG_DMC_SSP_BASE:
+            write_uint32_le(data, xe2->firmware.dmc_base);
             break;
 
         case XE2_REG_PLANE_CTL_1_A:
@@ -1130,6 +1277,10 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         // Hardware engines:
         case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_BLT_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_RENDER_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_COMPUTE0_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_COMPUTE1_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_COMPUTE2_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_COMPUTE3_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS1_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS2_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_IDLEDLY(XE2_HW_ENGINE_XEHPC_BCS3_RING_BASE):
@@ -1149,11 +1300,12 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
-        // (MTL_MEDIA_GSI_BASE): 380000
-        // Media offset:            d8c
-        //                       380d8c
         case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_BLT_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_RENDER_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_COMPUTE0_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_COMPUTE1_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_COMPUTE2_RING_BASE):
+        case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_COMPUTE3_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS1_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS2_RING_BASE):
         case XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(XE2_HW_ENGINE_XEHPC_BCS3_RING_BASE):
@@ -1190,6 +1342,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
     }
 
+    // [    6.167743] xe 0000:00:01.0: [drm] DMC 0 mmio[0]/0x8f074 incorrect (expected 0x86fc0, current 0x0)
     if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset <= (XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main))) {
         uint32_t word = read_uint32_le(&xe2->firmware.main[offset - XE2_DMC_FW_MAIN_OFFSET]);
         write_uint32_le(data, word);
@@ -1202,7 +1355,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 {
     UNUSED(size);
 
-    // if (offset != XE2_REG_FLUSH_PENDING && offset != XE2_REG_GT_GMD_ID && offset < 0x800000 && offset != 0x102040 && offset != 0x102080)
+    if (!xe2_skip_mmio_range(offset))
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     xe2_dev_t *xe2 = dev->data;
@@ -1297,6 +1450,11 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->dc_state |= (cmd & mask);
             break;
         }
+
+        case XE2_REG_DMC_SSP_BASE:
+            xe2->firmware.dmc_base = read_uint32_le(data);
+            break;
+
         case XE2_REG_GUC_WOPCM_SIZE: {
             uint32_t cmd = read_uint32_le(data);
             xe2->wopcm_size = xe2_reg_field_get(XE2_REG_GUC_WOPCM_SIZE_MASK, cmd);
@@ -1430,7 +1588,7 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
         .irq_pin    = PCI_IRQ_PIN_INTA,
         // MMIO + GTT
         .bar[0]     = {
-            .size           = 0x10000000,
+            .size           = 0x1000000,
             .min_op_size    = 1,
             .max_op_size    = 4,
             .read           = xe2_mmio_read,
