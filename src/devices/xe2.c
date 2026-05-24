@@ -13,6 +13,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "devices/pci-bus.h"
 #include "mem_ops.h"
 #include "rvvm/rvvm_base.h"
+#include "spinlock.h"
 #include "utils.h"
 #include "vma_ops.h"
 #include <stdint.h>
@@ -149,6 +150,19 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_SDEIMR                                      0xC4004
 #define XE2_REG_SDEIIR                                      0xC4008
 #define XE2_REG_SDEIER                                      0xC400C
+
+#define XE2_REG_PSR_IMR_A                                   0x60814
+#define XE2_REG_PSR_IIR_A                                   0x60818
+
+#define XE2_REG_DE_PORT_ISR                                 0x44440
+#define XE2_REG_DE_PORT_IMR                                 0x44444
+#define XE2_REG_DE_PORT_IIR                                 0x44448
+#define XE2_REG_DE_PORT_IER                                 0x4444c
+
+#define XE2_REG_GU_MISC_ISR                                 0x444f0
+#define XE2_REG_GU_MISC_IMR                                 0x444f4
+#define XE2_REG_GU_MISC_IIR                                 0x444f8
+#define XE2_REG_GU_MISC_IER                                 0x444fc
 
 #define XE2_REG_DE_PIPE_ISR(pipe)                           (0x44400 + (0x10 * (pipe)))
 #define XE2_REG_DE_PIPE_IMR(pipe)                           (0x44404 + (0x10 * (pipe)))
@@ -497,6 +511,13 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_CFG_VRAM_SIZE                                   0x10000000
 
+// https://lists.freedesktop.org/archives/intel-xe/2023-June/005371.html
+#define XE2_GGTT_PTE_VALID      (1ULL << 0)
+#define XE2_GGTT_PAGES          0x100000
+#define XE2_GGTT_PTE_ADDR_MASK  0x0000FFFFFFFFF000ULL
+#define XE2_GGTT_MMIO_BASE      0x800000 // 8 MiB
+#define XE2_GGTT_MMIO_SIZE      0x800000 // 8 MiB
+
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
 #define DPCD_REG_REV                                        0x00
@@ -532,6 +553,7 @@ typedef struct {
 
 typedef struct {
     pci_func_t *pci_func;
+    spinlock_t  lock;
     uint32_t    forcewake_gsc;
     uint32_t    forcewake_gt_mtl;
     uint32_t    forcewake_renderer;
@@ -637,17 +659,9 @@ static rvvm_mmio_type_t xe2_type = {
     .remove = xe2_remove,
 };
 
-
-#define GGTT_PTE_VALID      (1ULL << 0)
-#define GGTT_PAGES          0x100000
-#define GGTT_PTE_ADDR_MASK  0x0000FFFFFFFFF000ULL
-#define GGTT_MMIO_BASE      0x807a60 // Not specified in driver directly. Unknown behaviour
-#define GGTT_MMIO_SIZE      0x010000 // Not specified in driver directly. Unknown behaviour
-#define GGTT_MMIO_GSM_START 0x800000
-
-static uint64_t ggtt_pte[GGTT_PAGES];
-static uint32_t ggtt_lo_addr[GGTT_PAGES];
-static bool     ggtt_lo_present[GGTT_PAGES];
+static uint64_t ggtt_pte[XE2_GGTT_PAGES];
+static uint32_t ggtt_lo_addr[XE2_GGTT_PAGES];
+static bool     ggtt_lo_present[XE2_GGTT_PAGES];
 
 static inline void xe2_ggtt_write_pte(uint64_t index, uint64_t pte)
 {
@@ -656,7 +670,7 @@ static inline void xe2_ggtt_write_pte(uint64_t index, uint64_t pte)
 
 static inline void xe2_ggtt_mmio_write(uint32_t offset, uint32_t value)
 {
-    uint64_t idx = (offset - GGTT_MMIO_GSM_START) / 8;
+    uint64_t idx = (offset - XE2_GGTT_MMIO_BASE) / 8;
     bool     hi  =  offset & 4;
 
     if (!hi) {
@@ -667,7 +681,7 @@ static inline void xe2_ggtt_mmio_write(uint32_t offset, uint32_t value)
 
     if (ggtt_lo_present[idx]) {
         uint64_t pte = ((uint64_t) value << 32) | ggtt_lo_addr[idx];
-        rvvm_info("Write PTE[0x%lx]: 0x%lx", idx, pte);
+        // rvvm_info("Write PTE[0x%lx]: 0x%lx", idx, pte);
         xe2_ggtt_write_pte(idx, pte);
     }
 }
@@ -678,27 +692,15 @@ static inline uint64_t xe2_ggtt_translate(uint64_t ggtt)
     uint64_t off = ggtt & 0xfff;
     uint64_t pte = ggtt_pte[idx];
 
-    // Possibly good:
-    //   PTE: ggtt addr:  0x18ee000
-    //   PTE: ggtt index: 0x18ee
-    //   PTE: ggtt off:   0x0
-    //   PTE: raw pte:    0x20000083842001
-    //   PTE:   result: 0x83842000
-    //   GuC: G2H CTB addr: 0x83842000
-    //
-    // Bad:
-    //   PTE: ggtt addr:  0xd8d000
-    //   PTE: ggtt index: 0xd8d
-    //   PTE: ggtt off:   0x0
-    //   PTE: raw pte:    0x0
-    //   PTE:   result: 0x0
-
-
-    rvvm_info("PTE: ggtt addr:  0x%lx", ggtt);
-    rvvm_info("PTE: ggtt index: 0x%lx", idx);
-    rvvm_info("PTE: ggtt off:   0x%lx", off);
-    rvvm_info("PTE: raw pte:    0x%lx", pte);
-    rvvm_info("PTE:   result: 0x%llx", (pte & 0x0000FFFFFFFFF000ULL) + off);
+    rvvm_info("PTE: ggtt addr:       0x%lx", ggtt);
+    rvvm_info("PTE: ggtt index:      0x%lx", idx);
+    rvvm_info("PTE: ggtt off:        0x%lx", off);
+    rvvm_info("PTE: raw pte:         0x%lx", pte);
+    rvvm_info("PTE:   result:        0x%llx", (pte & 0x0000FFFFFFFFF000ULL) + off);
+    rvvm_info("PTE: flag (NULL)?     %lu", pte & (1 << 9));
+    rvvm_info("PTE: flag (PS64)?     %lu", pte & (1 << 8));
+    rvvm_info("PTE: flag (RW)?       %lu", pte & (1 << 1));
+    rvvm_info("PTE: flag (present)?  %lu", pte & (1 << 0));
 
     if (!(pte & 1)) {
         rvvm_warn("PTE 0x%lx is invalid!", pte);
@@ -723,13 +725,72 @@ static inline bool xe2_guc_klv_address_key(uint32_t key)
     }
 }
 
+static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions)
+{
+    uint32_t key = xe2_reg_field_get(xe2_reg_genmask(31, 16), actions[1]);
+    rvvm_info("GUC action (address key)?  %d", xe2_guc_klv_address_key(key));
+
+    uint32_t response = (1 << 31)  // GUC_HXG_ORIGIN_GUC
+                      | (7 << 28)  // GUC_HXG_TYPE_RESPONSE_SUCCESS
+                      | (1 <<  0); // AUX data (1)
+
+    if (!xe2_guc_klv_address_key(key)) {
+        return response;
+    }
+
+    uint64_t addr = (uint64_t) actions[2]
+                  | (uint64_t) actions[3] << 32;
+    rvvm_addr_t dma_addr = xe2_ggtt_translate(addr);
+    if (!dma_addr) {
+        rvvm_warn("GGTT returned NULL: (dma_addr: 0x%lx, addr: 0x%lx)", dma_addr, addr);
+        return response;
+    }
+
+    switch (key) {
+        case GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
+            xe2->guc_addr_memirq_status = dma_addr;
+            rvvm_info("GuC cfg: memirq status addr: 0x%lx", xe2->guc_addr_memirq_status);
+            break;
+
+        case GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
+            xe2->guc_addr_memirq_source = dma_addr;
+            rvvm_info("GuC cfg: memirq source addr: 0x%lx", xe2->guc_addr_memirq_source);
+            break;
+
+        case GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
+            xe2->guc_addr_ctb_h2g = dma_addr;
+            rvvm_info("GuC cfg: H2G CTB addr: 0x%lx", xe2->guc_addr_ctb_h2g);
+            break;
+
+        case GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
+            xe2->guc_addr_ctb_h2g_descriptor = dma_addr;
+            rvvm_info("GuC cfg: H2G CTB descriptor addr: 0x%lx", xe2->guc_addr_ctb_h2g_descriptor);
+            break;
+
+        case GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
+            xe2->guc_addr_ctb_g2h = dma_addr;
+            rvvm_info("GuC cfg: G2H CTB addr: 0x%lx", xe2->guc_addr_ctb_g2h);
+            break;
+
+        case GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
+            xe2->guc_addr_ctb_g2h_descriptor = dma_addr;
+            rvvm_info("GuC cfg: G2H CTB descriptor addr: 0x%lx", xe2->guc_addr_ctb_g2h_descriptor);
+            break;
+
+        default:
+            break;
+    }
+
+    return response;
+}
+
 // GuC commands pipeline:
 //
 // write (GUC FW SW 1): 32 bit header
 // write (GUC FW SW 2): 32 bit payload
 // write (GUC FW SW 3): 32 bit payload
 // write (GUC FW SW 4): 32 bit payload
-static inline void xe2_guc_action(xe2_dev_t *xe2, void *data, uint32_t *actions)
+static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *actions)
 {
     uint32_t arg = 0U;
 
@@ -744,57 +805,7 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, void *data, uint32_t *actions)
             arg = 0x1000;
             break;
         case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: { // 0x508
-            uint32_t key  = xe2_reg_field_get(xe2_reg_genmask(31, 16), actions[1]);
-            rvvm_info("GUC action (address key)?  %d", xe2_guc_klv_address_key(key));
-
-            if (xe2_guc_klv_address_key(key)) {
-                uint64_t addr = (uint64_t) actions[2]
-                              | (uint64_t) actions[3] << 32;
-                rvvm_addr_t dma_addr = xe2_ggtt_translate(addr);
-                if (!dma_addr) {
-                    rvvm_warn("GGTT returned NULL: (dma_addr: 0x%lx, addr: 0x%lx)", dma_addr, addr);
-                } else {
-                    switch (key) {
-                        case GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
-                            rvvm_info("GuC: memirq status addr: 0x%lx", dma_addr);
-                            xe2->guc_addr_memirq_status = dma_addr;
-                            break;
-
-                        case GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
-                            rvvm_info("GuC: memirq source addr: 0x%lx", dma_addr);
-                            xe2->guc_addr_memirq_source = dma_addr;
-                            break;
-
-                        case GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
-                            rvvm_info("GuC: H2G CTB addr: 0x%lx", dma_addr);
-                            xe2->guc_addr_ctb_h2g = dma_addr;
-                            break;
-
-                        case GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
-                            rvvm_info("GuC: H2G CTB descriptor addr: 0x%lx", dma_addr);
-                            xe2->guc_addr_ctb_h2g_descriptor = dma_addr;
-                            break;
-
-                        case GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
-                            rvvm_info("GuC: G2H CTB addr: 0x%lx", dma_addr);
-                            xe2->guc_addr_ctb_g2h = dma_addr;
-                            break;
-
-                        case GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
-                            rvvm_info("GuC: G2H CTB descriptor addr: 0x%lx", dma_addr);
-                            xe2->guc_addr_ctb_g2h_descriptor = dma_addr;
-                            break;
-
-                        default:
-                            break;
-                    }
-                }
-            }
-
-            arg = (1 << 31) // GUC_HXG_ORIGIN_GUC
-                | (7 << 28) // GUC_HXG_TYPE_RESPONSE_SUCCESS
-                | (1 <<  0) // AUX data (1)
-                ;
+            arg = xe2_guc_action_self_cfg(xe2, actions);
             break;
         }
         case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB: // 0x4509
@@ -811,7 +822,7 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, void *data, uint32_t *actions)
                  | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7)   // Success
                  | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_DATA_MASK, arg);
 
-    write_uint32_le(data, cmd);
+    actions[0] = cmd;
 
     rvvm_info(" ");
 }
@@ -916,6 +927,8 @@ static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
 static inline bool xe2_skip_mmio_range(size_t offset)
 {
     bool skip = 0;
+    skip |= offset >= 0x050000 && offset <= 0x05FFFF;
+    skip |= offset >= 0x090000 && offset <= 0x09FFFF;
     skip |= offset >= 0x800000 && offset <= 0x8FFFFF;
     skip |= offset >= 0x900000 && offset <= 0x9FFFFF;
     skip |= offset >= 0xA00000 && offset <= 0xAFFFFF;
@@ -936,10 +949,11 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 {
     UNUSED(size);
 
+    xe2_dev_t *xe2 = dev->data;
+    spin_lock(&xe2->lock);
+
     if (!xe2_skip_mmio_range(offset))
         rvvm_info("PCI read: offset=%lx, data=%x", offset, read_uint32_le(data));
-
-    xe2_dev_t *xe2 = dev->data;
 
     switch (offset) {
         case XE2_REG_GT_GMD_ID: {
@@ -1018,41 +1032,6 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_GT_GDRST:
             xe2->gt_gdrst = 0;
             write_uint32_le(data, xe2->gt_gdrst);
-            break;
-
-        // For now initialize interrupt registers with zero.
-        // Shall be handled later.
-        case XE2_REG_SDEISR:
-        case XE2_REG_SDEIER:
-        case XE2_REG_SDEIIR:
-        case XE2_REG_SDEIMR:
-            write_uint32_le(data, 0x0);
-            break;
-
-        case XE2_REG_DE_MISC_ISR:
-        case XE2_REG_DE_MISC_IER:
-        case XE2_REG_DE_MISC_IIR:
-        case XE2_REG_DE_MISC_IMR:
-            write_uint32_le(data, 0x0);
-            break;
-
-        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_A):
-        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_B):
-        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_C):
-        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_D):
-        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_A):
-        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_B):
-        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_C):
-        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_D):
-        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_A):
-        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_B):
-        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_C):
-        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_D):
-        case XE2_REG_DE_PIPE_IER(XE2_PIPE_A):
-        case XE2_REG_DE_PIPE_IER(XE2_PIPE_B):
-        case XE2_REG_DE_PIPE_IER(XE2_PIPE_C):
-        case XE2_REG_DE_PIPE_IER(XE2_PIPE_D):
-            write_uint32_le(data, 0x0);
             break;
 
         case XE2_REG_GSMBASE_LO:
@@ -1244,7 +1223,12 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         // Note that guest needs read access only for the first of
         // 4 GuC action registers to read the response.
         case XE2_REG_GUC_FW_SW_1:
-            xe2_guc_action(xe2, data, xe2->guc_actions);
+            write_uint32_le(data, xe2->guc_actions[0]);
+            break;
+        case XE2_REG_GUC_FW_SW_2:
+        case XE2_REG_GUC_FW_SW_3:
+        case XE2_REG_GUC_FW_SW_4:
+            write_uint32_le(data, 0x0);
             break;
 
         case XE2_REG_GUC_PMTIMESTAMP_LO: {
@@ -1393,6 +1377,10 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
 
         default:
+            // For safety initialize all unhandled requests to 0.
+            // Note that driver expects zero-initialized interrupt registers
+            // at startup (ISR/IMR/IIR/IER).
+            write_uint32_le(data, 0x0);
             break;
     }
 
@@ -1402,20 +1390,31 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         write_uint32_le(data, word);
     }
 
+    spin_unlock(&xe2->lock);
     return true;
+}
+
+static inline bool xe2_ggtt_mmio_range(size_t offset)
+{
+    size_t begin = XE2_GGTT_MMIO_BASE;
+    size_t end   = XE2_GGTT_MMIO_BASE + XE2_GGTT_MMIO_SIZE;
+
+    return offset >= begin && offset <= end;
 }
 
 static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
 {
     UNUSED(size);
 
+    xe2_dev_t *xe2 = dev->data;
+    spin_lock(&xe2->lock);
+
     if (!xe2_skip_mmio_range(offset))
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
-    xe2_dev_t *xe2 = dev->data;
-
-    if (offset >= GGTT_MMIO_BASE && offset <= (GGTT_MMIO_BASE + GGTT_MMIO_SIZE)) {
+    if (xe2_ggtt_mmio_range(offset)) {
         xe2_ggtt_mmio_write(offset, read_uint32_le(data));
+        spin_unlock(&xe2->lock);
         return true;
     }
 
@@ -1548,6 +1547,13 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             break;
         }
 
+        case XE2_REG_GUC_TLB_INV_DESC0:
+            rvvm_info("GuC requested to invalidate TLB[0]");
+            break;
+        case XE2_REG_GUC_TLB_INV_DESC1:
+            rvvm_info("GuC requested to invalidate TLB[1]");
+            break;
+
         case XE2_REG_GUC_DMA_ADDR_1_LO:
             xe2->dma_1  = (rvvm_addr_t) read_uint32_le(data);
             break;
@@ -1563,17 +1569,61 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 
         // GuC host interrupt is called after each GuC transaction (xe_guc_mmio_send_recv).
         //
-        // Totally unclear what to write there.
+        // Totally unclear what to write there. We could fire DMA actions on
+        // interrupt request, however definitely this should not be done after
+        // each GuC request.
+        //
+        // Driver tells:
+        // [    5.277335] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: LRC rcs0 WA job: 4138 dwords
+        // [    5.279589] xe_bb_new: bb->cs: 00000000427b963e
+        // [    5.279763] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x5588] = 0x04000400
+        // [    5.281509] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x6204] = 0x01400140
+        // [    5.283204] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x6208] = 0x00200020
+        // [    5.284833] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x62a8] = 0x02400240
+        // [    5.286248] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x7010] = 0x40004000
+        // [    5.287370] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x7300] = 0x10001000
+        // [    5.288529] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x83a8] = 0x20002000
+        // [    5.289978] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x6210] = ~0x3f18000|0x3f18000
+        // [    5.291159] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_bb_create_job: Create BB job for address 409000
+        // [    5.291780] xe 0000:00:01.0: [drm] Tile0: GT0: Batch address: 409000
+        // [    5.293556] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(1): 0000INFO: PCI write: offset=1901f8, data=0, size = 4
+        // RVVM:
+        // PCI write: offset=1901f0, data=0, size = 4
+        //  Driver sent GuC interrupt request
+        //  GUC action (request):      f0000000
+        //  GUC action (key | len):    00000001
+        //  GUC action (value hi):     00020000
+        //  GUC action (value lo):     00000000
+        //
+        //    CTB G2H addr: 0x142000
+        //    CTB H2G addr: 0x141000
+        //  GuC interrupt request failed: NULL address (CTB G2H: 0x142000) from PTE: 0x20000000142003
+        //  GuC interrupt request failed: NULL address (CTB H2G: 0x141000) from PTE: 0x20000000141003
+        //
+        // G2H & H2G addresses invalidated to some shit and Linux fails on DMA fence. Maybe 0x142000 is not DMA
+        // but something else. I don't know.
         case XE2_REG_GUC_HOST_INTERRUPT: {
             rvvm_info("Driver sent GuC interrupt request");
-            rvvm_addr_t addr = xe2->guc_addr_ctb_h2g;
-            uint32_t *dma = pci_get_dma_ptr(xe2->pci_func, addr, 4);
-            if (dma) {
-                rvvm_info("GuC interrupt succeed (CTB H2G: 0x%lx)", addr);
-                *dma = 1;
+            xe2_guc_action(xe2, xe2->guc_actions);
+            rvvm_info("  CTB G2H addr: 0x%lx", xe2->guc_addr_ctb_g2h);
+            rvvm_info("  CTB H2G addr: 0x%lx", xe2->guc_addr_ctb_h2g);
+            uint32_t *dma_g2h = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_g2h, sizeof(uint32_t) * 4);
+            uint32_t *dma_h2g = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_h2g, sizeof(uint32_t) * 4);
+            if (dma_g2h) {
+                for (size_t i = 0; i < 4; ++i) {
+                    rvvm_info("DMA G2H[%02ld]: %x", i, dma_g2h[i]);
+                }
             } else {
-                rvvm_warn("GuC interrupt request failed: NULL address (CTB H2G: 0x%lx)", addr);
+                rvvm_warn("GuC interrupt request failed: NULL address (CTB G2H: 0x%lx)", xe2->guc_addr_ctb_g2h);
             }
+            if (dma_h2g) {
+                for (size_t i = 0; i < 4; ++i) {
+                    rvvm_info("DMA H2G[%02ld]: %x", i, dma_h2g[i]);
+                }
+            } else {
+                rvvm_warn("GuC interrupt request failed: NULL address (CTB H2G: 0x%lx)", xe2->guc_addr_ctb_h2g);
+            }
+            rvvm_info(" ");
             break;
         }
 
@@ -1623,6 +1673,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         xe2->firmware.main_loaded += size;
     }
 
+    spin_unlock(&xe2->lock);
     return true;
 }
 
