@@ -509,14 +509,14 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_HW_ENGINE_RING_START(base)                  (base + 0x38)
 #define XE2_REG_HW_ENGINE_RING_CTL(base)                    (base + 0x38)
 
-#define XE2_CFG_VRAM_SIZE                                   0x10000000
+#define XE2_VRAM_SIZE                                       0x100000000 // 4 GiB
 
 // https://lists.freedesktop.org/archives/intel-xe/2023-June/005371.html
-#define XE2_GGTT_PTE_VALID      (1ULL << 0)
-#define XE2_GGTT_PAGES          0x100000
-#define XE2_GGTT_PTE_ADDR_MASK  0x0000FFFFFFFFF000ULL
-#define XE2_GGTT_MMIO_BASE      0x800000 // 8 MiB
-#define XE2_GGTT_MMIO_SIZE      0x800000 // 8 MiB
+#define XE2_GGTT_PTE_VALID                                  (1ULL << 0)
+#define XE2_GGTT_PAGES                                      0x100000
+#define XE2_GGTT_PTE_ADDR_MASK                              0x0000FFFFFFFFF000ULL
+#define XE2_GGTT_MMIO_BASE                                  0x800000 // 8 MiB
+#define XE2_GGTT_MMIO_SIZE                                  0x800000 // 8 MiB
 
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
@@ -588,6 +588,14 @@ typedef struct {
     rvvm_addr_t guc_addr_ctb_h2g_descriptor;
     rvvm_addr_t guc_addr_ctb_g2h_descriptor;
 
+    // Page table entries.
+    uint64_t    *ggtt_pte;
+    // Lower PTE addresses. Comes from splitted
+    // 64-bit MMIO request into two 32-bit ones.
+    uint32_t    *ggtt_lo_addrs;
+    // Validity map.
+    bool        *ggtt_pte_valid;
+
     uint8_t     *vram;
 
     struct {
@@ -649,9 +657,13 @@ static const uint8_t xe2_edid[] = {
     0x00, 0x4E, 0x54, 0x31, 0x35, 0x36, 0x46, 0x48, 0x4D, 0x2D, 0x4E, 0x34, 0x31, 0x0A, 0x00, 0x27,
 };
 
-static void xe2_remove(rvvm_mmio_dev_t* dev)
+static void xe2_remove(rvvm_mmio_dev_t *dev)
 {
-    UNUSED(dev);
+    xe2_dev_t *xe2 = dev->data;
+    vma_free(xe2->ggtt_pte_valid, XE2_GGTT_PAGES * sizeof(bool));
+    vma_free(xe2->ggtt_lo_addrs, XE2_GGTT_PAGES * sizeof(uint32_t));
+    vma_free(xe2->ggtt_pte, XE2_GGTT_PAGES * sizeof(uint64_t));
+    vma_free(xe2->vram, XE2_VRAM_SIZE);
 }
 
 static rvvm_mmio_type_t xe2_type = {
@@ -659,38 +671,34 @@ static rvvm_mmio_type_t xe2_type = {
     .remove = xe2_remove,
 };
 
-static uint64_t ggtt_pte[XE2_GGTT_PAGES];
-static uint32_t ggtt_lo_addr[XE2_GGTT_PAGES];
-static bool     ggtt_lo_present[XE2_GGTT_PAGES];
-
-static inline void xe2_ggtt_write_pte(uint64_t index, uint64_t pte)
+static inline void xe2_ggtt_write_pte(xe2_dev_t *xe2, uint64_t index, uint64_t pte)
 {
-    ggtt_pte[index] = pte;
+    xe2->ggtt_pte[index] = pte;
 }
 
-static inline void xe2_ggtt_mmio_write(uint32_t offset, uint32_t value)
+static inline void xe2_ggtt_mmio_write(xe2_dev_t *xe2, uint32_t offset, uint32_t value)
 {
     uint64_t idx = (offset - XE2_GGTT_MMIO_BASE) / 8;
     bool     hi  =  offset & 4;
 
     if (!hi) {
-        ggtt_lo_addr[idx] = value;
-        ggtt_lo_present[idx] = true;
+        xe2->ggtt_lo_addrs[idx] = value;
+        xe2->ggtt_pte_valid[idx] = true;
         return;
     }
 
-    if (ggtt_lo_present[idx]) {
-        uint64_t pte = ((uint64_t) value << 32) | ggtt_lo_addr[idx];
+    if (xe2->ggtt_pte_valid[idx]) {
+        uint64_t pte = ((uint64_t) value << 32) | (uint64_t) xe2->ggtt_lo_addrs[idx];
         // rvvm_info("Write PTE[0x%lx]: 0x%lx", idx, pte);
-        xe2_ggtt_write_pte(idx, pte);
+        xe2_ggtt_write_pte(xe2, idx, pte);
     }
 }
 
-static inline uint64_t xe2_ggtt_translate(uint64_t ggtt)
+static inline uint64_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
 {
     uint64_t idx = ggtt >> 12;
     uint64_t off = ggtt & 0xfff;
-    uint64_t pte = ggtt_pte[idx];
+    uint64_t pte = xe2->ggtt_pte[idx];
 
     rvvm_info("PTE: ggtt addr:       0x%lx", ggtt);
     rvvm_info("PTE: ggtt index:      0x%lx", idx);
@@ -740,7 +748,7 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
 
     uint64_t addr = (uint64_t) actions[2]
                   | (uint64_t) actions[3] << 32;
-    rvvm_addr_t dma_addr = xe2_ggtt_translate(addr);
+    rvvm_addr_t dma_addr = xe2_ggtt_translate(xe2, addr);
     if (!dma_addr) {
         rvvm_warn("GGTT returned NULL: (dma_addr: 0x%lx, addr: 0x%lx)", dma_addr, addr);
         return response;
@@ -1413,7 +1421,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
 
     if (xe2_ggtt_mmio_range(offset)) {
-        xe2_ggtt_mmio_write(offset, read_uint32_le(data));
+        xe2_ggtt_mmio_write(xe2, offset, read_uint32_le(data));
         spin_unlock(&xe2->lock);
         return true;
     }
@@ -1682,7 +1690,10 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
     xe2_dev_t *xe2 = safe_new_obj(xe2_dev_t);
     xe2->aux[0].edid_written = 0;
     xe2->steer_semaphore = 1; // Begin with unlocked state.
-    xe2->vram = vma_alloc(NULL, XE2_CFG_VRAM_SIZE, VMA_RDWR);
+    xe2->vram = vma_alloc(NULL, XE2_VRAM_SIZE, VMA_RDWR);
+    xe2->ggtt_pte = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint64_t), VMA_RDWR);
+    xe2->ggtt_lo_addrs = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint32_t), VMA_RDWR);
+    xe2->ggtt_pte_valid = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(bool), VMA_RDWR);
 
     pci_func_desc_t xe2_desc = {
         .vendor_id  = XE2_VENDOR_ID_INTEL,
@@ -1702,7 +1713,7 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
         },
         // VRAM
         .bar[2]         = {
-            .size           = XE2_CFG_VRAM_SIZE,
+            .size           = XE2_VRAM_SIZE,
             .min_op_size    = 1,
             .max_op_size    = 4,
             .data           = xe2,
