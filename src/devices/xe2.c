@@ -21,29 +21,62 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: GuC DMA addresses configured somehow, but driver resets
-//                 it to some another addresses not present in GGTT. Fuck.
+// Current status: GuC command submission.
 //
-// This OK
-//  GUC action (request):   00000508
-//  GUC action (key | len): 09050002
-//  GUC action (value hi):  018ee000
-//  GUC action (value lo):  00000000
-//  GuC: G2H CTB addr: 0x84c82000
+// Fails somewhere around this:
+// struct xe_lrc *xe_lrc_create(struct xe_hw_engine *hwe, struct xe_vm *vm,
+// 			     u32 ring_size, u16 msix_vec, u32 flags)
 //
-// This is not OK
-//  GUC action (request):   00000508
-//  GUC action (key | len): 09050002
-//  GUC action (value hi):  00d8f000
-//  GUC action (value lo):  00000000
-//  PTE 0x0 is invalid!
-//  PTE candidate: 0x0
-//  GuC: G2H CTB addr: 0x0
-//
-// This may follow from erroneous GuC initialization when driver
-// resets GuC.
-//
-// xe_guc_ct_enable() called twice.
+// [    5.534951] Unable to handle kernel paging request at virtual address ffffffd600007308
+// [    5.535215] Current modprobe pgtable: 4K pagesize, 39-bit VAs, pgdp=0x000000008294b000
+// [    5.535298] [ffffffd600007308] pgd=0000000023fffc01, p4d=0000000023fffc01, pud=0000000023fffc01, pmd=0000000023fff801, pte=0000000000000000
+// [    5.535557] Oops [#1]
+// [    5.535630] Modules linked in: xe(+) drm_ttm_helper ttm i2c_algo_bit gpu_sched drm_buddy video drm_client_lib drm_suballoc_helper drm_gpuvm drm_exec configfs drm_display_helper drm_kms_helper drm drm_panel_orientation_quirks backlight
+// [    5.536031] CPU: 0 UID: 0 PID: 86 Comm: modprobe Tainted: G        W           6.18.7 #5 NONE 
+// [    5.536127] Tainted: [W]=WARN
+// [    5.536171] Hardware name: RVVM v0.7-git-gb811038-dirty (DT)
+// [    5.536226] epc : __kmalloc_cache_noprof+0x14a/0x2c0
+// [    5.536328]  ra : guc_exec_queue_init+0x5c/0x45c [xe]
+// [    5.537648] epc : ffffffff8022e03e ra : ffffffff015945fc sp : ffffffc6001c3230
+// [    5.537722]  gp : ffffffff81376190 tp : ffffffd60287e000 t0 : 0000000000000000
+// [    5.537911]  t1 : 0000000000000000 t2 : 0000000000000004 s0 : ffffffc6001c3280
+// [    5.537997]  s1 : ffffffd601801b00 a0 : ffffffd600007108 a1 : 0000000000000dc0
+// [    5.538060]  a2 : 0000000000000328 a3 : ffffffc5000d7f80 a4 : ffffffd600007308
+// [    5.538117]  a5 : 0000000000000328 a6 : 000000000000041f a7 : 0000000000000420
+// [    5.538178]  s2 : 0000000000000dc0 s3 : 0000000000000328 s4 : ffffffff015945fc
+// [    5.538232]  s5 : ffffffff813b2a20 s6 : 0000000000000000 s7 : 0000000000000001
+// [    5.538283]  s8 : 0000000000000001 s9 : ffffffd602c44040 s10: ffffffd602c46048
+// [    5.538343]  s11: 0000000000000000 t3 : ffffffc73fee8030 t4 : ffffffc73fee8030
+// [    5.538397]  t5 : 0000000000000028 t6 : 0000000000000000
+// [    5.538443] status: 0000000200000120 badaddr: ffffffd600007308 cause: 000000000000000d
+// [    5.538508] [<ffffffff8022e03e>] __kmalloc_cache_noprof+0x14a/0x2c0
+// [    5.538602] [<ffffffff015945fc>] guc_exec_queue_init+0x5c/0x45c [xe]
+// [    5.539555] [<ffffffff01566d52>] xe_exec_queue_create+0x382/0x44c [xe]
+// [    5.540537] [<ffffffff01571a02>] xe_gt_record_default_lrcs+0x11e/0x6b4 [xe]
+// [    5.541545] [<ffffffff015d835c>] xe_uc_load_hw+0xa8/0x558 [xe]
+// [    5.542499] [<ffffffff015726a8>] xe_gt_init+0x2a8/0x594 [xe]
+// [    5.543408] [<ffffffff01560a0e>] xe_device_probe+0x2fa/0x8f8 [xe]
+// [    5.544350] [<ffffffff015bbf6a>] xe_pci_probe+0x842/0x10ac [xe]
+// [    5.545248] [<ffffffff80461baa>] pci_device_probe+0x82/0x100
+// [    5.545318] [<ffffffff805810e0>] really_probe+0x84/0x230
+// [    5.545379] [<ffffffff805812e8>] __driver_probe_device+0x5c/0xdc
+// [    5.545454] [<ffffffff8058142c>] driver_probe_device+0x2c/0xf8
+// [    5.545519] [<ffffffff80581634>] __driver_attach+0x6c/0x15c
+// [    5.545581] [<ffffffff8057f282>] bus_for_each_dev+0x62/0xb0
+// [    5.545636] [<ffffffff80580c22>] driver_attach+0x1a/0x24
+// [    5.545708] [<ffffffff8058045a>] bus_add_driver+0xce/0x1d8
+// [    5.545769] [<ffffffff80582394>] driver_register+0x40/0xdc
+// [    5.545829] [<ffffffff80460c50>] __pci_register_driver+0x44/0x4c
+// [    5.545890] [<ffffffff015bc7fc>] xe_register_pci_driver+0x28/0x30 [xe]
+// [    5.546837] [<ffffffff014a2094>] xe_init+0x24/0x80 [xe]
+// [    5.547848] [<ffffffff8000e89a>] do_one_initcall+0x56/0x1cc
+// [    5.547940] [<ffffffff800b62da>] do_init_module+0x52/0x1dc
+// [    5.548038] [<ffffffff800b7c12>] load_module+0x158a/0x1980
+// [    5.548109] [<ffffffff800b81b6>] init_module_from_file+0x76/0xb0
+// [    5.548172] [<ffffffff800b8404>] __riscv_sys_finit_module+0x1dc/0x3a8
+// [    5.548236] [<ffffffff80765ad6>] do_trap_ecall_u+0x296/0x370
+// [    5.548317] [<ffffffff807709aa>] handle_exception+0x146/0x152
+// [    5.548479] Code: 6b14 0563 1005 8363 1006 e703 0304 0893 0018 972a (6310) 75f3 
 
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -367,6 +400,14 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_DMC_FW_PIPE_D_OFFSET                            0x59000
 
 #define XE2_REG_DMC_SSP_BASE                                0x8F074
+
+#define XE2_REG_XELP_GT_GEOMETRY_DSS_ENABLE                 0x913C
+#define XE2_REG_XELP_XEHP_GT_COMPUTE_DSS_ENABLE             0x9144
+#define XE2_REG_XELP_EU_ENABLE                              0x9134
+#define XE2_REG_MIRROR_FUSE3                                0x9118
+#define XE2_REG_MIRROR_FUSE3_NODE_ENABLE_MASK               xe2_reg_genmask(31, 16)
+#define XE2_REG_MIRROR_FUSE3_XEHPC_GT_L3_MODE_MASK          xe2_reg_genmask( 7,  4)
+#define XE2_REG_MIRROR_FUSE3_MEML3_EN_MASK                  xe2_reg_genmask( 3,  0)
 
 #define XE2_REG_PLANE_CTL_1_A                               0x70180 // We assume post-icl graphics
 #define XE2_REG_PLANE_CTL_2_A                               0x70280
@@ -1061,6 +1102,18 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
+        case XE2_REG_XELP_GT_GEOMETRY_DSS_ENABLE:
+            write_uint32_le(data, 0xF);
+            break;
+        case XE2_REG_XELP_XEHP_GT_COMPUTE_DSS_ENABLE:
+            write_uint32_le(data, 0xFF);
+            break;
+        case XE2_REG_XELP_EU_ENABLE:
+            write_uint32_le(data, 0xFFFF);
+            break;
+        case XE2_REG_MIRROR_FUSE3:
+            write_uint32_le(data, 0x110);
+            break;
 
         case XE2_REG_STOLEN_RESERVED_LO:
             write_uint32_le(data, 0x1000);
