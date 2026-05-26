@@ -919,7 +919,7 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
             uint32_t chunk_1 = read_uint32_be_m(&xe2_edid[aux->edid_written +  3]);
             uint32_t chunk_2 = read_uint32_be_m(&xe2_edid[aux->edid_written +  7]);
             uint32_t chunk_3 = read_uint32_be_m(&xe2_edid[aux->edid_written + 11]);
-            uint32_t chunk_4 = read_uint32_be_m(&xe2_edid[aux->edid_written + 15]) & 0xFF << 24;
+            uint32_t chunk_4 = read_uint8(&xe2_edid[aux->edid_written + 15]) << 24;
 
             switch (request) {
                 case DPCD_REQ_I2C_WRITE_MOT:
