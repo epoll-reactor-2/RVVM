@@ -550,7 +550,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_HW_ENGINE_RING_START(base)                  (base + 0x38)
 #define XE2_REG_HW_ENGINE_RING_CTL(base)                    (base + 0x38)
 
-#define XE2_VRAM_SIZE                                       0x100000000 // 4 GiB
+#define XE2_VRAM_SIZE                                       0x10000000 // 256 MiB
 
 // https://lists.freedesktop.org/archives/intel-xe/2023-June/005371.html
 #define XE2_GGTT_PTE_VALID                                  (1ULL << 0)
@@ -612,7 +612,8 @@ typedef struct {
     uint32_t    wopcm_offset;
     uint32_t    wopcm_locked;
 
-    uint32_t    guc_actions[4];
+    uint32_t    guc_actions_h2g[4];
+    uint32_t    guc_actions_g2h[4];
     xe2_aux_t   aux[1]; // We assume one display with one AUX channel.
 
     uint32_t    spi_address;
@@ -839,22 +840,22 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
 // write (GUC FW SW 2): 32 bit payload
 // write (GUC FW SW 3): 32 bit payload
 // write (GUC FW SW 4): 32 bit payload
-static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *actions)
+static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
 {
     uint32_t arg = 0U;
 
     // GuC reports addresses of CTB, CTB descriptor (for both directions)
-    rvvm_info("GUC action (request):      %08x", actions[0]);
-    rvvm_info("GUC action (key | len):    %08x", actions[1]);
-    rvvm_info("GUC action (value hi):     %08x", actions[2]);
-    rvvm_info("GUC action (value lo):     %08x", actions[3]);
+    rvvm_info("GUC action (request):      %08x", h2g[0]);
+    rvvm_info("GUC action (key | len):    %08x", h2g[1]);
+    rvvm_info("GUC action (value hi):     %08x", h2g[2]);
+    rvvm_info("GUC action (value lo):     %08x", h2g[3]);
 
-    switch (actions[0]) {
+    switch (h2g[0]) {
         case XE2_GUC_ACTION_GET_HWCONFIG: // 0x4100
             arg = 0x1000;
             break;
         case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: { // 0x508
-            arg = xe2_guc_action_self_cfg(xe2, actions);
+            arg = xe2_guc_action_self_cfg(xe2, h2g);
             break;
         }
         case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB: // 0x4509
@@ -871,7 +872,7 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *actions)
                  | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7)   // Success
                  | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_DATA_MASK, arg);
 
-    actions[0] = cmd;
+    g2h[0] = cmd;
 
     rvvm_info(" ");
 }
@@ -1103,17 +1104,21 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
         case XE2_REG_XELP_GT_GEOMETRY_DSS_ENABLE:
-            write_uint32_le(data, 0xF);
+            write_uint32_le(data, 0x1);
             break;
         case XE2_REG_XELP_XEHP_GT_COMPUTE_DSS_ENABLE:
-            write_uint32_le(data, 0xFF);
+            write_uint32_le(data, 0x1);
             break;
         case XE2_REG_XELP_EU_ENABLE:
             write_uint32_le(data, 0xFFFF);
             break;
-        case XE2_REG_MIRROR_FUSE3:
-            write_uint32_le(data, 0x110);
+        case XE2_REG_MIRROR_FUSE3: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_MIRROR_FUSE3_MEML3_EN_MASK, 1)
+                         | xe2_reg_field_prep(XE2_REG_MIRROR_FUSE3_NODE_ENABLE_MASK, 1)
+                         | xe2_reg_field_prep(XE2_REG_MIRROR_FUSE3_XEHPC_GT_L3_MODE_MASK, 1);
+            write_uint32_le(data, cmd);
             break;
+        }
 
         case XE2_REG_STOLEN_RESERVED_LO:
             write_uint32_le(data, 0x1000);
@@ -1281,15 +1286,17 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
-        // Note that guest needs read access only for the first of
-        // 4 GuC action registers to read the response.
         case XE2_REG_GUC_FW_SW_1:
-            write_uint32_le(data, xe2->guc_actions[0]);
+            write_uint32_le(data, xe2->guc_actions_g2h[0]);
             break;
         case XE2_REG_GUC_FW_SW_2:
+            write_uint32_le(data, xe2->guc_actions_g2h[1]);
+            break;
         case XE2_REG_GUC_FW_SW_3:
+            write_uint32_le(data, xe2->guc_actions_g2h[2]);
+            break;
         case XE2_REG_GUC_FW_SW_4:
-            write_uint32_le(data, 0x0);
+            write_uint32_le(data, xe2->guc_actions_g2h[3]);
             break;
 
         case XE2_REG_GUC_PMTIMESTAMP_LO: {
@@ -1317,6 +1324,10 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_GUC_DMA_CTRL: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_DMA_CTRL, 1);
             write_uint32_le(data, cmd);
+            break;
+        }
+        case 0x8800: {
+            write_uint32_le(data, 0x1000);
             break;
         }
 
@@ -1586,16 +1597,16 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             break;
         }
         case XE2_REG_GUC_FW_SW_1:
-            xe2->guc_actions[0] = read_uint32_le(data);
+            xe2->guc_actions_h2g[0] = read_uint32_le(data);
             break;
         case XE2_REG_GUC_FW_SW_2:
-            xe2->guc_actions[1] = read_uint32_le(data);
+            xe2->guc_actions_h2g[1] = read_uint32_le(data);
             break;
         case XE2_REG_GUC_FW_SW_3:
-            xe2->guc_actions[2] = read_uint32_le(data);
+            xe2->guc_actions_h2g[2] = read_uint32_le(data);
             break;
         case XE2_REG_GUC_FW_SW_4:
-            xe2->guc_actions[3] = read_uint32_le(data);
+            xe2->guc_actions_h2g[3] = read_uint32_le(data);
             break;
 
         case XE2_REG_GUC_DMA_ADDR_0_LO:
@@ -1665,24 +1676,27 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         // but something else. I don't know.
         case XE2_REG_GUC_HOST_INTERRUPT: {
             rvvm_info("Driver sent GuC interrupt request");
-            xe2_guc_action(xe2, xe2->guc_actions);
+            // Note the difference between xe_guc_mmio_send() and xe_guc_ct_send().
+            // One use MMIO, another not.
+            xe2_guc_action(xe2, xe2->guc_actions_h2g, xe2->guc_actions_g2h);
             rvvm_info("  CTB G2H addr: 0x%lx", xe2->guc_addr_ctb_g2h);
             rvvm_info("  CTB H2G addr: 0x%lx", xe2->guc_addr_ctb_h2g);
-            uint32_t *dma_g2h = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_g2h, sizeof(uint32_t) * 4);
-            uint32_t *dma_h2g = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_h2g, sizeof(uint32_t) * 4);
-            if (dma_g2h) {
-                for (size_t i = 0; i < 4; ++i) {
-                    rvvm_info("DMA G2H[%02ld]: %x", i, dma_g2h[i]);
-                }
-            } else {
-                rvvm_warn("GuC interrupt request failed: NULL address (CTB G2H: 0x%lx)", xe2->guc_addr_ctb_g2h);
-            }
+            uint32_t *dma_g2h = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_g2h, sizeof(uint32_t) * 8);
+            uint32_t *dma_h2g = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_h2g, sizeof(uint32_t) * 8);
             if (dma_h2g) {
-                for (size_t i = 0; i < 4; ++i) {
+                for (size_t i = 0; i < 8; ++i) {
                     rvvm_info("DMA H2G[%02ld]: %x", i, dma_h2g[i]);
                 }
             } else {
                 rvvm_warn("GuC interrupt request failed: NULL address (CTB H2G: 0x%lx)", xe2->guc_addr_ctb_h2g);
+            }
+            if (dma_g2h) {
+                for (size_t i = 0; i < 8; ++i) {
+                    dma_g2h[i] = 0xFF;
+                    rvvm_info("DMA G2H[%02ld]: %x", i, dma_g2h[i]);
+                }
+            } else {
+                rvvm_warn("GuC interrupt request failed: NULL address (CTB G2H: 0x%lx)", xe2->guc_addr_ctb_g2h);
             }
             rvvm_info(" ");
             break;
