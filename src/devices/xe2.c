@@ -21,62 +21,25 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: GuC command submission.
+// Current status: DMA fucked up.
 //
-// Fails somewhere around this:
-// struct xe_lrc *xe_lrc_create(struct xe_hw_engine *hwe, struct xe_vm *vm,
-// 			     u32 ring_size, u16 msix_vec, u32 flags)
+// [  400.188759] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(1): 00000000739565e5, 00000000739565e5
+// [  400.188961] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(2): 00000000739565e5, 00000000739565e5
+// [  401.177227] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: !timeout (0)
+// [  401.177624] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: emit_wa_job: emit_job_sync() returned: -ETIME
+// [  401.178453] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: hwe rcs0: emit_wa_job failed (-ETIME) guc_id=1
+// [  401.178848] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_uc_load_hw: xe_gt_record_default_lrcs() failed
+// [  401.179155] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_guc_ct_disable: Set DISABLED
 //
-// [    5.534951] Unable to handle kernel paging request at virtual address ffffffd600007308
-// [    5.535215] Current modprobe pgtable: 4K pagesize, 39-bit VAs, pgdp=0x000000008294b000
-// [    5.535298] [ffffffd600007308] pgd=0000000023fffc01, p4d=0000000023fffc01, pud=0000000023fffc01, pmd=0000000023fff801, pte=0000000000000000
-// [    5.535557] Oops [#1]
-// [    5.535630] Modules linked in: xe(+) drm_ttm_helper ttm i2c_algo_bit gpu_sched drm_buddy video drm_client_lib drm_suballoc_helper drm_gpuvm drm_exec configfs drm_display_helper drm_kms_helper drm drm_panel_orientation_quirks backlight
-// [    5.536031] CPU: 0 UID: 0 PID: 86 Comm: modprobe Tainted: G        W           6.18.7 #5 NONE 
-// [    5.536127] Tainted: [W]=WARN
-// [    5.536171] Hardware name: RVVM v0.7-git-gb811038-dirty (DT)
-// [    5.536226] epc : __kmalloc_cache_noprof+0x14a/0x2c0
-// [    5.536328]  ra : guc_exec_queue_init+0x5c/0x45c [xe]
-// [    5.537648] epc : ffffffff8022e03e ra : ffffffff015945fc sp : ffffffc6001c3230
-// [    5.537722]  gp : ffffffff81376190 tp : ffffffd60287e000 t0 : 0000000000000000
-// [    5.537911]  t1 : 0000000000000000 t2 : 0000000000000004 s0 : ffffffc6001c3280
-// [    5.537997]  s1 : ffffffd601801b00 a0 : ffffffd600007108 a1 : 0000000000000dc0
-// [    5.538060]  a2 : 0000000000000328 a3 : ffffffc5000d7f80 a4 : ffffffd600007308
-// [    5.538117]  a5 : 0000000000000328 a6 : 000000000000041f a7 : 0000000000000420
-// [    5.538178]  s2 : 0000000000000dc0 s3 : 0000000000000328 s4 : ffffffff015945fc
-// [    5.538232]  s5 : ffffffff813b2a20 s6 : 0000000000000000 s7 : 0000000000000001
-// [    5.538283]  s8 : 0000000000000001 s9 : ffffffd602c44040 s10: ffffffd602c46048
-// [    5.538343]  s11: 0000000000000000 t3 : ffffffc73fee8030 t4 : ffffffc73fee8030
-// [    5.538397]  t5 : 0000000000000028 t6 : 0000000000000000
-// [    5.538443] status: 0000000200000120 badaddr: ffffffd600007308 cause: 000000000000000d
-// [    5.538508] [<ffffffff8022e03e>] __kmalloc_cache_noprof+0x14a/0x2c0
-// [    5.538602] [<ffffffff015945fc>] guc_exec_queue_init+0x5c/0x45c [xe]
-// [    5.539555] [<ffffffff01566d52>] xe_exec_queue_create+0x382/0x44c [xe]
-// [    5.540537] [<ffffffff01571a02>] xe_gt_record_default_lrcs+0x11e/0x6b4 [xe]
-// [    5.541545] [<ffffffff015d835c>] xe_uc_load_hw+0xa8/0x558 [xe]
-// [    5.542499] [<ffffffff015726a8>] xe_gt_init+0x2a8/0x594 [xe]
-// [    5.543408] [<ffffffff01560a0e>] xe_device_probe+0x2fa/0x8f8 [xe]
-// [    5.544350] [<ffffffff015bbf6a>] xe_pci_probe+0x842/0x10ac [xe]
-// [    5.545248] [<ffffffff80461baa>] pci_device_probe+0x82/0x100
-// [    5.545318] [<ffffffff805810e0>] really_probe+0x84/0x230
-// [    5.545379] [<ffffffff805812e8>] __driver_probe_device+0x5c/0xdc
-// [    5.545454] [<ffffffff8058142c>] driver_probe_device+0x2c/0xf8
-// [    5.545519] [<ffffffff80581634>] __driver_attach+0x6c/0x15c
-// [    5.545581] [<ffffffff8057f282>] bus_for_each_dev+0x62/0xb0
-// [    5.545636] [<ffffffff80580c22>] driver_attach+0x1a/0x24
-// [    5.545708] [<ffffffff8058045a>] bus_add_driver+0xce/0x1d8
-// [    5.545769] [<ffffffff80582394>] driver_register+0x40/0xdc
-// [    5.545829] [<ffffffff80460c50>] __pci_register_driver+0x44/0x4c
-// [    5.545890] [<ffffffff015bc7fc>] xe_register_pci_driver+0x28/0x30 [xe]
-// [    5.546837] [<ffffffff014a2094>] xe_init+0x24/0x80 [xe]
-// [    5.547848] [<ffffffff8000e89a>] do_one_initcall+0x56/0x1cc
-// [    5.547940] [<ffffffff800b62da>] do_init_module+0x52/0x1dc
-// [    5.548038] [<ffffffff800b7c12>] load_module+0x158a/0x1980
-// [    5.548109] [<ffffffff800b81b6>] init_module_from_file+0x76/0xb0
-// [    5.548172] [<ffffffff800b8404>] __riscv_sys_finit_module+0x1dc/0x3a8
-// [    5.548236] [<ffffffff80765ad6>] do_trap_ecall_u+0x296/0x370
-// [    5.548317] [<ffffffff807709aa>] handle_exception+0x146/0x152
-// [    5.548479] Code: 6b14 0563 1005 8363 1006 e703 0304 0893 0018 972a (6310) 75f3 
+// GGTT fucked up.
+//
+// RVVM: Driver sent GuC interrupt request
+// RVVM:   CTB G2H addr:            0x142000
+// RVVM:   CTB H2G addr:            0x141000
+// RVVM:   CTB G2H descriptor addr: 0x140800
+// RVVM:   CTB H2G descriptor addr: 0x140000
+//
+// Everything is fucked up.
 
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -1639,66 +1602,98 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->dma_copy_size = read_uint32_le(data);
             break;
 
-        // GuC host interrupt is called after each GuC transaction (xe_guc_mmio_send_recv).
+        // What happens:
         //
-        // Totally unclear what to write there. We could fire DMA actions on
-        // interrupt request, however definitely this should not be done after
-        // each GuC request.
+        // 1. Driver sends series of 8 self configure commands:
+        //    - H2G CTB descriptor address
+        //    - H2G CTB address
+        //    - H2G CTB size
+        //    - G2H CTB descriptor address
+        //    - G2H CTB address
+        //    - G2H CTB size
+        //    - memirq status address
+        //    - memirq status size
         //
-        // Driver tells:
-        // [    5.277335] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: LRC rcs0 WA job: 4138 dwords
-        // [    5.279589] xe_bb_new: bb->cs: 00000000427b963e
-        // [    5.279763] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x5588] = 0x04000400
-        // [    5.281509] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x6204] = 0x01400140
-        // [    5.283204] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x6208] = 0x00200020
-        // [    5.284833] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x62a8] = 0x02400240
-        // [    5.286248] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x7010] = 0x40004000
-        // [    5.287370] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x7300] = 0x10001000
-        // [    5.288529] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x83a8] = 0x20002000
-        // [    5.289978] xe 0000:00:01.0: [drm:xe_gt_record_default_lrcs [xe]] Tile0: GT0: REG[0x6210] = ~0x3f18000|0x3f18000
-        // [    5.291159] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_bb_create_job: Create BB job for address 409000
-        // [    5.291780] xe 0000:00:01.0: [drm] Tile0: GT0: Batch address: 409000
-        // [    5.293556] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(1): 0000INFO: PCI write: offset=1901f8, data=0, size = 4
-        // RVVM:
-        // PCI write: offset=1901f0, data=0, size = 4
-        //  Driver sent GuC interrupt request
-        //  GUC action (request):      f0000000
-        //  GUC action (key | len):    00000001
-        //  GUC action (value hi):     00020000
-        //  GUC action (value lo):     00000000
+        // 2. Then driver sends HOST2GUC_CONTROL_CTB request.
+        //    guc_ct_control_toggle() is responsible for that.
         //
-        //    CTB G2H addr: 0x142000
-        //    CTB H2G addr: 0x141000
-        //  GuC interrupt request failed: NULL address (CTB G2H: 0x142000) from PTE: 0x20000000142003
-        //  GuC interrupt request failed: NULL address (CTB H2G: 0x141000) from PTE: 0x20000000141003
+        // 3. Then some other MMIO communication, then GGTT addresses
+        //    reported with self configure command are invalidated
+        //    to PTE: 0x20000000140003 (DMA: 0x140000).
         //
-        // G2H & H2G addresses invalidated to some shit and Linux fails on DMA fence. Maybe 0x142000 is not DMA
-        // but something else. I don't know.
+        // Undefined where exactly DMA should be used and what to report.
+        // Driver emits GUC interrupt request with xe_guc_notify() after each
+        // GuC MMIO/CT send. This means XE2_REG_GUC_HOST_INTERRUPT is not
+        // responsible for firing DMA.
+        //
+        // DMA format (for G2H, H2G similarly):
+        // DMA[0]: 0x6a0ce00
+        // DMA[1]: 0xffffffd6
+        // DMA[2]: 0x7f42400
+        // DMA[3]: 0xffffffd6
+        // DMA[4]: 0x0
+        // DMA[5]: 0x0
+        // DMA[6]: 0x69b3210
+        // DMA[7]: 0xffffffd6
+        //
+        // I suspect this filled in guc_init_params()
+        //
+        //////////////////////////////////////////////////////////////
+        //
+        // Driver uses LRC (Logical ring context):
+        // - xe_lrc_init()
+        //
+        // LRC:
+        // Region                       Size
+        // +============================+=================================+ <- __xe_lrc_ring_offset()
+        // | Ring                       | ring_size, see                  |
+        // |                            | xe_lrc_init()                   |
+        // +============================+=================================+ <- __xe_lrc_pphwsp_offset()
+        // | PPHWSP (includes SW state) | 4K                              |
+        // +----------------------------+---------------------------------+ <- __xe_lrc_regs_offset()
+        // | Engine Context Image       | n * 4K, see                     |
+        // |                            | xe_gt_lrc_size()                |
+        // +----------------------------+---------------------------------+ <- __xe_lrc_indirect_ring_offset()
+        // | Indirect Ring State Page   | 0 or 4k, see                    |
+        // |                            | XE_LRC_FLAG_INDIRECT_RING_STATE |
+        // +============================+=================================+ <- __xe_lrc_indirect_ctx_offset()
+        // | Indirect Context Page      | 0 or 4k, see                    |
+        // |                            | XE_LRC_FLAG_INDIRECT_CTX        |
+        // +============================+=================================+ <- __xe_lrc_wa_bb_offset()
+        // | WA BB Per Ctx              | 4k                              |
+        // +============================+=================================+ <- xe_bo_size(lrc->bo)
         case XE2_REG_GUC_HOST_INTERRUPT: {
             rvvm_info("Driver sent GuC interrupt request");
+            uint32_t *dma_g2h      = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_g2h, sizeof(uint32_t) * 8);
+            uint32_t *dma_g2h_desc = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_g2h_descriptor, sizeof(uint32_t) * 8);
+            uint32_t *dma_h2g      = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_h2g, sizeof(uint32_t) * 8);
+            uint32_t *dma_h2g_desc = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_h2g_descriptor, sizeof(uint32_t) * 8);
+
+            rvvm_info("  CTB G2H addr:            0x%lx", xe2->guc_addr_ctb_g2h);
+            for (size_t i = 0; i < 8; ++i) {
+                if (dma_g2h)
+                    rvvm_info("DMA[%lu]: 0x%x", i, dma_g2h[i]);
+            }
+            rvvm_info("  CTB H2G addr:            0x%lx", xe2->guc_addr_ctb_h2g);
+            for (size_t i = 0; i < 8; ++i) {
+                if (dma_h2g)
+                    rvvm_info("DMA[%lu]: 0x%x", i, dma_h2g[i]);
+            }
+            rvvm_info("  CTB G2H descriptor addr: 0x%lx", xe2->guc_addr_ctb_g2h_descriptor);
+            for (size_t i = 0; i < 8; ++i) {
+                if (dma_g2h_desc)
+                    rvvm_info("DMA[%lu]: 0x%x", i, dma_g2h_desc[i]);
+            }
+            rvvm_info("  CTB H2G descriptor addr: 0x%lx", xe2->guc_addr_ctb_h2g_descriptor);
+            for (size_t i = 0; i < 8; ++i) {
+                if (dma_h2g_desc)
+                    rvvm_info("DMA[%lu]: 0x%x", i, dma_h2g_desc[i]);
+            }
+            rvvm_info("  CTB memirq source:       0x%lx", xe2->guc_addr_memirq_source);
+
             // Note the difference between xe_guc_mmio_send() and xe_guc_ct_send().
             // One use MMIO, another not.
             xe2_guc_action(xe2, xe2->guc_actions_h2g, xe2->guc_actions_g2h);
-            rvvm_info("  CTB G2H addr: 0x%lx", xe2->guc_addr_ctb_g2h);
-            rvvm_info("  CTB H2G addr: 0x%lx", xe2->guc_addr_ctb_h2g);
-            uint32_t *dma_g2h = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_g2h, sizeof(uint32_t) * 8);
-            uint32_t *dma_h2g = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_h2g, sizeof(uint32_t) * 8);
-            if (dma_h2g) {
-                for (size_t i = 0; i < 8; ++i) {
-                    rvvm_info("DMA H2G[%02ld]: %x", i, dma_h2g[i]);
-                }
-            } else {
-                rvvm_warn("GuC interrupt request failed: NULL address (CTB H2G: 0x%lx)", xe2->guc_addr_ctb_h2g);
-            }
-            if (dma_g2h) {
-                for (size_t i = 0; i < 8; ++i) {
-                    dma_g2h[i] = 0xFF;
-                    rvvm_info("DMA G2H[%02ld]: %x", i, dma_g2h[i]);
-                }
-            } else {
-                rvvm_warn("GuC interrupt request failed: NULL address (CTB G2H: 0x%lx)", xe2->guc_addr_ctb_g2h);
-            }
-            rvvm_info(" ");
             break;
         }
 
