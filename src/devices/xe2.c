@@ -21,25 +21,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: DMA fucked up.
-//
-// [  400.188759] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(1): 00000000739565e5, 00000000739565e5
-// [  400.188961] xe 0000:00:01.0: [drm] Tile0: GT0: desc_read(2): 00000000739565e5, 00000000739565e5
-// [  401.177227] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: !timeout (0)
-// [  401.177624] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: emit_wa_job: emit_job_sync() returned: -ETIME
-// [  401.178453] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: hwe rcs0: emit_wa_job failed (-ETIME) guc_id=1
-// [  401.178848] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_uc_load_hw: xe_gt_record_default_lrcs() failed
-// [  401.179155] xe 0000:00:01.0: [drm] *ERROR* Tile0: GT0: xe_guc_ct_disable: Set DISABLED
-//
-// GGTT fucked up.
-//
-// RVVM: Driver sent GuC interrupt request
-// RVVM:   CTB G2H addr:            0x142000
-// RVVM:   CTB H2G addr:            0x141000
-// RVVM:   CTB G2H descriptor addr: 0x140800
-// RVVM:   CTB H2G descriptor addr: 0x140000
-//
-// Everything is fucked up.
+// Current status: GuC CT communication seems to be correct. Next stage is
+// understand messages format and handle it. We deal with same GuC actions
+// but another ones for DMA channel, not MMIO one (comments in XE2_REG_GUC_HOST_INTERRUPT).
 
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -555,6 +539,14 @@ typedef struct {
     uint32_t edid_written;  // Internal variable.
 } xe2_aux_t;
 
+#define XE2_MEM_SMEM        0 // System memory (accessed via DMA)
+#define XE2_MEM_LMEM        1 // Local memory (accessed via VRAM)
+
+typedef struct {
+    uint64_t addr;
+    uint8_t  type;
+} xe2_dma_addr_t;
+
 typedef struct {
     pci_func_t *pci_func;
     spinlock_t  lock;
@@ -575,8 +567,6 @@ typedef struct {
     uint32_t    wopcm_offset;
     uint32_t    wopcm_locked;
 
-    uint32_t    guc_actions_h2g[4];
-    uint32_t    guc_actions_g2h[4];
     xe2_aux_t   aux[1]; // We assume one display with one AUX channel.
 
     uint32_t    spi_address;
@@ -586,12 +576,19 @@ typedef struct {
     rvvm_addr_t dma_1;
     uint32_t    dma_copy_size;
 
-    rvvm_addr_t guc_addr_memirq_status;
-    rvvm_addr_t guc_addr_memirq_source;
-    rvvm_addr_t guc_addr_ctb_h2g;
-    rvvm_addr_t guc_addr_ctb_g2h;
-    rvvm_addr_t guc_addr_ctb_h2g_descriptor;
-    rvvm_addr_t guc_addr_ctb_g2h_descriptor;
+    struct {
+        uint32_t       actions_h2g[4];
+        uint32_t       actions_g2h[4];
+
+        xe2_dma_addr_t memirq_status_addr;
+        xe2_dma_addr_t memirq_source_addr;
+        xe2_dma_addr_t ctb_h2g_addr;
+        size_t         ctb_h2g_size;
+        xe2_dma_addr_t ctb_g2h_addr;
+        size_t         ctb_g2h_size;
+        xe2_dma_addr_t ctb_h2g_descriptor_addr;
+        xe2_dma_addr_t ctb_g2h_descriptor_addr;
+    } guc;
 
     // Page table entries.
     uint64_t    *ggtt_pte;
@@ -699,7 +696,7 @@ static inline void xe2_ggtt_mmio_write(xe2_dev_t *xe2, uint32_t offset, uint32_t
     }
 }
 
-static inline uint64_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
+static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
 {
     uint64_t idx = ggtt >> 12;
     uint64_t off = ggtt & 0xfff;
@@ -717,10 +714,46 @@ static inline uint64_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
 
     if (!(pte & 1)) {
         rvvm_warn("PTE 0x%lx is invalid!", pte);
-        return 0;
+        return (xe2_dma_addr_t) {
+            .addr = 0,
+            .type = 0
+        };
     }
 
-    return (pte & 0x0000FFFFFFFFF000ULL) + off;
+    return (xe2_dma_addr_t) {
+        .addr = (pte & 0x0000FFFFFFFFF000ULL) + off,
+        .type = (pte & 2) ? XE2_MEM_SMEM : XE2_MEM_LMEM
+    };
+}
+
+static uint32_t xe2_dma_read32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
+{
+    if (dma.type == XE2_MEM_SMEM) {
+        if (dma.addr + off + 4 > XE2_VRAM_SIZE)
+            return 0;
+        return read_uint32_le(xe2->vram + dma.addr + off);
+    } else {
+        uint32_t *ptr = pci_get_dma_ptr(xe2->pci_func, dma.addr + off, 4);
+        return ptr ? *ptr : 0;
+    }
+}
+
+static void xe2_dma_write32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint32_t msg)
+{
+    if (dma.type == XE2_MEM_SMEM) {
+        if (unlikely(dma.addr + off + 4 > XE2_VRAM_SIZE)) {
+            rvvm_info("%s: Failed", __FUNCTION__);
+            return;
+        }
+        write_uint32_le(xe2->vram + dma.addr + off, msg);
+        rvvm_info("%s: write_uint32_le[0x%lx]: 0x%x done", __FUNCTION__, dma.addr + off, msg);
+    } else {
+        uint32_t *ptr = pci_get_dma_ptr(xe2->pci_func, dma.addr + off, 4);
+        if (likely(ptr)) {
+            *ptr = msg;
+        }
+        rvvm_info("%s: DMA done", __FUNCTION__);
+    }
 }
 
 static inline bool xe2_guc_klv_address_key(uint32_t key)
@@ -747,47 +780,56 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
                       | (7 << 28)  // GUC_HXG_TYPE_RESPONSE_SUCCESS
                       | (1 <<  0); // AUX data (1)
 
-    if (!xe2_guc_klv_address_key(key)) {
-        return response;
-    }
+    uint64_t value = (uint64_t) actions[2]
+                   | (uint64_t) actions[3] << 32;
+    xe2_dma_addr_t dma_addr = xe2_guc_klv_address_key(key)
+        ? xe2_ggtt_translate(xe2, value)
+        : (xe2_dma_addr_t) {0};
 
-    uint64_t addr = (uint64_t) actions[2]
-                  | (uint64_t) actions[3] << 32;
-    rvvm_addr_t dma_addr = xe2_ggtt_translate(xe2, addr);
-    if (!dma_addr) {
-        rvvm_warn("GGTT returned NULL: (dma_addr: 0x%lx, addr: 0x%lx)", dma_addr, addr);
+    if (!xe2_guc_klv_address_key(key) && dma_addr.addr) {
+        rvvm_warn("GGTT returned NULL: (dma_addr: 0x%lx, addr: 0x%lx)", dma_addr.addr, value);
         return response;
     }
 
     switch (key) {
         case GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
-            xe2->guc_addr_memirq_status = dma_addr;
-            rvvm_info("GuC cfg: memirq status addr: 0x%lx", xe2->guc_addr_memirq_status);
+            xe2->guc.memirq_status_addr = dma_addr;
+            rvvm_info("GuC cfg: memirq status addr: 0x%lx", xe2->guc.memirq_status_addr.addr);
             break;
 
         case GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
-            xe2->guc_addr_memirq_source = dma_addr;
-            rvvm_info("GuC cfg: memirq source addr: 0x%lx", xe2->guc_addr_memirq_source);
+            xe2->guc.memirq_source_addr = dma_addr;
+            rvvm_info("GuC cfg: memirq source addr: 0x%lx", xe2->guc.memirq_source_addr.addr);
             break;
 
         case GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
-            xe2->guc_addr_ctb_h2g = dma_addr;
-            rvvm_info("GuC cfg: H2G CTB addr: 0x%lx", xe2->guc_addr_ctb_h2g);
+            xe2->guc.ctb_h2g_addr = dma_addr;
+            rvvm_info("GuC cfg: H2G CTB addr: 0x%lx", xe2->guc.ctb_h2g_addr.addr);
+            break;
+
+        case GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY:
+            rvvm_info("GuC cfg: H2G CTB size: %lu", value);
+            xe2->guc.ctb_h2g_size = value;
+            break;
+
+        case GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY:
+            rvvm_info("GuC cfg: G2H CTB size: %lu", value);
+            xe2->guc.ctb_g2h_size = value;
             break;
 
         case GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
-            xe2->guc_addr_ctb_h2g_descriptor = dma_addr;
-            rvvm_info("GuC cfg: H2G CTB descriptor addr: 0x%lx", xe2->guc_addr_ctb_h2g_descriptor);
+            xe2->guc.ctb_h2g_descriptor_addr = dma_addr;
+            rvvm_info("GuC cfg: H2G CTB descriptor addr: 0x%lx", xe2->guc.ctb_h2g_descriptor_addr.addr);
             break;
 
         case GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
-            xe2->guc_addr_ctb_g2h = dma_addr;
-            rvvm_info("GuC cfg: G2H CTB addr: 0x%lx", xe2->guc_addr_ctb_g2h);
+            xe2->guc.ctb_g2h_addr = dma_addr;
+            rvvm_info("GuC cfg: G2H CTB addr: 0x%lx", xe2->guc.ctb_g2h_addr.addr);
             break;
 
         case GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
-            xe2->guc_addr_ctb_g2h_descriptor = dma_addr;
-            rvvm_info("GuC cfg: G2H CTB descriptor addr: 0x%lx", xe2->guc_addr_ctb_g2h_descriptor);
+            xe2->guc.ctb_g2h_descriptor_addr = dma_addr;
+            rvvm_info("GuC cfg: G2H CTB descriptor addr: 0x%lx", xe2->guc.ctb_g2h_descriptor_addr.addr);
             break;
 
         default:
@@ -838,6 +880,110 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
     g2h[0] = cmd;
 
     rvvm_info(" ");
+}
+
+// We learned how to catch Command Transport buffers. But we don't know
+// yet how to correctly respond back. Linux still fails on DMA fence
+// timeout.
+//
+// According to driver,
+//   CTB descriptor:
+//     [0]: [................................]
+//          31        head                   0
+//     [1]: [................................]
+//          31        tail                   0
+//     [2]: [................................]
+//          31        status                 0
+//                ...
+//    [15]: [................................]
+//          31                               0
+//
+//   CTB message:
+//     [0]: [31:16] - seqno (fence)
+//          [15:12] - format
+//          [11: 8] - rsvd
+//          [ 7: 0] - seqno
+//     [1]: payload
+//     [x]: payload (depends on format)
+//
+//===============================================================
+//
+// We have header of shape: 0x8001000a, where according to
+// the table our seqno is 0x8001. But intuition says it should start
+// from zero. Previously fence was tried with [27:16] not [31:16].
+static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
+{
+    rvvm_info("Driver sent GuC interrupt request");
+    // Note the difference between xe_guc_mmio_send() and xe_guc_ct_send().
+    // One use MMIO, another not.
+    xe2_guc_action(xe2, xe2->guc.actions_h2g, xe2->guc.actions_g2h);
+
+    uint32_t head = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0);
+    uint32_t tail = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 4);
+
+    rvvm_info("Read head/tail: %u/%u", head, tail);
+
+    while (head != tail) {
+        uint32_t header     = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_addr, head * 4);
+        rvvm_info("Header: %x", header);
+        uint32_t num_dwords = xe2_reg_field_get(xe2_reg_genmask( 7,  0), header);
+        uint32_t fence      = xe2_reg_field_get(xe2_reg_genmask(31, 16), header);
+
+        if (num_dwords == 0 || head + 1 + num_dwords > tail) {
+            break;
+        }
+
+        uint32_t hxg_header = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_addr, (head + 1) * 4);
+        uint32_t action     =  hxg_header & 0xFFFF;
+        uint32_t type       = (hxg_header >> 28) & 0x7;
+        uint32_t origin     = (hxg_header >> 31) & 0x1;
+
+        uint32_t msg[64] = {
+            [0] = hxg_header
+        };
+        rvvm_info("GuC msg[0]: 0x%x", msg[0]);
+        for (uint32_t i = 1; i < num_dwords && i < 64; i++) {
+            msg[i] = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_addr, (head + 1 + i) * 4);
+            rvvm_info("GuC msg[%u]: 0x%x", i, msg[i]);
+        }
+
+        rvvm_info("GuC IRQ: dwords: %x", num_dwords);
+        rvvm_info("GuC IRQ: action: %x", action);
+        rvvm_info("GuC IRQ: type:   %x", type);
+        rvvm_info("GuC IRQ: origin: %x", origin);
+        rvvm_info("GuC IRQ: fence:  %x", fence);
+
+        uint32_t request = msg[0] & 0xFFFF;
+
+        switch (request) {
+            case XE2_GUC_ACTION_REGISTER_CONTEXT:
+            case XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES:
+            case XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET: {
+                // This is incorrect operation on LRCA, but somehow in a
+                // similar way we could report our status via DMA to guest.
+                // I guess...
+                uint32_t lrca = msg[11] & ~0xFFF;
+                uint64_t pphwsp_ggtt = lrca + /* Ring size */ 0x1000;
+                xe2_dma_addr_t pphwsp = xe2_ggtt_translate(xe2, pphwsp_ggtt);
+                uint32_t seqno_offset = 512;
+                rvvm_info("CTB response: LRCA: 0x%x", lrca);
+                rvvm_info("CTB response: PPHWSP GGTT: 0x%lx", pphwsp_ggtt);
+                rvvm_info("CTB response: PPHWSP GGTT (DMA): 0x%lx", pphwsp.addr);
+                rvvm_info("CTB response: Seqno: 0x%x", seqno_offset);
+                xe2_dma_write32(xe2, pphwsp, seqno_offset, 1);
+                pci_send_irq(xe2->pci_func, 0);
+                break;
+            }
+        }
+
+        head += 1 + num_dwords;
+    }
+
+    // Try to trigger everything to pass DMA timeouts.
+    xe2_dma_write32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0, head);
+    xe2_dma_write32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 0, head);
+    xe2_dma_write32(xe2, xe2->guc.ctb_h2g_addr, 0, head);
+    xe2_dma_write32(xe2, xe2->guc.ctb_g2h_addr, 0, head);
 }
 
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
@@ -1250,16 +1396,16 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
         case XE2_REG_GUC_FW_SW_1:
-            write_uint32_le(data, xe2->guc_actions_g2h[0]);
+            write_uint32_le(data, xe2->guc.actions_g2h[0]);
             break;
         case XE2_REG_GUC_FW_SW_2:
-            write_uint32_le(data, xe2->guc_actions_g2h[1]);
+            write_uint32_le(data, xe2->guc.actions_g2h[1]);
             break;
         case XE2_REG_GUC_FW_SW_3:
-            write_uint32_le(data, xe2->guc_actions_g2h[2]);
+            write_uint32_le(data, xe2->guc.actions_g2h[2]);
             break;
         case XE2_REG_GUC_FW_SW_4:
-            write_uint32_le(data, xe2->guc_actions_g2h[3]);
+            write_uint32_le(data, xe2->guc.actions_g2h[3]);
             break;
 
         case XE2_REG_GUC_PMTIMESTAMP_LO: {
@@ -1560,16 +1706,16 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             break;
         }
         case XE2_REG_GUC_FW_SW_1:
-            xe2->guc_actions_h2g[0] = read_uint32_le(data);
+            xe2->guc.actions_h2g[0] = read_uint32_le(data);
             break;
         case XE2_REG_GUC_FW_SW_2:
-            xe2->guc_actions_h2g[1] = read_uint32_le(data);
+            xe2->guc.actions_h2g[1] = read_uint32_le(data);
             break;
         case XE2_REG_GUC_FW_SW_3:
-            xe2->guc_actions_h2g[2] = read_uint32_le(data);
+            xe2->guc.actions_h2g[2] = read_uint32_le(data);
             break;
         case XE2_REG_GUC_FW_SW_4:
-            xe2->guc_actions_h2g[3] = read_uint32_le(data);
+            xe2->guc.actions_h2g[3] = read_uint32_le(data);
             break;
 
         case XE2_REG_GUC_DMA_ADDR_0_LO:
@@ -1602,100 +1748,9 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->dma_copy_size = read_uint32_le(data);
             break;
 
-        // What happens:
-        //
-        // 1. Driver sends series of 8 self configure commands:
-        //    - H2G CTB descriptor address
-        //    - H2G CTB address
-        //    - H2G CTB size
-        //    - G2H CTB descriptor address
-        //    - G2H CTB address
-        //    - G2H CTB size
-        //    - memirq status address
-        //    - memirq status size
-        //
-        // 2. Then driver sends HOST2GUC_CONTROL_CTB request.
-        //    guc_ct_control_toggle() is responsible for that.
-        //
-        // 3. Then some other MMIO communication, then GGTT addresses
-        //    reported with self configure command are invalidated
-        //    to PTE: 0x20000000140003 (DMA: 0x140000).
-        //
-        // Undefined where exactly DMA should be used and what to report.
-        // Driver emits GUC interrupt request with xe_guc_notify() after each
-        // GuC MMIO/CT send. This means XE2_REG_GUC_HOST_INTERRUPT is not
-        // responsible for firing DMA.
-        //
-        // DMA format (for G2H, H2G similarly):
-        // DMA[0]: 0x6a0ce00
-        // DMA[1]: 0xffffffd6
-        // DMA[2]: 0x7f42400
-        // DMA[3]: 0xffffffd6
-        // DMA[4]: 0x0
-        // DMA[5]: 0x0
-        // DMA[6]: 0x69b3210
-        // DMA[7]: 0xffffffd6
-        //
-        // I suspect this filled in guc_init_params()
-        //
-        //////////////////////////////////////////////////////////////
-        //
-        // Driver uses LRC (Logical ring context):
-        // - xe_lrc_init()
-        //
-        // LRC:
-        // Region                       Size
-        // +============================+=================================+ <- __xe_lrc_ring_offset()
-        // | Ring                       | ring_size, see                  |
-        // |                            | xe_lrc_init()                   |
-        // +============================+=================================+ <- __xe_lrc_pphwsp_offset()
-        // | PPHWSP (includes SW state) | 4K                              |
-        // +----------------------------+---------------------------------+ <- __xe_lrc_regs_offset()
-        // | Engine Context Image       | n * 4K, see                     |
-        // |                            | xe_gt_lrc_size()                |
-        // +----------------------------+---------------------------------+ <- __xe_lrc_indirect_ring_offset()
-        // | Indirect Ring State Page   | 0 or 4k, see                    |
-        // |                            | XE_LRC_FLAG_INDIRECT_RING_STATE |
-        // +============================+=================================+ <- __xe_lrc_indirect_ctx_offset()
-        // | Indirect Context Page      | 0 or 4k, see                    |
-        // |                            | XE_LRC_FLAG_INDIRECT_CTX        |
-        // +============================+=================================+ <- __xe_lrc_wa_bb_offset()
-        // | WA BB Per Ctx              | 4k                              |
-        // +============================+=================================+ <- xe_bo_size(lrc->bo)
-        case XE2_REG_GUC_HOST_INTERRUPT: {
-            rvvm_info("Driver sent GuC interrupt request");
-            uint32_t *dma_g2h      = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_g2h, sizeof(uint32_t) * 8);
-            uint32_t *dma_g2h_desc = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_g2h_descriptor, sizeof(uint32_t) * 8);
-            uint32_t *dma_h2g      = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_h2g, sizeof(uint32_t) * 8);
-            uint32_t *dma_h2g_desc = pci_get_dma_ptr(xe2->pci_func, xe2->guc_addr_ctb_h2g_descriptor, sizeof(uint32_t) * 8);
-
-            rvvm_info("  CTB G2H addr:            0x%lx", xe2->guc_addr_ctb_g2h);
-            for (size_t i = 0; i < 8; ++i) {
-                if (dma_g2h)
-                    rvvm_info("DMA[%lu]: 0x%x", i, dma_g2h[i]);
-            }
-            rvvm_info("  CTB H2G addr:            0x%lx", xe2->guc_addr_ctb_h2g);
-            for (size_t i = 0; i < 8; ++i) {
-                if (dma_h2g)
-                    rvvm_info("DMA[%lu]: 0x%x", i, dma_h2g[i]);
-            }
-            rvvm_info("  CTB G2H descriptor addr: 0x%lx", xe2->guc_addr_ctb_g2h_descriptor);
-            for (size_t i = 0; i < 8; ++i) {
-                if (dma_g2h_desc)
-                    rvvm_info("DMA[%lu]: 0x%x", i, dma_g2h_desc[i]);
-            }
-            rvvm_info("  CTB H2G descriptor addr: 0x%lx", xe2->guc_addr_ctb_h2g_descriptor);
-            for (size_t i = 0; i < 8; ++i) {
-                if (dma_h2g_desc)
-                    rvvm_info("DMA[%lu]: 0x%x", i, dma_h2g_desc[i]);
-            }
-            rvvm_info("  CTB memirq source:       0x%lx", xe2->guc_addr_memirq_source);
-
-            // Note the difference between xe_guc_mmio_send() and xe_guc_ct_send().
-            // One use MMIO, another not.
-            xe2_guc_action(xe2, xe2->guc_actions_h2g, xe2->guc_actions_g2h);
+        case XE2_REG_GUC_HOST_INTERRUPT:
+            xe2_guc_host_interrupt(xe2);
             break;
-        }
 
         case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_RENDER_RING_BASE):
             rvvm_info("Write ring head: HW engine renderer");
