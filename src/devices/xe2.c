@@ -576,6 +576,9 @@ typedef struct {
     rvvm_addr_t dma_1;
     uint32_t    dma_copy_size;
 
+    xe2_dma_addr_t hwlrca_addr;
+    xe2_dma_addr_t pphwsp_addr;
+
     struct {
         uint32_t       actions_h2g[4];
         uint32_t       actions_g2h[4];
@@ -956,25 +959,50 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
         uint32_t request = msg[0] & 0xFFFF;
 
         switch (request) {
-            case XE2_GUC_ACTION_REGISTER_CONTEXT:
-            case XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES:
-            case XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET: {
-                // This is incorrect operation on LRCA, but somehow in a
-                // similar way we could report our status via DMA to guest.
-                // I guess...
-                uint32_t lrca = msg[11] & ~0xFFF;
-                uint64_t pphwsp_ggtt = lrca + /* Ring size */ 0x1000;
-                xe2_dma_addr_t pphwsp = xe2_ggtt_translate(xe2, pphwsp_ggtt);
-                uint32_t seqno_offset = 512;
-                rvvm_info("CTB response: LRCA: 0x%x", lrca);
-                rvvm_info("CTB response: PPHWSP GGTT: 0x%lx", pphwsp_ggtt);
-                rvvm_info("CTB response: PPHWSP GGTT (DMA): 0x%lx", pphwsp.addr);
-                rvvm_info("CTB response: Seqno: 0x%x", seqno_offset);
-                xe2_dma_write32(xe2, pphwsp, seqno_offset, 1);
-                pci_send_irq(xe2->pci_func, 0);
+            case XE2_GUC_ACTION_REGISTER_CONTEXT: {
+                uint32_t flags = msg[1];
+                uint32_t context_idx = msg[2];
+                uint32_t engine_class = msg[3];
+                uint32_t engine_submit_mask = msg[4];
+                uint32_t wq_desc_lo = msg[5];
+                uint32_t wq_desc_hi = msg[6];
+                uint32_t wq_base_lo = msg[7];
+                uint32_t wq_base_hi = msg[8];
+                uint32_t wq_size = msg[9];
+                uint32_t hwlrca_lo = msg[10];
+                uint32_t hwlrca_hi = msg[11];
+                rvvm_info("GuC IRQ: Register context");
+                rvvm_info("  flags:              0x%x", flags);
+                rvvm_info("  context_idx:        0x%x", context_idx);
+                rvvm_info("  engine_class:       0x%x", engine_class);
+                rvvm_info("  engine_submit_mask: 0x%x", engine_submit_mask);
+                rvvm_info("  wq_desc_lo:         0x%x", wq_desc_lo);
+                rvvm_info("  wq_desc_hi:         0x%x", wq_desc_hi);
+                rvvm_info("  wq_base_lo:         0x%x", wq_base_lo);
+                rvvm_info("  wq_base_hi:         0x%x", wq_base_hi);
+                rvvm_info("  wq_size:            0x%x", wq_size);
+                rvvm_info("  hwlrca_lo:          0x%x", hwlrca_lo);
+                rvvm_info("  hwlrca_hi:          0x%x", hwlrca_hi);
+
+                rvvm_addr_t hwlrca = (rvvm_addr_t) hwlrca_lo
+                                   | (rvvm_addr_t) hwlrca_hi << 32;
+                hwlrca &= ~0xFFFULL;
+                xe2->hwlrca_addr = xe2_ggtt_translate(xe2, hwlrca);
+                rvvm_info("Translated HWLRCA address: 0x%lx -> 0x%lx", hwlrca, xe2->hwlrca_addr.addr);
+                rvvm_addr_t pphwsp_ggtt = hwlrca + 0x4000; // SZ_16K (Ring size)
+                xe2->pphwsp_addr = xe2_ggtt_translate(xe2, pphwsp_ggtt);
+                rvvm_info("Translated PPHWSP address: 0x%lx -> 0x%lx", pphwsp_ggtt, xe2->pphwsp_addr.addr);
                 break;
             }
+            default:
+                break;
         }
+
+        rvvm_info("GuC notify PPHWSP address: 0x%lx (1)", xe2->pphwsp_addr.addr);
+        rvvm_addr_t seqno = 512;
+        xe2_dma_write32(xe2, xe2->pphwsp_addr, 0, 1);
+        xe2_dma_write32(xe2, xe2->pphwsp_addr, seqno, 1);
+        pci_send_irq(xe2->pci_func, 0);
 
         head += 1 + num_dwords;
     }
@@ -982,8 +1010,6 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
     // Try to trigger everything to pass DMA timeouts.
     xe2_dma_write32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0, head);
     xe2_dma_write32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 0, head);
-    xe2_dma_write32(xe2, xe2->guc.ctb_h2g_addr, 0, head);
-    xe2_dma_write32(xe2, xe2->guc.ctb_g2h_addr, 0, head);
 }
 
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
