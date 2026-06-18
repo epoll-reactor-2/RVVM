@@ -495,7 +495,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_HW_ENGINE_RING_TAIL(base)                   (base + 0x30)
 #define XE2_REG_HW_ENGINE_RING_HEAD(base)                   (base + 0x34)
 #define XE2_REG_HW_ENGINE_RING_START(base)                  (base + 0x38)
-#define XE2_REG_HW_ENGINE_RING_CTL(base)                    (base + 0x38)
+#define XE2_REG_HW_ENGINE_RING_CTL(base)                    (base + 0x3C)
 
 #define XE2_VRAM_SIZE                                       0x10000000 // 256 MiB
 
@@ -1569,18 +1569,22 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 
         case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_RENDER_RING_BASE):
             rvvm_info("Read ring head: HW engine renderer");
+            write_uint32_le(data, 0);
             break;
 
         case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_RENDER_RING_BASE):
             rvvm_info("Read ring tail: HW engine renderer");
+            write_uint32_le(data, 0);
             break;
 
         case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
             rvvm_info("Read ring head: HW engine BCS8");
+            write_uint32_le(data, 0);
             break;
 
         case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
             rvvm_info("Read ring tail: HW engine BCS8");
+            write_uint32_le(data, 0);
             break;
 
         default:
