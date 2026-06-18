@@ -448,6 +448,26 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY                   0x907
 #define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_LEN                   1
 
+// GuC Command Transport Buffer (CTB) message framing. Each ring message is one
+// CTB header dword followed by NUM_DWORDS payload dwords. The buffer descriptor
+// holds head (consumer) and tail (producer) as dword indices into a circular
+// command buffer.
+#define XE2_GUC_CTB_HDR_LEN                                 1
+#define XE2_GUC_CTB_MSG_0_FENCE                             xe2_reg_genmask(31, 16)
+#define XE2_GUC_CTB_MSG_0_FORMAT                            xe2_reg_genmask(15, 12)
+#define XE2_GUC_CTB_FORMAT_HXG                              0
+#define XE2_GUC_CTB_MSG_0_NUM_DWORDS                        xe2_reg_genmask(7, 0)
+
+// Host <-> GuC (HXG) message header, carried as the first payload dword.
+#define XE2_GUC_HXG_MSG_0_ORIGIN                            xe2_reg_bit(31)
+#define XE2_GUC_HXG_ORIGIN_GUC                              1
+#define XE2_GUC_HXG_MSG_0_TYPE                              xe2_reg_genmask(30, 28)
+#define XE2_GUC_HXG_TYPE_REQUEST                            0
+#define XE2_GUC_HXG_TYPE_EVENT                              1
+#define XE2_GUC_HXG_TYPE_RESPONSE_SUCCESS                  7
+#define XE2_GUC_HXG_MSG_0_ACTION                           xe2_reg_genmask(15, 0)
+#define XE2_GUC_HXG_RESPONSE_MSG_0_DATA0                   xe2_reg_genmask(27, 0)
+
 
 #define XE2_HW_ENGINE_RENDER_RING_BASE                      0x02000
 #define XE2_HW_ENGINE_BSD_RING_BASE                         0x1C0000
@@ -885,131 +905,119 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
     rvvm_info(" ");
 }
 
-// We learned how to catch Command Transport buffers. But we don't know
-// yet how to correctly respond back. Linux still fails on DMA fence
-// timeout.
-//
-// According to driver,
-//   CTB descriptor:
-//     [0]: [................................]
-//          31        head                   0
-//     [1]: [................................]
-//          31        tail                   0
-//     [2]: [................................]
-//          31        status                 0
-//                ...
-//    [15]: [................................]
-//          31                               0
-//
-//   CTB message:
-//     [0]: [31:16] - seqno (fence)
-//          [15:12] - format
-//          [11: 8] - rsvd
-//          [ 7: 0] - seqno
-//     [1]: payload
-//     [x]: payload (depends on format)
-//
-//===============================================================
-//
-// We have header of shape: 0x8001000a, where according to
-// the table our seqno is 0x8001. But intuition says it should start
-// from zero. Previously fence was tried with [27:16] not [31:16].
+// Read/write one dword in a CTB ring; head/tail are dword indices that wrap
+// within the buffer.
+static inline uint32_t xe2_ctb_get(xe2_dev_t *xe2, xe2_dma_addr_t buf, uint32_t idx, uint32_t dwords)
+{
+    return xe2_dma_read32(xe2, buf, (idx % dwords) * 4);
+}
+
+static inline void xe2_ctb_put(xe2_dev_t *xe2, xe2_dma_addr_t buf, uint32_t idx, uint32_t dwords, uint32_t val)
+{
+    xe2_dma_write32(xe2, buf, (idx % dwords) * 4, val);
+}
+
+// Frame an HXG message into the G2H ring as [CTB header][n payload dwords],
+// advance the producer tail and raise the GuC interrupt. 'fence' echoes the
+// originating request so a blocking transport send completes.
+static void xe2_guc_g2h_push(xe2_dev_t *xe2, uint32_t fence, const uint32_t *hxg, uint32_t n)
+{
+    uint32_t dwords = xe2->guc.ctb_g2h_size / 4;
+    if (dwords == 0) {
+        return;
+    }
+
+    uint32_t tail = xe2_dma_read32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 4);
+
+    uint32_t header = xe2_reg_field_prep(XE2_GUC_CTB_MSG_0_FENCE, fence)
+                    | xe2_reg_field_prep(XE2_GUC_CTB_MSG_0_FORMAT, XE2_GUC_CTB_FORMAT_HXG)
+                    | xe2_reg_field_prep(XE2_GUC_CTB_MSG_0_NUM_DWORDS, n);
+
+    xe2_ctb_put(xe2, xe2->guc.ctb_g2h_addr, tail, dwords, header);
+    for (uint32_t i = 0; i < n; i++) {
+        xe2_ctb_put(xe2, xe2->guc.ctb_g2h_addr, tail + XE2_GUC_CTB_HDR_LEN + i, dwords, hxg[i]);
+    }
+
+    tail = (tail + XE2_GUC_CTB_HDR_LEN + n) % dwords;
+    xe2_dma_write32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 4, tail);
+
+    pci_send_irq(xe2->pci_func, 0);
+}
+
+// Reply to a transport request with a single-dword success response.
+static void xe2_guc_g2h_response(xe2_dev_t *xe2, uint32_t fence, uint32_t data0)
+{
+    uint32_t hxg = xe2_reg_field_prep(XE2_GUC_HXG_MSG_0_ORIGIN, XE2_GUC_HXG_ORIGIN_GUC)
+                 | xe2_reg_field_prep(XE2_GUC_HXG_MSG_0_TYPE, XE2_GUC_HXG_TYPE_RESPONSE_SUCCESS)
+                 | xe2_reg_field_prep(XE2_GUC_HXG_RESPONSE_MSG_0_DATA0, data0);
+    xe2_guc_g2h_push(xe2, fence, &hxg, 1);
+}
+
+// GuC Command Transport: the driver writes H2G requests into a circular ring
+// and, for blocking sends, waits for a G2H response that echoes the request's
+// fence. Drain every pending H2G message, act on it, and push a fence-matched
+// success response for each request.
 static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
 {
-    rvvm_info("Driver sent GuC interrupt request");
-    // Note the difference between xe_guc_mmio_send() and xe_guc_ct_send().
-    // One use MMIO, another not.
+    // Scratch-register (MMIO) transport path, used before the CT rings are up.
     xe2_guc_action(xe2, xe2->guc.actions_h2g, xe2->guc.actions_g2h);
+
+    uint32_t dwords = xe2->guc.ctb_h2g_size / 4;
+    if (dwords == 0) {
+        return;
+    }
 
     uint32_t head = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0);
     uint32_t tail = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 4);
 
-    rvvm_info("Read head/tail: %u/%u", head, tail);
-
     while (head != tail) {
-        uint32_t header     = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_addr, head * 4);
-        rvvm_info("Header: %x", header);
-        uint32_t num_dwords = xe2_reg_field_get(xe2_reg_genmask( 7,  0), header);
-        uint32_t fence      = xe2_reg_field_get(xe2_reg_genmask(31, 16), header);
+        uint32_t header     = xe2_ctb_get(xe2, xe2->guc.ctb_h2g_addr, head, dwords);
+        uint32_t num_dwords = xe2_reg_field_get(XE2_GUC_CTB_MSG_0_NUM_DWORDS, header);
+        uint32_t fence      = xe2_reg_field_get(XE2_GUC_CTB_MSG_0_FENCE, header);
 
-        if (num_dwords == 0 || head + 1 + num_dwords > tail) {
+        if (num_dwords == 0) {
             break;
         }
 
-        uint32_t hxg_header = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_addr, (head + 1) * 4);
-        uint32_t action     =  hxg_header & 0xFFFF;
-        uint32_t type       = (hxg_header >> 28) & 0x7;
-        uint32_t origin     = (hxg_header >> 31) & 0x1;
-
-        uint32_t msg[64] = {
-            [0] = hxg_header
-        };
-        rvvm_info("GuC msg[0]: 0x%x", msg[0]);
-        for (uint32_t i = 1; i < num_dwords && i < 64; i++) {
-            msg[i] = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_addr, (head + 1 + i) * 4);
-            rvvm_info("GuC msg[%u]: 0x%x", i, msg[i]);
+        uint32_t msg[64] = {0};
+        for (uint32_t i = 0; i < num_dwords && i < 64; i++) {
+            msg[i] = xe2_ctb_get(xe2, xe2->guc.ctb_h2g_addr, head + XE2_GUC_CTB_HDR_LEN + i, dwords);
         }
 
-        rvvm_info("GuC IRQ: dwords: %x", num_dwords);
-        rvvm_info("GuC IRQ: action: %x", action);
-        rvvm_info("GuC IRQ: type:   %x", type);
-        rvvm_info("GuC IRQ: origin: %x", origin);
-        rvvm_info("GuC IRQ: fence:  %x", fence);
+        uint32_t type   = xe2_reg_field_get(XE2_GUC_HXG_MSG_0_TYPE, msg[0]);
+        uint32_t action = xe2_reg_field_get(XE2_GUC_HXG_MSG_0_ACTION, msg[0]);
 
-        uint32_t request = msg[0] & 0xFFFF;
+        rvvm_info("GuC CT: action=0x%x type=%u fence=0x%x dwords=%u", action, type, fence, num_dwords);
 
-        switch (request) {
+        switch (action) {
             case XE2_GUC_ACTION_REGISTER_CONTEXT: {
-                uint32_t flags = msg[1];
-                uint32_t context_idx = msg[2];
-                uint32_t engine_class = msg[3];
-                uint32_t engine_submit_mask = msg[4];
-                uint32_t wq_desc_lo = msg[5];
-                uint32_t wq_desc_hi = msg[6];
-                uint32_t wq_base_lo = msg[7];
-                uint32_t wq_base_hi = msg[8];
-                uint32_t wq_size = msg[9];
-                uint32_t hwlrca_lo = msg[10];
-                uint32_t hwlrca_hi = msg[11];
-                rvvm_info("GuC IRQ: Register context");
-                rvvm_info("  flags:              0x%x", flags);
-                rvvm_info("  context_idx:        0x%x", context_idx);
-                rvvm_info("  engine_class:       0x%x", engine_class);
-                rvvm_info("  engine_submit_mask: 0x%x", engine_submit_mask);
-                rvvm_info("  wq_desc_lo:         0x%x", wq_desc_lo);
-                rvvm_info("  wq_desc_hi:         0x%x", wq_desc_hi);
-                rvvm_info("  wq_base_lo:         0x%x", wq_base_lo);
-                rvvm_info("  wq_base_hi:         0x%x", wq_base_hi);
-                rvvm_info("  wq_size:            0x%x", wq_size);
-                rvvm_info("  hwlrca_lo:          0x%x", hwlrca_lo);
-                rvvm_info("  hwlrca_hi:          0x%x", hwlrca_hi);
-
-                rvvm_addr_t hwlrca = (rvvm_addr_t) hwlrca_lo
-                                   | (rvvm_addr_t) hwlrca_hi << 32;
-                hwlrca &= 0x0000FFFFFFFFF000ULL; // GGTT page addr only; strip desc flags + engine class/instance
+                // The registered context address points at the per-process HW
+                // status page (PPHWSP), which is the first page of the context.
+                rvvm_addr_t hwlrca = (rvvm_addr_t) msg[10]
+                                   | (rvvm_addr_t) msg[11] << 32;
+                hwlrca &= 0x0000FFFFFFFFF000ULL; // page addr only; drop desc flags + engine class/instance
                 xe2->hwlrca_addr = xe2_ggtt_translate(xe2, hwlrca);
-                rvvm_info("Translated HWLRCA address: 0x%lx -> 0x%lx", hwlrca, xe2->hwlrca_addr.addr);
-                rvvm_addr_t pphwsp_ggtt = hwlrca; // LRCA already points at PPHWSP (first page of the LRC)
-                xe2->pphwsp_addr = xe2_ggtt_translate(xe2, pphwsp_ggtt);
-                rvvm_info("Translated PPHWSP address: 0x%lx -> 0x%lx", pphwsp_ggtt, xe2->pphwsp_addr.addr);
+                xe2->pphwsp_addr = xe2_ggtt_translate(xe2, hwlrca);
+                rvvm_info("GuC CT: register context, PPHWSP 0x%llx -> 0x%llx",
+                          (uint64_t) hwlrca, (uint64_t) xe2->pphwsp_addr.addr);
+                // Seed the status-page seqno so submitted work appears complete.
+                xe2_dma_write32(xe2, xe2->pphwsp_addr, 0, 1);
                 break;
             }
             default:
                 break;
         }
 
-        rvvm_info("GuC notify PPHWSP address: 0x%lx (1)", xe2->pphwsp_addr.addr);
-        rvvm_addr_t seqno = 512;
-        xe2_dma_write32(xe2, xe2->pphwsp_addr, 0, 1);
-        xe2_dma_write32(xe2, xe2->pphwsp_addr, seqno, 1);
-        pci_send_irq(xe2->pci_func, 0);
+        // A request expects a fence-matched response; an event does not.
+        if (type == XE2_GUC_HXG_TYPE_REQUEST) {
+            xe2_guc_g2h_response(xe2, fence, 0);
+        }
 
-        head += 1 + num_dwords;
+        head = (head + XE2_GUC_CTB_HDR_LEN + num_dwords) % dwords;
     }
 
-    // Try to trigger everything to pass DMA timeouts.
+    // Publish the updated consumer head.
     xe2_dma_write32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0, head);
-    xe2_dma_write32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 0, head);
 }
 
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
