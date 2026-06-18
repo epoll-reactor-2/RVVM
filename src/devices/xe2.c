@@ -789,7 +789,7 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
         ? xe2_ggtt_translate(xe2, value)
         : (xe2_dma_addr_t) {0};
 
-    if (!xe2_guc_klv_address_key(key) && dma_addr.addr) {
+    if (xe2_guc_klv_address_key(key) && !dma_addr.addr) {
         rvvm_warn("GGTT returned NULL: (dma_addr: 0x%lx, addr: 0x%lx)", dma_addr.addr, value);
         return response;
     }
@@ -1456,11 +1456,10 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
-        case XE2_REG_GUC_DMA_CTRL: {
-            uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_DMA_CTRL, 1);
-            write_uint32_le(data, cmd);
+        case XE2_REG_GUC_DMA_CTRL:
+            // START_DMA (bit 0) reads back 0 once the DMA completes.
+            write_uint32_le(data, 0);
             break;
-        }
         case 0x8800: {
             write_uint32_le(data, 0x1000);
             break;
