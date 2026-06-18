@@ -986,10 +986,10 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
 
                 rvvm_addr_t hwlrca = (rvvm_addr_t) hwlrca_lo
                                    | (rvvm_addr_t) hwlrca_hi << 32;
-                hwlrca &= ~0xFFFULL;
+                hwlrca &= 0x0000FFFFFFFFF000ULL; // GGTT page addr only; strip desc flags + engine class/instance
                 xe2->hwlrca_addr = xe2_ggtt_translate(xe2, hwlrca);
                 rvvm_info("Translated HWLRCA address: 0x%lx -> 0x%lx", hwlrca, xe2->hwlrca_addr.addr);
-                rvvm_addr_t pphwsp_ggtt = hwlrca + 0x4000; // SZ_16K (Ring size)
+                rvvm_addr_t pphwsp_ggtt = hwlrca; // LRCA already points at PPHWSP (first page of the LRC)
                 xe2->pphwsp_addr = xe2_ggtt_translate(xe2, pphwsp_ggtt);
                 rvvm_info("Translated PPHWSP address: 0x%lx -> 0x%lx", pphwsp_ggtt, xe2->pphwsp_addr.addr);
                 break;
