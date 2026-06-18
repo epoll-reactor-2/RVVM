@@ -725,13 +725,13 @@ static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
 
     return (xe2_dma_addr_t) {
         .addr = (pte & 0x0000FFFFFFFFF000ULL) + off,
-        .type = (pte & 2) ? XE2_MEM_SMEM : XE2_MEM_LMEM
+        .type = (pte & 2) ? XE2_MEM_LMEM : XE2_MEM_SMEM
     };
 }
 
 static uint32_t xe2_dma_read32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
 {
-    if (dma.type == XE2_MEM_SMEM) {
+    if (dma.type == XE2_MEM_LMEM) {
         if (dma.addr + off + 4 > XE2_VRAM_SIZE)
             return 0;
         return read_uint32_le(xe2->vram + dma.addr + off);
@@ -743,7 +743,7 @@ static uint32_t xe2_dma_read32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
 
 static void xe2_dma_write32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint32_t msg)
 {
-    if (dma.type == XE2_MEM_SMEM) {
+    if (dma.type == XE2_MEM_LMEM) {
         if (unlikely(dma.addr + off + 4 > XE2_VRAM_SIZE)) {
             rvvm_info("%s: Failed", __FUNCTION__);
             return;
