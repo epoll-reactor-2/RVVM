@@ -1595,7 +1595,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
     }
 
     // [    6.167743] xe 0000:00:01.0: [drm] DMC 0 mmio[0]/0x8f074 incorrect (expected 0x86fc0, current 0x0)
-    if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset <= (XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main))) {
+    if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset + 4 <= XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main)) {
         uint32_t word = read_uint32_le(&xe2->firmware.main[offset - XE2_DMC_FW_MAIN_OFFSET]);
         write_uint32_le(data, word);
     }
@@ -1822,9 +1822,11 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             break;
     }
 
-    if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset <= (XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main))) {
-        memcpy(xe2->firmware.main + xe2->firmware.main_loaded, data, size);
-        xe2->firmware.main_loaded += size;
+    if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset + size <= XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main)) {
+        size_t fw_off = offset - XE2_DMC_FW_MAIN_OFFSET;
+        memcpy(xe2->firmware.main + fw_off, data, size);
+        if (fw_off + size > xe2->firmware.main_loaded)
+            xe2->firmware.main_loaded = fw_off + size;
     }
 
     spin_unlock(&xe2->lock);
