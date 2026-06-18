@@ -28,8 +28,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
-#define xe2_reg_field_get(mask, val)    (((val) & (mask)) >> __builtin_ctz(mask))
-#define xe2_reg_field_prep(mask, val)   (((val) << __builtin_ctz(mask)) & (mask))
+#define xe2_reg_field_get(mask, val)    (((val) & (mask)) >> __builtin_ctzll(mask))
+#define xe2_reg_field_prep(mask, val)   (((val) << __builtin_ctzll(mask)) & (mask))
 
 #define XE2_VENDOR_ID_INTEL                                 0x8086
 #define XE2_DEVICE_ID_ARC_B570_GRAPHICS                     0xE20C
