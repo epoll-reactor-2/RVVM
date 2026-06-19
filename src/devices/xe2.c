@@ -90,6 +90,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_PRIMARY_SPI_ADDRESS                         0x102080
 #define XE2_REG_PRIMARY_SPI_TRIGGER                         0x102040
+// SPI flash window the driver scans for the VBT: it picks the static region,
+// reads the option-ROM base offset, then latches a byte address and reads back
+// the 32-bit flash word. We serve a synthetic VBT image at flash offset 0.
+#define XE2_REG_PRIMARY_SPI_REGIONID                        0x102084
+#define XE2_REG_SPI_STATIC_REGIONS                          0x102090
+#define XE2_REG_OROM_OFFSET                                 0x1020C0
 
 #define XE2_REG_GT_FORCEWAKE_GSC                            0xA618
 #define XE2_REG_GT_FORCEWAKE_ACK_GSC                        0xDF8
@@ -666,6 +672,18 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
 #define DPCD_REG_REV                                        0x00
+// Receiver capability fields read as a 15-byte block from address 0x00. The
+// link rate and lane count must be non-zero or the sink's link config is
+// rejected and the eDP connector is torn down (no fixed mode, no fb0).
+#define DPCD_REG_MAX_LINK_RATE                               0x01
+#define DPCD_REG_MAX_LANE_COUNT                              0x02
+#define DPCD_RECEIVER_CAP_SIZE                               15
+#define DPCD_LINK_RATE_HBR2                                  0x14  // 5.4 Gbps
+#define DPCD_LANE_COUNT_4_ENHANCED                           0x84  // 4 lanes | enhanced framing
+// eDP-specific revision block; eDP 1.3 keeps the sink on the MAX_LINK_RATE path
+// (no separate link-rate table required).
+#define DPCD_REG_EDP_DPCD_REV                                0x700
+#define DPCD_EDP_REV_1_3                                     0x02
 #define DPCD_REG_RECEIVER_ALPM_CAP                          0x2E
 #define DPCD_REG_DSC_SUPPORT                                0x60
 #define DPCD_REG_PSR_SUPPORT                                0x70
@@ -806,6 +824,12 @@ typedef struct {
 
         uint32_t dmc_base;
     } firmware;
+
+    // The DMC loader writes a per-firmware list of (register, value) pairs and
+    // later verifies the registers read back those values. Shadow the two DMC
+    // register windows so those writes stick. These hold no other state.
+    uint8_t dmc_mmio_5f[0x1000]; // 0x5F000..0x5FFFF (pipe DMCs)
+    uint8_t dmc_mmio_8f[0x1000]; // 0x8F000..0x8FFFF (main DMC)
 } xe2_dev_t;
 
 // Encoded configuration:
@@ -848,6 +872,53 @@ static const uint8_t xe2_edid[] = {
     0x4F, 0x45, 0x20, 0x43, 0x51, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xFE,
     0x00, 0x4E, 0x54, 0x31, 0x35, 0x36, 0x46, 0x48, 0x4D, 0x2D, 0x4E, 0x34, 0x31, 0x0A, 0x00, 0x27,
 };
+
+// Synthetic VBT (Video BIOS Table) served over the SPI flash window. The driver
+// needs it to enumerate display outputs; without it port setup is guessed and
+// warns. This minimal image declares one eDP child device on PORT_A (DP A), so
+// the eDP connector is created and paired with the EDID served over AUX.
+// Layout: vbt_header(48) + bdb_header(22) + BDB_GENERAL_DEFINITIONS block. The
+// "$VBT" signature sits 4-byte aligned at flash offset 0 where the driver scans.
+static const uint8_t xe2_vbt[] = {
+    0x24, 0x56, 0x42, 0x54, 0x20, 0x52, 0x56, 0x56, 0x4D, 0x2D, 0x58, 0x45,
+    0x32, 0x20, 0x45, 0x4D, 0x55, 0x4C, 0x00, 0x00, 0x00, 0x01, 0x30, 0x00,
+    0x7A, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x42, 0x49, 0x4F, 0x53, 0x5F, 0x44, 0x41, 0x54, 0x41, 0x5F, 0x42, 0x4C,
+    0x4F, 0x43, 0x4B, 0x20, 0x07, 0x01, 0x16, 0x00, 0x4A, 0x00, 0x02, 0x31,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x08, 0x00, 0xC6, 0x78, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00,
+};
+
+// Return the little-endian 32-bit flash word at the latched SPI address, served
+// from the synthetic VBT image at flash offset 0 (zero-filled beyond its end).
+static uint32_t xe2_spi_read32(xe2_dev_t *xe2)
+{
+    uint32_t addr = xe2->spi_address;
+    uint32_t word = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        if (addr + i < sizeof(xe2_vbt)) {
+            word |= (uint32_t) xe2_vbt[addr + i] << (i * 8);
+        }
+    }
+    return word;
+}
+
+// Map a DMC register-window offset to its backing shadow byte, or NULL if the
+// offset lies outside both windows. Used so DMC loader writes read back.
+static inline uint8_t *xe2_dmc_shadow(xe2_dev_t *xe2, size_t offset)
+{
+    if (offset >= 0x5F000 && offset + 4 <= 0x60000) {
+        return &xe2->dmc_mmio_5f[offset - 0x5F000];
+    }
+    if (offset >= 0x8F000 && offset + 4 <= 0x90000) {
+        return &xe2->dmc_mmio_8f[offset - 0x8F000];
+    }
+    return NULL;
+}
 
 static void xe2_remove(rvvm_mmio_dev_t *dev)
 {
@@ -1499,6 +1570,23 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
     xe2_complete_advanced_contexts(xe2);
 }
 
+// Pack an AUX reply: a leading ACK header byte (0x00) followed by the payload,
+// big-endian within each of the five 32-bit AUX data registers (the same byte
+// order the EDID-over-AUX path uses).
+static inline void xe2_aux_reply(xe2_aux_t *aux, const uint8_t *payload, size_t n)
+{
+    uint8_t buf[20] = {0};
+    for (size_t i = 0; i < n && i + 1 < sizeof(buf); i++) {
+        buf[1 + i] = payload[i];
+    }
+    for (size_t d = 0; d < 5; d++) {
+        aux->data[d] = (uint32_t) buf[d * 4 + 0] << 24
+                     | (uint32_t) buf[d * 4 + 1] << 16
+                     | (uint32_t) buf[d * 4 + 2] <<  8
+                     | (uint32_t) buf[d * 4 + 3];
+    }
+}
+
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
 {
     // Outgoing AUX request layout:
@@ -1519,9 +1607,24 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
     //
     // 16 bytes total.
     switch (cmd) {
-        case DPCD_REG_REV:
-            aux->data[0] = 0x13 << 16; // DPCD rev 13
+        case DPCD_REG_REV: {
+            // Full receiver capability block. The driver reads it in one go and
+            // rejects the link (tearing down the eDP connector) unless the rev,
+            // link rate and lane count are all non-zero.
+            uint8_t caps[DPCD_RECEIVER_CAP_SIZE] = {0};
+            caps[DPCD_REG_REV]            = 0x12; // DPCD rev 1.2
+            caps[DPCD_REG_MAX_LINK_RATE]  = DPCD_LINK_RATE_HBR2;
+            caps[DPCD_REG_MAX_LANE_COUNT] = DPCD_LANE_COUNT_4_ENHANCED;
+            xe2_aux_reply(aux, caps, sizeof(caps));
             break;
+        }
+        case DPCD_REG_EDP_DPCD_REV: {
+            // eDP capability block; rev 1.3 keeps the sink on the MAX_LINK_RATE
+            // path, so no separate supported-link-rate table is needed.
+            uint8_t edp = DPCD_EDP_REV_1_3;
+            xe2_aux_reply(aux, &edp, 1);
+            break;
+        }
         case DPCD_REG_RECEIVER_ALPM_CAP:
             aux->data[0] = 0x01 << 16; // DP_ALPM_CAP
             break;
@@ -1711,10 +1814,18 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
 
         case XE2_REG_PRIMARY_SPI_TRIGGER:
-            write_uint32_le(data, xe2->spi_trigger);
+            write_uint32_le(data, xe2_spi_read32(xe2));
             break;
         case XE2_REG_PRIMARY_SPI_ADDRESS:
             write_uint32_le(data, xe2->spi_address);
+            break;
+        case XE2_REG_SPI_STATIC_REGIONS:
+            // Static region id the driver echoes back when selecting the region.
+            write_uint32_le(data, 0);
+            break;
+        case XE2_REG_OROM_OFFSET:
+            // Option-ROM base within flash; our VBT image sits at offset 0.
+            write_uint32_le(data, 0);
             break;
         case XE2_REG_GT_FORCEWAKE_ACK_GSC:
             write_uint32_le(data, xe2->forcewake_gsc);
@@ -2145,10 +2256,17 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
     }
 
-    // [    6.167743] xe 0000:00:01.0: [drm] DMC 0 mmio[0]/0x8f074 incorrect (expected 0x86fc0, current 0x0)
     if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset + 4 <= XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main)) {
         uint32_t word = read_uint32_le(&xe2->firmware.main[offset - XE2_DMC_FW_MAIN_OFFSET]);
         write_uint32_le(data, word);
+    }
+
+    // Replay the DMC loader's register writes so its post-load verification of
+    // each mmio[i] entry matches (avoids the "DMC N mmio[i]/0xADDR incorrect"
+    // assertion). These windows hold no other emulated state.
+    uint8_t *dmc_shadow = xe2_dmc_shadow(xe2, offset);
+    if (dmc_shadow != NULL) {
+        write_uint32_le(data, read_uint32_le(dmc_shadow));
     }
 
     spin_unlock(&xe2->lock);
@@ -2200,6 +2318,9 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             break;
         case XE2_REG_PRIMARY_SPI_ADDRESS:
             xe2->spi_address = read_uint32_le(data);
+            break;
+        case XE2_REG_PRIMARY_SPI_REGIONID:
+            // Region selection only; our flash serves a single VBT image.
             break;
 
         case XE2_REG_DPA_AUX_CH_CTL:
@@ -2378,6 +2499,12 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         memcpy(xe2->firmware.main + fw_off, data, size);
         if (fw_off + size > xe2->firmware.main_loaded)
             xe2->firmware.main_loaded = fw_off + size;
+    }
+
+    // Latch DMC loader register writes so they read back during verification.
+    uint8_t *dmc_shadow = xe2_dmc_shadow(xe2, offset);
+    if (dmc_shadow != NULL && size <= 4) {
+        memcpy(dmc_shadow, data, size);
     }
 
     spin_unlock(&xe2->lock);
