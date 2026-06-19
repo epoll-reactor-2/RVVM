@@ -306,6 +306,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_HUC_LOADING_AGENT_GUC_MASK                  xe2_reg_bit(1)
 #define XE2_REG_GUC_WOPCM_OFFSET_VALID                      xe2_reg_bit(0)
 
+// HuC kernel load/auth status. The driver triggers authentication via the GuC
+// and polls this register for the success bit before marking HuC running.
+#define XE2_REG_HUC_KERNEL_LOAD_INFO                        0xC1DC
+#define XE2_REG_HUC_KERNEL_LOAD_INFO_SUCCESSFUL             xe2_reg_bit(0)
+
 // WOPCM (Write once protected content memory)
 // https://docs.kernel.org/gpu/xe/xe_firmware.html
 #define XE2_REG_GUC_WOPCM_SIZE                              0xC050
@@ -759,6 +764,10 @@ typedef struct {
         // so the driver's GuC-PC start handshake completes.
         xe2_dma_addr_t slpc_data_addr;
         bool           slpc_data_valid;
+
+        // Latched once the driver asks the GuC to authenticate the HuC firmware.
+        // Surfaced through HUC_KERNEL_LOAD_INFO, which the driver polls.
+        bool           huc_authenticated;
     } guc;
 
     // Page table entries.
@@ -1430,6 +1439,11 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 xe2_slpc_request(xe2, msg);
                 break;
             }
+            case XE2_GUC_ACTION_AUTHENTICATE_HUC:
+                // The GuC verifies the HuC firmware image; report success so the
+                // driver's HUC_KERNEL_LOAD_INFO poll sees the firmware verified.
+                xe2->guc.huc_authenticated = true;
+                break;
             default:
                 break;
         }
@@ -1657,6 +1671,11 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         case XE2_REG_RPNSWREQ:
             write_uint32_le(data, xe2_reg_field_prep(XE2_REG_RPNSWREQ_RATIO_MASK, XE2_GT_FREQ_RPE_RATIO));
+            break;
+
+        case XE2_REG_HUC_KERNEL_LOAD_INFO:
+            write_uint32_le(data, xe2->guc.huc_authenticated
+                ? XE2_REG_HUC_KERNEL_LOAD_INFO_SUCCESSFUL : 0);
             break;
 
         case XE2_REG_PRIMARY_SPI_TRIGGER:
