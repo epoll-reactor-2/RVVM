@@ -431,6 +431,16 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_ACTION_AUTHENTICATE_HUC                     0x4000
 #define XE2_GUC_ACTION_GET_HWCONFIG                         0x4100
 #define XE2_GUC_ACTION_REGISTER_CONTEXT                     0x4502
+
+// hwconfig table attributes (key/length/value triplets). The driver reads the
+// physical slice/subslice layout to derive register-steering targets; absent
+// these keys it falls back to hardcoded values and logs an error. The counts
+// describe the steering grid (not enabled DSS), and reproduce the per-group DSS
+// count this Xe2 part otherwise assumes: ceil(subslices / slices) = 4.
+#define XE2_HWCONFIG_ATTR_MAX_SLICES                        1
+#define XE2_HWCONFIG_ATTR_MAX_SUBSLICES                     70
+#define XE2_HWCONFIG_MAX_SLICES_VAL                         4
+#define XE2_HWCONFIG_MAX_SUBSLICES_VAL                      16
 #define XE2_GUC_ACTION_DEREGISTER_CONTEXT                   0x4503
 #define XE2_GUC_ACTION_REGISTER_COMMAND_TRANSPORT_BUFFER    0x4505
 #define XE2_GUC_ACTION_DEREGISTER_COMMAND_TRANSPORT_BUFFER  0x4506
@@ -1019,6 +1029,26 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
     return response;
 }
 
+// Emit the hwconfig table as key/length/value triplets into the supplied buffer
+// and return its size in bytes. The driver first queries the size (address 0),
+// then re-requests with a buffer to copy into.
+static uint32_t xe2_guc_emit_hwconfig(xe2_dev_t *xe2, uint64_t ggtt_addr)
+{
+    static const uint32_t table[] = {
+        XE2_HWCONFIG_ATTR_MAX_SLICES,    1, XE2_HWCONFIG_MAX_SLICES_VAL,
+        XE2_HWCONFIG_ATTR_MAX_SUBSLICES, 1, XE2_HWCONFIG_MAX_SUBSLICES_VAL,
+    };
+
+    if (ggtt_addr != 0) {
+        xe2_dma_addr_t dst = xe2_ggtt_translate(xe2, ggtt_addr);
+        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+            xe2_dma_write32(xe2, dst, i * 4, table[i]);
+        }
+    }
+
+    return sizeof(table);
+}
+
 // GuC commands pipeline:
 //
 // write (GUC FW SW 1): 32 bit header
@@ -1036,9 +1066,11 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
     rvvm_info("GUC action (value lo):     %08x", h2g[3]);
 
     switch (h2g[0]) {
-        case XE2_GUC_ACTION_GET_HWCONFIG: // 0x4100
-            arg = 0x1000;
+        case XE2_GUC_ACTION_GET_HWCONFIG: { // 0x4100
+            uint64_t ggtt = (uint64_t) h2g[1] | (uint64_t) h2g[2] << 32;
+            arg = xe2_guc_emit_hwconfig(xe2, ggtt);
             break;
+        }
         case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: { // 0x508
             arg = xe2_guc_action_self_cfg(xe2, h2g);
             break;
