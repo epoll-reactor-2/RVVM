@@ -174,6 +174,19 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_DE_PIPE_IMR(pipe)                           (0x44404 + (0x10 * (pipe)))
 #define XE2_REG_DE_PIPE_IIR(pipe)                           (0x44408 + (0x10 * (pipe)))
 #define XE2_REG_DE_PIPE_IER(pipe)                           (0x4440C + (0x10 * (pipe)))
+// Bits within DE_PIPE_{ISR,IMR,IIR,IER}.
+#define XE2_REG_DE_PIPE_VBLANK_MASK                         xe2_reg_bit(0)
+#define XE2_REG_DE_PIPE_FLIP_DONE_MASK                      xe2_reg_bit(3)
+
+#define XE2_PIPE_COUNT                                      4
+
+// Per-pipe frame counter. Pipe A = 0x70040, stride 0x1000 between pipes.
+#define XE2_REG_PIPE_FRMCOUNT(pipe)                         (0x70040 + (0x1000 * (pipe)))
+
+// Top-level display interrupt control.
+#define XE2_REG_GEN11_DISPLAY_INT_CTL                       0x44200
+#define XE2_REG_GEN11_DISPLAY_INT_CTL_ENABLE_MASK           xe2_reg_bit(31)
+#define XE2_REG_GEN11_DISPLAY_INT_CTL_PIPE_MASK(pipe)       xe2_reg_bit(16 + (pipe))
 
 #define XE2_PIPE_A                                          0x0
 #define XE2_PIPE_B                                          0x1
@@ -211,6 +224,50 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_DPX_AUX_CH_CTL_BIT_CLOCK_2X_MASK            xe2_reg_genmask(10, 0)
 #define XE2_REG_DPX_AUX_CH_CTL_FW_SYNC_PULSE_SKL_MASK       xe2_reg_genmask(9, 5)
 #define XE2_REG_DPX_AUX_CH_CTL_SYNC_PUSLE_SKL_MASK          xe2_reg_genmask(4, 0)
+
+// Cx0 PHY per-lane message bus (PORT_A). The Cx0 PHYs are not directly
+// addressable over MMIO: the host issues commands to a per-lane message
+// bus and polls a status word for the PHY response.
+#define XE2_REG_CX0_M2P_MSGBUS_CTL(lane)                    (0x64040 + 4 * (lane))
+#define XE2_REG_CX0_P2M_MSGBUS_STATUS(lane)                 (0x64048 + 4 * (lane))
+#define XE2_CX0_LANE_TOTAL                                  2
+
+// Host -> PHY command word (M2P_MSGBUS_CTL).
+#define XE2_REG_CX0_M2P_TRANSACTION_PENDING_MASK            xe2_reg_bit(31)
+#define XE2_REG_CX0_M2P_COMMAND_TYPE_MASK                   xe2_reg_genmask(30, 27)
+#define XE2_REG_CX0_M2P_DATA_MASK                           xe2_reg_genmask(23, 16)
+#define XE2_REG_CX0_M2P_TRANSACTION_RESET_MASK              xe2_reg_bit(15)
+#define XE2_REG_CX0_M2P_ADDRESS_MASK                        xe2_reg_genmask(11, 0)
+
+#define XE2_CX0_M2P_COMMAND_WRITE_UNCOMMITTED               0x1
+#define XE2_CX0_M2P_COMMAND_WRITE_COMMITTED                 0x2
+#define XE2_CX0_M2P_COMMAND_READ                            0x3
+
+// PHY -> host status word (P2M_MSGBUS_STATUS).
+#define XE2_REG_CX0_P2M_RESPONSE_READY_MASK                 xe2_reg_bit(31)
+#define XE2_REG_CX0_P2M_COMMAND_TYPE_MASK                   xe2_reg_genmask(30, 27)
+#define XE2_REG_CX0_P2M_DATA_MASK                           xe2_reg_genmask(23, 16)
+#define XE2_REG_CX0_P2M_ERROR_SET_MASK                      xe2_reg_bit(15)
+
+#define XE2_CX0_P2M_COMMAND_READ_ACK                        0x4
+#define XE2_CX0_P2M_COMMAND_WRITE_ACK                       0x5
+
+// Indirect 16-bit SRAM access through special Cx0 register addresses. The
+// host stages the address/data bytes, then a committed write to *_DATA_L
+// performs the SRAM store; reads of *_DATA_H/L return the latched word.
+#define XE2_CX0_REG_SRAM_WR_ADDRESS_H                       0xC03
+#define XE2_CX0_REG_SRAM_WR_ADDRESS_L                       0xC02
+#define XE2_CX0_REG_SRAM_WR_DATA_H                          0xC05
+#define XE2_CX0_REG_SRAM_WR_DATA_L                          0xC04
+#define XE2_CX0_REG_SRAM_RD_ADDRESS_H                       0xC07
+#define XE2_CX0_REG_SRAM_RD_ADDRESS_L                       0xC06
+#define XE2_CX0_REG_SRAM_RD_DATA_H                          0xC09
+#define XE2_CX0_REG_SRAM_RD_DATA_L                          0xC08
+
+// XELPDP_PORT_CLOCK_CTL (PORT_A). PLL request/ack handshake, per lane.
+#define XE2_REG_XELPDP_PORT_CLOCK_CTL                       0x640E0
+#define XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_REQUEST_MASK(lane) xe2_reg_bit(31 - 4 * (lane))
+#define XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_ACK_MASK(lane)     xe2_reg_bit(30 - 4 * (lane))
 
 #define XE2_REG_PP_STATUS                                   0x61200 // Panel power sequence
 #define XE2_REG_PP_ON_MASK                                  xe2_reg_bit(31)
@@ -604,6 +661,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_IRQ_MASTER_BIT                                  (1U << 31)
 #define XE2_IRQ_DG1_TILE0_BIT                               (1U << 0)
 #define XE2_IRQ_GT_DW0_BIT                                  (1U << 0)
+#define XE2_IRQ_DISPLAY_BIT                                 (1U << 16) // GFX_MSTR_IRQ display source
 #define XE2_IRQ_INTR_GUC_BIT                                (1U << 25)
 #define XE2_IRQ_INTR_DATA_VALID                             (1U << 31)
 #define XE2_IRQ_ENGINE_CLASS_OTHER                          4
@@ -714,6 +772,20 @@ typedef struct {
     uint32_t edid_written;  // Internal variable.
 } xe2_aux_t;
 
+// Cx0 PHY message-bus shadow for a single lane. The host writes 8-bit Cx0
+// registers (addressed by a 12-bit address) and reaches a 16-bit SRAM
+// indirectly through special register addresses. We mirror back whatever the
+// host wrote so post-modeset register verification reads see the right value.
+typedef struct {
+    uint32_t m2p;             // Last M2P_MSGBUS_CTL value (PENDING cleared).
+    uint32_t p2m;             // P2M_MSGBUS_STATUS value (response to last cmd).
+    uint8_t  regs[0x1000];    // Cx0 register file (indexed by 12-bit address).
+    uint16_t sram[0x10000];   // Indirect 16-bit SRAM.
+    uint16_t sram_wr_addr;    // Staged SRAM write address (H<<8 | L).
+    uint16_t sram_wr_data;    // Staged SRAM write data (H<<8 | L).
+    uint16_t sram_rd_addr;    // Latched SRAM read address.
+} xe2_cx0_lane_t;
+
 #define XE2_MEM_SMEM        0 // System memory (accessed via DMA)
 #define XE2_MEM_LMEM        1 // Local memory (accessed via VRAM)
 
@@ -743,6 +815,9 @@ typedef struct {
     uint32_t    wopcm_locked;
 
     xe2_aux_t   aux[1]; // We assume one display with one AUX channel.
+
+    xe2_cx0_lane_t cx0[XE2_CX0_LANE_TOTAL]; // Cx0 PHY per-lane message bus.
+    uint32_t    port_clock_ctl;             // XELPDP_PORT_CLOCK_CTL (PORT_A).
 
     uint32_t    spi_address;
     uint32_t    spi_trigger;
@@ -797,6 +872,18 @@ typedef struct {
         // Surfaced through HUC_KERNEL_LOAD_INFO, which the driver polls.
         bool           huc_authenticated;
     } guc;
+
+    struct {
+        uint32_t int_ctl;            // GEN11_DISPLAY_INT_CTL (enable bit).
+
+        // Per-pipe Display-Engine interrupt registers.
+        uint32_t imr[XE2_PIPE_COUNT]; // 1 = masked.
+        uint32_t ier[XE2_PIPE_COUNT]; // 1 = enabled.
+        uint32_t iir[XE2_PIPE_COUNT]; // Pending bits (write-1-to-clear).
+        uint32_t isr[XE2_PIPE_COUNT]; // Raw status read-back storage.
+
+        uint32_t frmcount[XE2_PIPE_COUNT]; // Per-pipe frame counter.
+    } display;
 
     // Page table entries.
     uint64_t    *ggtt_pte;
@@ -929,9 +1016,61 @@ static void xe2_remove(rvvm_mmio_dev_t *dev)
     vma_free(xe2->vram, XE2_VRAM_SIZE);
 }
 
+// Bits of a pipe's DE_PIPE interrupt that are currently live, i.e. pending,
+// enabled and not masked.
+static inline uint32_t xe2_display_pipe_live(xe2_dev_t *xe2, uint32_t pipe)
+{
+    return xe2->display.iir[pipe] & xe2->display.ier[pipe] & ~xe2->display.imr[pipe];
+}
+
+// True if any pipe has a live (pending, enabled, unmasked) interrupt bit.
+static inline bool xe2_display_pending(xe2_dev_t *xe2)
+{
+    for (uint32_t pipe = 0; pipe < XE2_PIPE_COUNT; pipe++) {
+        if (xe2_display_pipe_live(xe2, pipe))
+            return true;
+    }
+    return false;
+}
+
+// Periodic display refresh callback, invoked by RVVM at roughly 60 Hz. For
+// every pipe with vblank enabled, advance the frame counter and raise its
+// vblank interrupt; raise flip-done too when that source is enabled, which
+// completes any armed page-flip. If any pipe becomes live, fire the MSI.
+static void xe2_update(rvvm_mmio_dev_t *dev)
+{
+    xe2_dev_t *xe2 = dev->data;
+    spin_lock(&xe2->lock);
+
+    bool raise = false;
+    for (uint32_t pipe = 0; pipe < XE2_PIPE_COUNT; pipe++) {
+        bool vblank_en = (xe2->display.ier[pipe] & XE2_REG_DE_PIPE_VBLANK_MASK)
+                      && !(xe2->display.imr[pipe] & XE2_REG_DE_PIPE_VBLANK_MASK);
+        if (!vblank_en)
+            continue;
+
+        xe2->display.frmcount[pipe]++;
+        xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_VBLANK_MASK;
+
+        bool flip_done_en = (xe2->display.ier[pipe] & XE2_REG_DE_PIPE_FLIP_DONE_MASK)
+                         && !(xe2->display.imr[pipe] & XE2_REG_DE_PIPE_FLIP_DONE_MASK);
+        if (flip_done_en)
+            xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_FLIP_DONE_MASK;
+
+        if (xe2_display_pipe_live(xe2, pipe))
+            raise = true;
+    }
+
+    if (raise)
+        pci_send_irq(xe2->pci_func, 0);
+
+    spin_unlock(&xe2->lock);
+}
+
 static rvvm_mmio_type_t xe2_type = {
     .name = "xe2",
     .remove = xe2_remove,
+    .update = xe2_update,
 };
 
 static inline void xe2_ggtt_write_pte(xe2_dev_t *xe2, uint64_t index, uint64_t pte)
@@ -1699,6 +1838,93 @@ static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
     xe2_dpcd_aux_config(address, request, payload_size, aux);
 }
 
+// Apply a committed Cx0 register write that targets the indirect SRAM access
+// registers. Staging registers latch their bytes; a committed write to the
+// write-data low byte performs the actual 16-bit SRAM store.
+static inline void xe2_cx0_sram_write(xe2_cx0_lane_t *lane, uint32_t address, uint8_t value)
+{
+    switch (address) {
+        case XE2_CX0_REG_SRAM_WR_ADDRESS_H:
+            lane->sram_wr_addr = (lane->sram_wr_addr & 0x00FF) | ((uint16_t)value << 8);
+            break;
+        case XE2_CX0_REG_SRAM_WR_ADDRESS_L:
+            lane->sram_wr_addr = (lane->sram_wr_addr & 0xFF00) | value;
+            break;
+        case XE2_CX0_REG_SRAM_WR_DATA_H:
+            lane->sram_wr_data = (lane->sram_wr_data & 0x00FF) | ((uint16_t)value << 8);
+            break;
+        case XE2_CX0_REG_SRAM_WR_DATA_L:
+            // Committing the low byte performs the 16-bit SRAM store.
+            lane->sram_wr_data = (lane->sram_wr_data & 0xFF00) | value;
+            lane->sram[lane->sram_wr_addr] = lane->sram_wr_data;
+            break;
+        case XE2_CX0_REG_SRAM_RD_ADDRESS_H:
+            lane->sram_rd_addr = (lane->sram_rd_addr & 0x00FF) | ((uint16_t)value << 8);
+            break;
+        case XE2_CX0_REG_SRAM_RD_ADDRESS_L:
+            lane->sram_rd_addr = (lane->sram_rd_addr & 0xFF00) | value;
+            break;
+        default:
+            break;
+    }
+}
+
+// Return the byte a Cx0 register read should yield. The SRAM read-data
+// registers expose the high/low byte of the latched 16-bit SRAM word; all
+// other registers read back from the Cx0 register file.
+static inline uint8_t xe2_cx0_reg_read(xe2_cx0_lane_t *lane, uint32_t address)
+{
+    switch (address) {
+        case XE2_CX0_REG_SRAM_RD_DATA_H:
+            return lane->sram[lane->sram_rd_addr] >> 8;
+        case XE2_CX0_REG_SRAM_RD_DATA_L:
+            return lane->sram[lane->sram_rd_addr] & 0xFF;
+        default:
+            return lane->regs[address & 0xFFF];
+    }
+}
+
+// Emulate a single Cx0 message-bus transaction. Called when the host writes
+// M2P_MSGBUS_CTL with TRANSACTION_PENDING set. The pending bit is cleared in
+// the stored M2P value so the host's poll-for-clear succeeds, and the matching
+// P2M response is staged for committed/read commands.
+static inline void xe2_cx0_msgbus_transaction(xe2_cx0_lane_t *lane, uint32_t cmd)
+{
+    if (cmd & XE2_REG_CX0_M2P_TRANSACTION_RESET_MASK) {
+        // Bus reset is self-clearing: read M2P/P2M back as cleared.
+        lane->m2p = 0;
+        lane->p2m = 0;
+        return;
+    }
+
+    uint32_t command = xe2_reg_field_get(XE2_REG_CX0_M2P_COMMAND_TYPE_MASK, cmd);
+    uint32_t address = xe2_reg_field_get(XE2_REG_CX0_M2P_ADDRESS_MASK, cmd);
+    uint8_t  payload = xe2_reg_field_get(XE2_REG_CX0_M2P_DATA_MASK, cmd);
+
+    // Store the command word with PENDING cleared so the host poll succeeds.
+    lane->m2p = cmd & ~XE2_REG_CX0_M2P_TRANSACTION_PENDING_MASK;
+
+    switch (command) {
+        case XE2_CX0_M2P_COMMAND_WRITE_UNCOMMITTED:
+            lane->regs[address & 0xFFF] = payload;
+            xe2_cx0_sram_write(lane, address, payload);
+            break;
+        case XE2_CX0_M2P_COMMAND_WRITE_COMMITTED:
+            lane->regs[address & 0xFFF] = payload;
+            xe2_cx0_sram_write(lane, address, payload);
+            lane->p2m = XE2_REG_CX0_P2M_RESPONSE_READY_MASK
+                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_COMMAND_TYPE_MASK, XE2_CX0_P2M_COMMAND_WRITE_ACK);
+            break;
+        case XE2_CX0_M2P_COMMAND_READ:
+            lane->p2m = XE2_REG_CX0_P2M_RESPONSE_READY_MASK
+                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_COMMAND_TYPE_MASK, XE2_CX0_P2M_COMMAND_READ_ACK)
+                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_DATA_MASK, xe2_cx0_reg_read(lane, address));
+            break;
+        default:
+            break;
+    }
+}
+
 static inline bool xe2_skip_mmio_range(size_t offset)
 {
     bool skip = 0;
@@ -1921,6 +2147,24 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_HSW_POWER_WELL_CTL4:
             write_uint32_le(data, 0xFFFFFFFF);
             break;
+
+        // Cx0 PHY message bus: return the stored response/command words.
+        case XE2_REG_CX0_M2P_MSGBUS_CTL(0):
+        case XE2_REG_CX0_M2P_MSGBUS_CTL(1): {
+            size_t lane = (offset - XE2_REG_CX0_M2P_MSGBUS_CTL(0)) / 4;
+            write_uint32_le(data, xe2->cx0[lane].m2p);
+            break;
+        }
+        case XE2_REG_CX0_P2M_MSGBUS_STATUS(0):
+        case XE2_REG_CX0_P2M_MSGBUS_STATUS(1): {
+            size_t lane = (offset - XE2_REG_CX0_P2M_MSGBUS_STATUS(0)) / 4;
+            write_uint32_le(data, xe2->cx0[lane].p2m);
+            break;
+        }
+        case XE2_REG_XELPDP_PORT_CLOCK_CTL:
+            write_uint32_le(data, xe2->port_clock_ctl);
+            break;
+
         case XE2_REG_BXT_DE_PLL_ENABLE: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_BXT_DE_PLL_ENABLE_LOCK_MASK, xe2->pll_enable);
             write_uint32_le(data, cmd);
@@ -2209,19 +2453,70 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, 0);
             break;
 
-        // GuC-to-host interrupt delivery chain (register-based, MSI-X vector 0).
-        // The handler walks DG1_MSTR_TILE_INTR -> GFX_MSTR_IRQ -> GT_INTR_DW0 ->
-        // INTR_IDENTITY_REG0; we report a pending GuC source (class OTHER,
-        // instance GUC) through it. The pending latch clears once the identity
-        // register is consumed.
+        // Top-level display interrupt control. Report enable bit (if set by
+        // driver) plus a per-pipe master bit for every pipe with a live IIR.
+        case XE2_REG_GEN11_DISPLAY_INT_CTL: {
+            uint32_t cmd = xe2->display.int_ctl & XE2_REG_GEN11_DISPLAY_INT_CTL_ENABLE_MASK;
+            for (uint32_t pipe = 0; pipe < XE2_PIPE_COUNT; pipe++) {
+                if (xe2_display_pipe_live(xe2, pipe))
+                    cmd |= XE2_REG_GEN11_DISPLAY_INT_CTL_PIPE_MASK(pipe);
+            }
+            write_uint32_le(data, cmd);
+            break;
+        }
+
+        // Per-pipe Display-Engine interrupt registers.
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_D):
+            write_uint32_le(data, xe2->display.imr[(offset - XE2_REG_DE_PIPE_IMR(0)) / 0x10]);
+            break;
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_D):
+            write_uint32_le(data, xe2->display.ier[(offset - XE2_REG_DE_PIPE_IER(0)) / 0x10]);
+            break;
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_D):
+            write_uint32_le(data, xe2->display.isr[(offset - XE2_REG_DE_PIPE_ISR(0)) / 0x10]);
+            break;
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_D):
+            write_uint32_le(data, xe2->display.iir[(offset - XE2_REG_DE_PIPE_IIR(0)) / 0x10]);
+            break;
+        case XE2_REG_PIPE_FRMCOUNT(XE2_PIPE_A):
+        case XE2_REG_PIPE_FRMCOUNT(XE2_PIPE_B):
+        case XE2_REG_PIPE_FRMCOUNT(XE2_PIPE_C):
+        case XE2_REG_PIPE_FRMCOUNT(XE2_PIPE_D):
+            write_uint32_le(data, xe2->display.frmcount[(offset - XE2_REG_PIPE_FRMCOUNT(0)) / 0x1000]);
+            break;
+
+        // GuC-to-host and display interrupt delivery chain (register-based, MSI
+        // vector 0). The handler walks DG1_MSTR_TILE_INTR -> GFX_MSTR_IRQ -> the
+        // GuC GT path (GT_INTR_DW0 -> INTR_IDENTITY_REG0) or the display path
+        // (GEN11_DISPLAY_INT_CTL -> DE_PIPE). Both the GuC latch and a live
+        // display pipe contribute to the master bits.
         case XE2_REG_DG1_MSTR_TILE_INTR:
-            write_uint32_le(data, xe2->guc.irq_pending
+            write_uint32_le(data, (xe2->guc.irq_pending || xe2_display_pending(xe2))
                 ? (XE2_IRQ_MASTER_BIT | XE2_IRQ_DG1_TILE0_BIT) : 0);
             break;
-        case XE2_REG_GFX_MSTR_IRQ:
-            write_uint32_le(data, xe2->guc.irq_pending
-                ? (XE2_IRQ_MASTER_BIT | XE2_IRQ_GT_DW0_BIT) : 0);
+        case XE2_REG_GFX_MSTR_IRQ: {
+            uint32_t cmd = 0;
+            if (xe2->guc.irq_pending || xe2_display_pending(xe2))
+                cmd |= XE2_IRQ_MASTER_BIT;
+            if (xe2->guc.irq_pending)
+                cmd |= XE2_IRQ_GT_DW0_BIT;
+            if (xe2_display_pending(xe2))
+                cmd |= XE2_IRQ_DISPLAY_BIT;
+            write_uint32_le(data, cmd);
             break;
+        }
         case XE2_REG_GT_INTR_DW0:
             write_uint32_le(data, xe2->guc.irq_pending ? XE2_IRQ_INTR_GUC_BIT : 0);
             break;
@@ -2335,6 +2630,70 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             size_t index = XE2_REG_DPX_AUX_CH_DATA_INDEX(offset);
             xe2->aux[0].data[index] = read_uint32_le(data);
             xe2->aux[0].message_size = ((index + 1) * 4);
+            break;
+        }
+
+        // Top-level display interrupt control: plain read-back storage.
+        case XE2_REG_GEN11_DISPLAY_INT_CTL:
+            xe2->display.int_ctl = read_uint32_le(data);
+            break;
+
+        // Per-pipe Display-Engine interrupt registers.
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IMR(XE2_PIPE_D):
+            xe2->display.imr[(offset - XE2_REG_DE_PIPE_IMR(0)) / 0x10] = read_uint32_le(data);
+            break;
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IER(XE2_PIPE_D):
+            xe2->display.ier[(offset - XE2_REG_DE_PIPE_IER(0)) / 0x10] = read_uint32_le(data);
+            break;
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_ISR(XE2_PIPE_D):
+            xe2->display.isr[(offset - XE2_REG_DE_PIPE_ISR(0)) / 0x10] = read_uint32_le(data);
+            break;
+        // IIR is write-1-to-clear: clear every written bit.
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_A):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_B):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_C):
+        case XE2_REG_DE_PIPE_IIR(XE2_PIPE_D):
+            xe2->display.iir[(offset - XE2_REG_DE_PIPE_IIR(0)) / 0x10] &= ~read_uint32_le(data);
+            break;
+
+        // Cx0 PHY message bus: starting a command runs the transaction.
+        case XE2_REG_CX0_M2P_MSGBUS_CTL(0):
+        case XE2_REG_CX0_M2P_MSGBUS_CTL(1): {
+            size_t   lane = (offset - XE2_REG_CX0_M2P_MSGBUS_CTL(0)) / 4;
+            uint32_t cmd  = read_uint32_le(data);
+            xe2->cx0[lane].m2p = cmd;
+            if (cmd & XE2_REG_CX0_M2P_TRANSACTION_PENDING_MASK)
+                xe2_cx0_msgbus_transaction(&xe2->cx0[lane], cmd);
+            break;
+        }
+        case XE2_REG_CX0_P2M_MSGBUS_STATUS(0):
+        case XE2_REG_CX0_P2M_MSGBUS_STATUS(1): {
+            size_t   lane = (offset - XE2_REG_CX0_P2M_MSGBUS_STATUS(0)) / 4;
+            uint32_t cmd  = read_uint32_le(data);
+            // Write-1-to-clear RESPONSE_READY and ERROR_SET.
+            xe2->cx0[lane].p2m &= ~(cmd & (XE2_REG_CX0_P2M_RESPONSE_READY_MASK
+                                         | XE2_REG_CX0_P2M_ERROR_SET_MASK));
+            break;
+        }
+        case XE2_REG_XELPDP_PORT_CLOCK_CTL: {
+            uint32_t cmd = read_uint32_le(data);
+            // Mirror each set PLL_REQUEST bit into its PLL_ACK bit on readback.
+            for (size_t lane = 0; lane < XE2_CX0_LANE_TOTAL; lane++) {
+                if (cmd & XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_REQUEST_MASK(lane))
+                    cmd |= XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_ACK_MASK(lane);
+                else
+                    cmd &= ~XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_ACK_MASK(lane);
+            }
+            xe2->port_clock_ctl = cmd;
             break;
         }
 
