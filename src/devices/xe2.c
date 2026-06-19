@@ -37,6 +37,26 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_FLUSH_PENDING                               0x130030 // Dummy register
 
+// GT frequency caps and status. The driver decodes the requested/efficient/
+// minimum/maximum ratios from these to bring up dynamic frequency control;
+// ratios are in units of 50/3 MHz. Cap values reflect a Battlemage B570.
+#define XE2_REG_RP_STATE_CAP                                0x138000
+#define XE2_REG_RP_STATE_CAP_RP0_MASK                       xe2_reg_genmask(8, 0)
+#define XE2_REG_RP_STATE_CAP_RPN_MASK                       xe2_reg_genmask(24, 16)
+#define XE2_REG_GT_RPE_FREQUENCY                            0x13800C
+#define XE2_REG_GT_RPE_FREQUENCY_RPE_MASK                   xe2_reg_genmask(8, 0)
+#define XE2_REG_GT_PERF_STATUS                              0x1381B4
+#define XE2_REG_GT_PERF_STATUS_CAGF_MASK                    xe2_reg_genmask(19, 11)
+#define XE2_REG_RPNSWREQ                                    0xA008
+#define XE2_REG_RPNSWREQ_RATIO_MASK                         xe2_reg_genmask(31, 23)
+#define XE2_REG_RP_CONTROL                                  0xA024
+
+// Battlemage B570 frequency ratios (raw units of 50/3 MHz): RP0 2500 MHz,
+// RPe 2000 MHz, RPn 300 MHz.
+#define XE2_GT_FREQ_RP0_RATIO                               150
+#define XE2_GT_FREQ_RPE_RATIO                               120
+#define XE2_GT_FREQ_RPN_RATIO                               18
+
 #define XE2_REG_PCODE_MAILBOX                               0x138124
 #define XE2_REG_PCODE_MAILBOX_READY_MASK                    xe2_reg_bit(31)
 #define XE2_REG_PCODE_MAILBOX_MB_PARAM2_MASK                xe2_reg_genmask(23, 16)
@@ -388,6 +408,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_ACTION_ENTER_S_STATE                        0x501
 #define XE2_GUC_ACTION_EXIT_S_STATE                         0x502
 #define XE2_GUC_ACTION_GLOBAL_SCHED_POLICY_CHANGE           0x506
+#define XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST             0x3003
+#define XE2_GUC_ACTION_HOST2GUC_SETUP_PC_GUCRC              0x3004
 #define XE2_GUC_ACTION_HOST2GUC_SELF_CFG                    0x508
 #define XE2_GUC_ACTION_UPDATE_SCHEDULING_POLICIES_KLV       0x509
 #define XE2_GUC_ACTION_SCHED_CONTEXT                        0x1000
@@ -430,6 +452,29 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_ACTION_NOTIFY_EXCEPTION                     0x8005
 #define XE2_GUC_ACTION_TEST_G2G_SEND                        0xF001
 #define XE2_GUC_ACTION_TEST_G2G_RECV                        0xF002
+
+// SLPC (single-loop power controller / GT frequency) request sub-events. The
+// SLPC request action 0x3003 carries an event id in msg[1] bits[31:8] and an
+// argument count in bits[7:0]; the host publishes task state into a shared BO.
+#define XE2_SLPC_EVENT_ID_MASK                              xe2_reg_genmask(31, 8)
+#define XE2_SLPC_EVENT_ARGC_MASK                            xe2_reg_genmask(7, 0)
+#define XE2_SLPC_EVENT_RESET                                0
+#define XE2_SLPC_EVENT_QUERY_TASK_STATE                     5
+#define XE2_SLPC_EVENT_PARAMETER_SET                        6
+#define XE2_SLPC_EVENT_PARAMETER_UNSET                      7
+#define XE2_SLPC_GLOBAL_STATE_RUNNING                       3
+
+// Shared-data byte offsets. The header occupies cacheline 0 (size @0,
+// global_state @4); platform info fills cacheline 1; the task-state cacheline
+// (status @0, freq @4) begins at cacheline 2.
+#define XE2_SLPC_OFF_HEADER_SIZE                            0x00
+#define XE2_SLPC_OFF_GLOBAL_STATE                           0x04
+#define XE2_SLPC_OFF_TASK_STATE_FREQ                        0x84
+#define XE2_SLPC_SHARED_DATA_SIZE                           0x2000
+
+// task_state_data.freq sub-fields (raw ratios, 50/3 MHz per unit).
+#define XE2_SLPC_FREQ_MAX_UNSLICE_MASK                      xe2_reg_genmask(7, 0)
+#define XE2_SLPC_FREQ_MIN_UNSLICE_MASK                      xe2_reg_genmask(15, 8)
 
 #define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY             0x900
 #define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_LEN             2
@@ -708,6 +753,12 @@ typedef struct {
         // GFX_MSTR_IRQ -> GT_INTR_DW -> INTR_IDENTITY_REG to find the source.
         // Latch a pending GuC interrupt and surface it through that chain.
         bool           irq_pending;
+
+        // SLPC (GT frequency) shared-data BO, supplied with the SLPC reset
+        // request. The host publishes the running state and frequency caps here
+        // so the driver's GuC-PC start handshake completes.
+        xe2_dma_addr_t slpc_data_addr;
+        bool           slpc_data_valid;
     } guc;
 
     // Page table entries.
@@ -1265,6 +1316,45 @@ static void xe2_complete_advanced_contexts(xe2_dev_t *xe2)
     }
 }
 
+// Publish the SLPC shared-data state the driver polls during GuC-PC start: the
+// running global state plus the unslice frequency caps. Without this the start
+// handshake spins on global_state and times out, disabling dynamic frequency
+// control and failing probe.
+static void xe2_slpc_publish(xe2_dev_t *xe2)
+{
+    if (!xe2->guc.slpc_data_valid) {
+        return;
+    }
+    uint32_t freq = xe2_reg_field_prep(XE2_SLPC_FREQ_MAX_UNSLICE_MASK, XE2_GT_FREQ_RP0_RATIO)
+                  | xe2_reg_field_prep(XE2_SLPC_FREQ_MIN_UNSLICE_MASK, XE2_GT_FREQ_RPN_RATIO);
+    xe2_dma_write32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_HEADER_SIZE,     XE2_SLPC_SHARED_DATA_SIZE);
+    xe2_dma_write32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_GLOBAL_STATE,    XE2_SLPC_GLOBAL_STATE_RUNNING);
+    xe2_dma_write32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_TASK_STATE_FREQ, freq);
+}
+
+// Handle an SLPC request sub-event. The reset/query events carry the shared-data
+// BO address in the first argument; parameter set/unset carry an id (+value).
+// Every variant publishes the running state so the driver's poll succeeds.
+static void xe2_slpc_request(xe2_dev_t *xe2, const uint32_t *msg)
+{
+    uint32_t event = xe2_reg_field_get(XE2_SLPC_EVENT_ID_MASK, msg[1]);
+
+    switch (event) {
+        case XE2_SLPC_EVENT_RESET:
+        case XE2_SLPC_EVENT_QUERY_TASK_STATE: {
+            uint64_t bo = (uint64_t) msg[2] | (uint64_t) msg[3] << 32;
+            xe2->guc.slpc_data_addr  = xe2_ggtt_translate(xe2, bo);
+            xe2->guc.slpc_data_valid = true;
+            break;
+        }
+        default:
+            // Parameter set/unset and other events keep the existing BO.
+            break;
+    }
+
+    xe2_slpc_publish(xe2);
+}
+
 // GuC Command Transport: the driver writes H2G requests into a circular ring
 // and, for blocking sends, waits for a G2H response that echoes the request's
 // fence. Drain every pending H2G message, act on it, and push a fence-matched
@@ -1332,6 +1422,12 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 // pending_disable wait clears and the reserved G2H space frees.
                 uint32_t done[2] = { msg[1], msg[2] };
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
+                break;
+            }
+            case XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST: {
+                // Bring up GuC-PC: publish the running SLPC state and frequency
+                // caps into the shared BO so the driver's start handshake clears.
+                xe2_slpc_request(xe2, msg);
                 break;
             }
             default:
@@ -1543,6 +1639,26 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
+
+        // GT frequency caps and status. The driver decodes RP0/RPn/RPe and the
+        // current/requested ratios from these to bring up dynamic frequency
+        // control; reporting non-zero ratios keeps freq management enabled.
+        case XE2_REG_RP_STATE_CAP: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_RP_STATE_CAP_RP0_MASK, XE2_GT_FREQ_RP0_RATIO)
+                         | xe2_reg_field_prep(XE2_REG_RP_STATE_CAP_RPN_MASK, XE2_GT_FREQ_RPN_RATIO);
+            write_uint32_le(data, cmd);
+            break;
+        }
+        case XE2_REG_GT_RPE_FREQUENCY:
+            write_uint32_le(data, xe2_reg_field_prep(XE2_REG_GT_RPE_FREQUENCY_RPE_MASK, XE2_GT_FREQ_RPE_RATIO));
+            break;
+        case XE2_REG_GT_PERF_STATUS:
+            write_uint32_le(data, xe2_reg_field_prep(XE2_REG_GT_PERF_STATUS_CAGF_MASK, XE2_GT_FREQ_RPE_RATIO));
+            break;
+        case XE2_REG_RPNSWREQ:
+            write_uint32_le(data, xe2_reg_field_prep(XE2_REG_RPNSWREQ_RATIO_MASK, XE2_GT_FREQ_RPE_RATIO));
+            break;
+
         case XE2_REG_PRIMARY_SPI_TRIGGER:
             write_uint32_le(data, xe2->spi_trigger);
             break;
