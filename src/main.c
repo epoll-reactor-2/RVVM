@@ -365,10 +365,6 @@ static int rvvm_cli_main(int argc, char** argv)
         sound_hda_init(machine);
     }
 
-    if (!rvvm_has_arg("nogpu")) {
-        xe2_init_auto(machine);
-    }
-
     tap_dev_t* tap = NULL;
 #ifdef USE_NET
     if (!rvvm_has_arg("nonet")) {
