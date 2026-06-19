@@ -480,6 +480,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_CTX_INT_SRC_REPORT_PTR                        89
 #define XE2_CTX_CS_INT_VEC_DATA                           91
 
+// Up to four engine contexts (rcs0/bcs0/ccs0/...) may be registered at once.
+#define XE2_MAX_CONTEXTS                                  8
+
 // Ring command stream decode. Type lives in bits 31:29 (MI = 0, GFXPIPE = 3);
 // the MI opcode is bits 28:23. The completion postamble a job appends to its
 // ring stores the seqno (MI_STORE_DATA_IMM / MI_FLUSH_DW / PIPE_CONTROL with a
@@ -520,6 +523,28 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_MEMIRQ_INTR_GUC                               25
 #define XE2_MEMIRQ_GUC2HOST_BYTE                          15
 
+// Register-based top-level interrupt chain (native, non-VF). MSI-X vector 0 is
+// wired to this handler; it consults these registers to locate the source. The
+// GuC sits in GT_INTR_DW bank 0 at INTR_GUC (bit 25), reported as engine class
+// OTHER (4) instance GUC (0) in the identity register.
+#define XE2_REG_DG1_MSTR_TILE_INTR                          0x190008
+#define XE2_REG_GFX_MSTR_IRQ                                0x190010
+#define XE2_REG_GT_INTR_DW0                                 0x190018
+#define XE2_REG_GT_INTR_DW1                                 0x19001C
+#define XE2_REG_INTR_IDENTITY_REG0                          0x190060
+#define XE2_REG_INTR_IDENTITY_REG1                          0x190064
+#define XE2_REG_IIR_REG_SELECTOR0                           0x190070
+#define XE2_REG_IIR_REG_SELECTOR1                           0x190074
+#define XE2_IRQ_MASTER_BIT                                  (1U << 31)
+#define XE2_IRQ_DG1_TILE0_BIT                               (1U << 0)
+#define XE2_IRQ_GT_DW0_BIT                                  (1U << 0)
+#define XE2_IRQ_INTR_GUC_BIT                                (1U << 25)
+#define XE2_IRQ_INTR_DATA_VALID                             (1U << 31)
+#define XE2_IRQ_ENGINE_CLASS_OTHER                          4
+#define XE2_IRQ_GUC_INSTANCE                                0
+// GuC interrupt cause carried in the identity register's intr_vec (bits 15:0);
+// the GuC handler queues the G2H worker only when GUC_INTR_GUC2HOST is set.
+#define XE2_IRQ_GUC2HOST_VEC                                (1U << 15)
 
 #define XE2_HW_ENGINE_RENDER_RING_BASE                      0x02000
 #define XE2_HW_ENGINE_BSD_RING_BASE                         0x1C0000
@@ -654,6 +679,16 @@ typedef struct {
     // Monotonic render-engine completion seqno, published at the LRC status page.
     uint32_t    ctx_seqno;
 
+    // Registered submission contexts. A doorbell on the shared host-interrupt
+    // register carries both CT messages and ring-work submissions; rather than
+    // guess which doorbell is a submission, we track each context's last-
+    // completed ring tail and complete one only when its LRC RING_TAIL advances.
+    struct {
+        xe2_dma_addr_t pphwsp;        // translated PPHWSP (context page) address
+        uint32_t       last_tail;     // ring tail already completed
+        bool           valid;
+    } ctx[XE2_MAX_CONTEXTS];
+
     struct {
         uint32_t       actions_h2g[4];
         uint32_t       actions_g2h[4];
@@ -667,6 +702,12 @@ typedef struct {
         size_t         ctb_g2h_size;
         xe2_dma_addr_t ctb_h2g_descriptor_addr;
         xe2_dma_addr_t ctb_g2h_descriptor_addr;
+
+        // GuC-to-host interrupt latch. The driver wires MSI-X vector 0 to the
+        // register-based top-level handler, which walks DG1_MSTR_TILE_INTR ->
+        // GFX_MSTR_IRQ -> GT_INTR_DW -> INTR_IDENTITY_REG to find the source.
+        // Latch a pending GuC interrupt and surface it through that chain.
+        bool           irq_pending;
     } guc;
 
     // Page table entries.
@@ -997,6 +1038,12 @@ static void xe2_guc_g2h_push(xe2_dev_t *xe2, uint32_t fence, const uint32_t *hxg
     tail = (tail + XE2_GUC_CTB_HDR_LEN + n) % dwords;
     xe2_dma_write32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 4, tail);
 
+    // Deliver the GuC-to-host interrupt. The driver wires MSI-X vector 0 to the
+    // register-based top-level handler (not the memirq path used for engines),
+    // so a bare MSI is ignored unless the interrupt-identity register chain
+    // reports a pending GuC source. Latch it and raise vector 0; without this
+    // every blocking CT request (e.g. GuC opt-in) times out.
+    xe2->guc.irq_pending = true;
     pci_send_irq(xe2->pci_func, 0);
 }
 
@@ -1007,6 +1054,22 @@ static void xe2_guc_g2h_response(xe2_dev_t *xe2, uint32_t fence, uint32_t data0)
                  | xe2_reg_field_prep(XE2_GUC_HXG_MSG_0_TYPE, XE2_GUC_HXG_TYPE_RESPONSE_SUCCESS)
                  | xe2_reg_field_prep(XE2_GUC_HXG_RESPONSE_MSG_0_DATA0, data0);
     xe2_guc_g2h_push(xe2, fence, &hxg, 1);
+}
+
+// Post an asynchronous G2H EVENT (no fence matching): an HXG header carrying the
+// action in bits 15:0, followed by the event payload dwords. Used for the
+// scheduling/deregister "done" notifications the driver blocks on.
+static void xe2_guc_g2h_event(xe2_dev_t *xe2, uint32_t action,
+                              const uint32_t *payload, uint32_t n)
+{
+    uint32_t hxg[16];
+    hxg[0] = xe2_reg_field_prep(XE2_GUC_HXG_MSG_0_ORIGIN, XE2_GUC_HXG_ORIGIN_GUC)
+           | xe2_reg_field_prep(XE2_GUC_HXG_MSG_0_TYPE, XE2_GUC_HXG_TYPE_EVENT)
+           | xe2_reg_field_prep(XE2_GUC_HXG_MSG_0_ACTION, action);
+    for (uint32_t i = 0; i < n && i < 15; i++) {
+        hxg[1 + i] = payload[i];
+    }
+    xe2_guc_g2h_push(xe2, 0, hxg, n + 1);
 }
 
 // Read a dword from the registered context's LRC register state.
@@ -1155,6 +1218,53 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2)
     pci_send_irq(xe2->pci_func, msix_vec);
 }
 
+// Record (or look up) a submission context by its PPHWSP address. A freshly
+// registered context baselines last_tail to its current ring tail so any ring
+// content present at registration (priming, wa_bb setup) is not replayed as a
+// job; only tail advances past this baseline are treated as submissions.
+static void xe2_track_context(xe2_dev_t *xe2, xe2_dma_addr_t pphwsp)
+{
+    int free_slot = -1;
+    for (size_t i = 0; i < XE2_MAX_CONTEXTS; i++) {
+        if (xe2->ctx[i].valid && xe2->ctx[i].pphwsp.addr == pphwsp.addr) {
+            // Re-registration: re-baseline so stale ring content is ignored.
+            xe2->pphwsp_addr = pphwsp;
+            xe2->ctx[i].last_tail = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
+            return;
+        }
+        if (free_slot < 0 && !xe2->ctx[i].valid) {
+            free_slot = (int) i;
+        }
+    }
+    if (free_slot < 0) {
+        return;
+    }
+    xe2->pphwsp_addr = pphwsp;
+    xe2->ctx[free_slot].pphwsp    = pphwsp;
+    xe2->ctx[free_slot].last_tail = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
+    xe2->ctx[free_slot].valid     = true;
+}
+
+// Scan every registered context and complete those whose ring tail advanced
+// since we last serviced them. This is the genuine "job submitted" signal and
+// is independent of whether the triggering doorbell also carried a CT message,
+// so concurrent CT exchanges (e.g. GuC opt-in) are never perturbed.
+static void xe2_complete_advanced_contexts(xe2_dev_t *xe2)
+{
+    for (size_t i = 0; i < XE2_MAX_CONTEXTS; i++) {
+        if (!xe2->ctx[i].valid) {
+            continue;
+        }
+        xe2->pphwsp_addr = xe2->ctx[i].pphwsp;
+        uint32_t tail = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
+        if (tail == xe2->ctx[i].last_tail) {
+            continue;
+        }
+        xe2->ctx[i].last_tail = tail;
+        xe2_signal_render_completion(xe2);
+    }
+}
+
 // GuC Command Transport: the driver writes H2G requests into a circular ring
 // and, for blocking sends, waits for a G2H response that echoes the request's
 // fence. Drain every pending H2G message, act on it, and push a fence-matched
@@ -1171,11 +1281,6 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
 
     uint32_t head = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0);
     uint32_t tail = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 4);
-
-    // A doorbell carrying no host-to-GuC message is a pure ring-work submission;
-    // a doorbell that delivers CT requests must not also be treated as one, or
-    // the spurious completion corrupts the in-flight CT exchange.
-    bool ct_message = (head != tail);
 
     while (head != tail) {
         uint32_t header     = xe2_ctb_get(xe2, xe2->guc.ctb_h2g_addr, head, dwords);
@@ -1215,6 +1320,18 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                         xe2->guc.memirq_base_ggtt = src - XE2_MEMIRQ_SOURCE_PAGE_OFFSET;
                     }
                 }
+                // Begin tracking this context for tail-advance completion.
+                xe2_track_context(xe2, xe2->pphwsp_addr);
+                break;
+            }
+            case XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET: {
+                // The driver enables (or disables) scheduling on a context and
+                // blocks on a matching SCHED_CONTEXT_MODE_DONE event before it
+                // can submit or tear down. msg[1] = guc_id, msg[2] = runnable
+                // state (enable/disable); echo both back so its pending_enable/
+                // pending_disable wait clears and the reserved G2H space frees.
+                uint32_t done[2] = { msg[1], msg[2] };
+                xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
                 break;
             }
             default:
@@ -1232,13 +1349,12 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
     // Publish the updated consumer head.
     xe2_dma_write32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0, head);
 
-    // The job-submission and CT-message doorbells share register 0x1901F0;
-    // raising completion on a doorbell that also carried a CT message corrupts
-    // the in-flight exchange (notably GuC opt-in). Restrict completion to
-    // doorbells with no concurrent CT traffic until the two are decoupled.
-    if (!ct_message) {
-        xe2_signal_render_completion(xe2);
-    }
+    // The job-submission and CT-message doorbells share register 0x1901F0. Rather
+    // than gate on the presence of CT traffic (which also rides submission
+    // doorbells and would suppress real completions), complete a context only
+    // when its LRC ring tail has advanced past what we last serviced. This is the
+    // true submission signal and leaves concurrent CT exchanges untouched.
+    xe2_complete_advanced_contexts(xe2);
 }
 
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
@@ -1812,6 +1928,45 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 
         case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
             rvvm_info("Read ring tail: HW engine BCS8");
+            write_uint32_le(data, 0);
+            break;
+
+        // GuC-to-host interrupt delivery chain (register-based, MSI-X vector 0).
+        // The handler walks DG1_MSTR_TILE_INTR -> GFX_MSTR_IRQ -> GT_INTR_DW0 ->
+        // INTR_IDENTITY_REG0; we report a pending GuC source (class OTHER,
+        // instance GUC) through it. The pending latch clears once the identity
+        // register is consumed.
+        case XE2_REG_DG1_MSTR_TILE_INTR:
+            write_uint32_le(data, xe2->guc.irq_pending
+                ? (XE2_IRQ_MASTER_BIT | XE2_IRQ_DG1_TILE0_BIT) : 0);
+            break;
+        case XE2_REG_GFX_MSTR_IRQ:
+            write_uint32_le(data, xe2->guc.irq_pending
+                ? (XE2_IRQ_MASTER_BIT | XE2_IRQ_GT_DW0_BIT) : 0);
+            break;
+        case XE2_REG_GT_INTR_DW0:
+            write_uint32_le(data, xe2->guc.irq_pending ? XE2_IRQ_INTR_GUC_BIT : 0);
+            break;
+        case XE2_REG_GT_INTR_DW1:
+            write_uint32_le(data, 0);
+            break;
+        case XE2_REG_INTR_IDENTITY_REG0: {
+            uint32_t ident = 0;
+            if (xe2->guc.irq_pending) {
+                // intr_vec (bits 15:0) carries the GuC interrupt cause; the GuC
+                // handler only queues the G2H worker when GUC_INTR_GUC2HOST is
+                // set, so it must be present here.
+                ident = XE2_IRQ_INTR_DATA_VALID
+                      | (XE2_IRQ_ENGINE_CLASS_OTHER << 16)
+                      | (XE2_IRQ_GUC_INSTANCE << 20)
+                      | XE2_IRQ_GUC2HOST_VEC;
+                // Source consumed; drop the latch so the line goes idle.
+                xe2->guc.irq_pending = false;
+            }
+            write_uint32_le(data, ident);
+            break;
+        }
+        case XE2_REG_INTR_IDENTITY_REG1:
             write_uint32_le(data, 0);
             break;
 
