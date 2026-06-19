@@ -468,6 +468,57 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_HXG_MSG_0_ACTION                           xe2_reg_genmask(15, 0)
 #define XE2_GUC_HXG_RESPONSE_MSG_0_DATA0                   xe2_reg_genmask(27, 0)
 
+// Logical Ring Context (LRC) image layout. The register state follows the
+// per-process HW status page (PPHWSP), one page in. Each entry below is a dword
+// index into that register state; the value lives at (LRC base + 0x1000 + i*4).
+#define XE2_LRC_REGS_OFFSET                               0x1000
+#define XE2_CTX_RING_HEAD                                 5
+#define XE2_CTX_RING_TAIL                                 7
+#define XE2_CTX_RING_START                                9
+#define XE2_CTX_RING_CTL                                  11
+#define XE2_CTX_INT_STATUS_REPORT_PTR                     87
+#define XE2_CTX_INT_SRC_REPORT_PTR                        89
+
+// Ring command stream decode. Type lives in bits 31:29 (MI = 0, GFXPIPE = 3);
+// the MI opcode is bits 28:23. The completion postamble a job appends to its
+// ring stores the seqno (MI_STORE_DATA_IMM / MI_FLUSH_DW / PIPE_CONTROL with a
+// GGTT post-sync write) and raises MI_USER_INTERRUPT.
+#define XE2_INSTR_TYPE(h)                                 ((h) >> 29)
+#define XE2_INSTR_TYPE_MI                                 0
+#define XE2_INSTR_TYPE_GFXPIPE                            3
+#define XE2_MI_OPCODE(h)                                  (((h) >> 23) & 0x3f)
+#define XE2_MI_OP_NOOP                                    0x00
+#define XE2_MI_OP_USER_INTERRUPT                          0x02
+#define XE2_MI_OP_ARB_CHECK                               0x05
+#define XE2_MI_OP_ARB_ON_OFF                              0x08
+#define XE2_MI_OP_BATCH_BUFFER_END                        0x0a
+#define XE2_MI_OP_STORE_DATA_IMM                          0x20
+#define XE2_MI_OP_FLUSH_DW                                0x26
+#define XE2_MI_SDI_GGTT                                   (1u << 22)
+#define XE2_MI_FLUSH_DW_OP_STOREDW                        (1u << 14)
+#define XE2_MI_FLUSH_DW_USE_GTT                           (1u << 2)
+#define XE2_PIPE_CONTROL_SIG                              0x7a // (h >> 24)
+#define XE2_PIPE_CONTROL_QW_WRITE                         (1u << 14)
+#define XE2_PIPE_CONTROL_GLOBAL_GTT                       (1u << 24)
+
+// Memory-based interrupts (memirq). The engine's source-report and
+// status-report GGTT pointers are baked into its LRC register state (the driver
+// never sends them over self-cfg). The render engine sits at irq_offset 0, and
+// its user-interrupt is byte 0 of the status vector; each cause is a byte 0xFF.
+#define XE2_MEMIRQ_RENDER_SRC_BYTE                        0
+#define XE2_MEMIRQ_RENDER_STATUS_BYTE                     0
+#define XE2_MEMIRQ_BYTE_SET                               0xFF
+#define XE2_LRC_SEQNO_OFFSET                              0
+
+// memirq page geometry. The source-report page sits 0x400 into the shared BO;
+// each status vector is 16 bytes. The GuC's own interrupt sits at bit 25
+// (INTR_GUC): source byte at +0x400+25, status vector at +25*16, and its
+// GuC-to-host cause is byte 15 (GUC_INTR_GUC2HOST) of that vector.
+#define XE2_MEMIRQ_SOURCE_PAGE_OFFSET                     0x400
+#define XE2_MEMIRQ_VECTOR_STRIDE                          16
+#define XE2_MEMIRQ_INTR_GUC                               25
+#define XE2_MEMIRQ_GUC2HOST_BYTE                          15
+
 
 #define XE2_HW_ENGINE_RENDER_RING_BASE                      0x02000
 #define XE2_HW_ENGINE_BSD_RING_BASE                         0x1C0000
@@ -599,12 +650,16 @@ typedef struct {
     xe2_dma_addr_t hwlrca_addr;
     xe2_dma_addr_t pphwsp_addr;
 
+    // Monotonic render-engine completion seqno, published at the LRC status page.
+    uint32_t    ctx_seqno;
+
     struct {
         uint32_t       actions_h2g[4];
         uint32_t       actions_g2h[4];
 
         xe2_dma_addr_t memirq_status_addr;
         xe2_dma_addr_t memirq_source_addr;
+        uint32_t       memirq_base_ggtt;
         xe2_dma_addr_t ctb_h2g_addr;
         size_t         ctb_h2g_size;
         xe2_dma_addr_t ctb_g2h_addr;
@@ -953,6 +1008,149 @@ static void xe2_guc_g2h_response(xe2_dev_t *xe2, uint32_t fence, uint32_t data0)
     xe2_guc_g2h_push(xe2, fence, &hxg, 1);
 }
 
+// Read a dword from the registered context's LRC register state.
+static uint32_t xe2_lrc_ctx_reg(xe2_dev_t *xe2, uint32_t idx)
+{
+    return xe2_dma_read32(xe2, xe2->pphwsp_addr, XE2_LRC_REGS_OFFSET + idx * 4);
+}
+
+// Perform a ring post-sync store: write a value to a GGTT address.
+static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
+{
+    if (ggtt_addr == 0) {
+        return;
+    }
+    xe2_dma_addr_t dst = xe2_ggtt_translate(xe2, ggtt_addr);
+    if (dst.addr == 0) {
+        return;
+    }
+    xe2_dma_write32(xe2, dst, 0, value);
+}
+
+// Walk the LRC ring between HEAD and TAIL and execute the post-sync seqno
+// stores the job appended (MI_STORE_DATA_IMM / MI_FLUSH_DW / PIPE_CONTROL with a
+// GGTT write). We do not run the batch itself; only its completion postamble has
+// observable side effects the driver waits on (the seqno reaching the fence
+// value). Returns true if a user interrupt was found in the stream.
+static bool xe2_ring_replay(xe2_dev_t *xe2)
+{
+    uint32_t ring_ggtt = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_START);
+    uint32_t head      = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_HEAD);
+    uint32_t tail      = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
+    uint32_t ctl       = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_CTL);
+
+    if (ring_ggtt == 0 || head == tail) {
+        return false;
+    }
+
+    xe2_dma_addr_t ring = xe2_ggtt_translate(xe2, ring_ggtt);
+    if (ring.addr == 0) {
+        return false;
+    }
+
+    // RING_CTL holds (size - PAGE_SIZE) page-aligned; recover the dword count.
+    uint32_t ring_bytes = (ctl & 0x003ff000U) + 0x1000U;
+    uint32_t ring_dw    = ring_bytes / 4;
+    bool     user_int   = false;
+
+    uint32_t i = (head / 4) % ring_dw;
+    uint32_t end = (tail / 4) % ring_dw;
+
+    for (uint32_t guard = 0; i != end && guard < ring_dw; guard++) {
+        uint32_t h   = xe2_dma_read32(xe2, ring, i * 4);
+        uint32_t len = 1;
+
+        if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_MI) {
+            switch (XE2_MI_OPCODE(h)) {
+                case XE2_MI_OP_NOOP:
+                case XE2_MI_OP_ARB_CHECK:
+                case XE2_MI_OP_ARB_ON_OFF:
+                case XE2_MI_OP_BATCH_BUFFER_END:
+                    len = 1;
+                    break;
+                case XE2_MI_OP_USER_INTERRUPT:
+                    len = 1;
+                    user_int = true;
+                    break;
+                case XE2_MI_OP_STORE_DATA_IMM:
+                    len = (h & 0x3ff) + 2;
+                    if (h & XE2_MI_SDI_GGTT) {
+                        uint32_t a = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
+                        uint32_t v = xe2_dma_read32(xe2, ring, ((i + 3) % ring_dw) * 4);
+                        xe2_ring_store(xe2, a, v);
+                    }
+                    break;
+                case XE2_MI_OP_FLUSH_DW:
+                    len = (h & 0x3f) + 2;
+                    if (h & XE2_MI_FLUSH_DW_OP_STOREDW) {
+                        uint32_t a = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
+                        uint32_t v = xe2_dma_read32(xe2, ring, ((i + 3) % ring_dw) * 4);
+                        if (a & XE2_MI_FLUSH_DW_USE_GTT) {
+                            xe2_ring_store(xe2, a & ~0x7U, v);
+                        }
+                    }
+                    break;
+                default:
+                    len = (h & 0xff) + 2;
+                    break;
+            }
+        } else if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_GFXPIPE
+                   && (h >> 24) == XE2_PIPE_CONTROL_SIG) {
+            len = (h & 0xff) + 2;
+            uint32_t flags = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
+            if ((flags & XE2_PIPE_CONTROL_QW_WRITE)
+                && (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
+                uint32_t a = xe2_dma_read32(xe2, ring, ((i + 2) % ring_dw) * 4);
+                uint32_t v = xe2_dma_read32(xe2, ring, ((i + 4) % ring_dw) * 4);
+                xe2_ring_store(xe2, a, v);
+            }
+        } else {
+            len = (h & 0xff) + 2;
+        }
+
+        if (len == 0) {
+            len = 1;
+        }
+        i = (i + len) % ring_dw;
+    }
+
+    // The ring is now drained; advance HEAD so the next submission is isolated.
+    xe2_dma_write32(xe2, xe2->pphwsp_addr,
+                    XE2_LRC_REGS_OFFSET + XE2_CTX_RING_HEAD * 4, tail);
+    return user_int;
+}
+
+// Complete render-engine work. Replay the ring's seqno stores, then post an rcs0
+// user interrupt via the memory-based interrupt pages whose GGTT locations the
+// driver baked into the LRC register state, so it wakes, reads the seqno and
+// signals the job fence.
+static void xe2_signal_render_completion(xe2_dev_t *xe2)
+{
+    if (xe2->pphwsp_addr.addr == 0) {
+        return;
+    }
+
+    if (!xe2_ring_replay(xe2)) {
+        return;
+    }
+
+    uint32_t src_ggtt = xe2_lrc_ctx_reg(xe2, XE2_CTX_INT_SRC_REPORT_PTR);
+    uint32_t sts_ggtt = xe2_lrc_ctx_reg(xe2, XE2_CTX_INT_STATUS_REPORT_PTR);
+    if (src_ggtt == 0 || sts_ggtt == 0) {
+        return;
+    }
+
+    // Render source byte: its IIR bit in the engine's source-report page.
+    xe2_dma_addr_t src = xe2_ggtt_translate(xe2, src_ggtt);
+    xe2_dma_write32(xe2, src, XE2_MEMIRQ_RENDER_SRC_BYTE, XE2_MEMIRQ_BYTE_SET);
+
+    // Render user-interrupt byte: byte 0 of the engine's status vector.
+    xe2_dma_addr_t sts = xe2_ggtt_translate(xe2, sts_ggtt);
+    xe2_dma_write32(xe2, sts, XE2_MEMIRQ_RENDER_STATUS_BYTE, XE2_MEMIRQ_BYTE_SET);
+
+    pci_send_irq(xe2->pci_func, 0);
+}
+
 // GuC Command Transport: the driver writes H2G requests into a circular ring
 // and, for blocking sends, waits for a G2H response that echoes the request's
 // fence. Drain every pending H2G message, act on it, and push a fence-matched
@@ -969,6 +1167,11 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
 
     uint32_t head = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0);
     uint32_t tail = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 4);
+
+    // A doorbell carrying no host-to-GuC message is a pure ring-work submission;
+    // a doorbell that delivers CT requests must not also be treated as one, or
+    // the spurious completion corrupts the in-flight CT exchange.
+    bool ct_message = (head != tail);
 
     while (head != tail) {
         uint32_t header     = xe2_ctb_get(xe2, xe2->guc.ctb_h2g_addr, head, dwords);
@@ -1000,8 +1203,14 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 xe2->pphwsp_addr = xe2_ggtt_translate(xe2, hwlrca);
                 rvvm_info("GuC CT: register context, PPHWSP 0x%llx -> 0x%llx",
                           (uint64_t) hwlrca, (uint64_t) xe2->pphwsp_addr.addr);
-                // Seed the status-page seqno so submitted work appears complete.
-                xe2_dma_write32(xe2, xe2->pphwsp_addr, 0, 1);
+                // The first registered context is rcs0 (irq_page 0); its source
+                // pointer reveals the shared memirq BO base for GuC signalling.
+                if (xe2->guc.memirq_base_ggtt == 0) {
+                    uint32_t src = xe2_lrc_ctx_reg(xe2, XE2_CTX_INT_SRC_REPORT_PTR);
+                    if (src > XE2_MEMIRQ_SOURCE_PAGE_OFFSET) {
+                        xe2->guc.memirq_base_ggtt = src - XE2_MEMIRQ_SOURCE_PAGE_OFFSET;
+                    }
+                }
                 break;
             }
             default:
@@ -1018,6 +1227,12 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
 
     // Publish the updated consumer head.
     xe2_dma_write32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0, head);
+
+    // A pure submission doorbell (no CT traffic) stands in for ring work;
+    // complete it so the job fence signals.
+    if (!ct_message) {
+        xe2_signal_render_completion(xe2);
+    }
 }
 
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
