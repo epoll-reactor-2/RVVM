@@ -13,6 +13,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "devices/pci-bus.h"
 #include "mem_ops.h"
 #include "rvvm/rvvm_base.h"
+#include "rvvm/rvvm_fb.h"
 #include "spinlock.h"
 #include "utils.h"
 #include "vma_ops.h"
@@ -470,6 +471,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_PLANE_CTL_2_A                               0x70280
 #define XE2_REG_PLANE_CTL_1_B                               0x71180
 #define XE2_REG_PLANE_CTL_2_B                               0x71280
+#define XE2_REG_PLANE_CTL_X_ENABLE_MASK                     xe2_reg_bit(31)
+// Remaining plane-1 / pipe-A geometry registers (the plane fbcon scans out on).
+#define XE2_REG_PLANE_STRIDE_1_A                            0x70188 // Units of 64 bytes
+#define XE2_REG_PLANE_SIZE_1_A                              0x70190 // (h-1)<<16 | (w-1)
+#define XE2_REG_PLANE_SURF_1_A                              0x7019C // Surface GGTT byte offset
 #define XE2_REG_PLANE_CTL_X_ICL_FORMAT_MASK                 xe2_reg_genmask(27, 23)
 #define XE2_REG_PLANE_CTL_X_KEY_ENABLE_MASK                 xe2_reg_genmask(22, 21)
 #define XE2_REG_PLANE_CTL_X_ORDER_RGBX_MASK                 xe2_reg_bit(20)
@@ -909,7 +915,18 @@ typedef struct {
         uint32_t isr[XE2_PIPE_COUNT]; // Raw status read-back storage.
 
         uint32_t frmcount[XE2_PIPE_COUNT]; // Per-pipe frame counter.
+
+        // Scanout state of pipe A, plane 1 (the universal plane fbcon drives).
+        // Captured from the driver's plane register writes; consumed by the
+        // refresh tick to blit guest framebuffer memory onto the host window.
+        uint32_t plane_ctl;    // PLANE_CTL_1_A    (enable bit, format, tiling)
+        uint32_t plane_stride; // PLANE_STRIDE_1_A (line stride in units of 64 bytes)
+        uint32_t plane_size;   // PLANE_SIZE_1_A   ((height-1)<<16 | (width-1))
+        uint32_t plane_surf;   // PLANE_SURF_1_A   (surface base, GGTT byte offset)
     } display;
+
+    // Host display device. NULL when running headless (-nogui / -nogpu display).
+    rvvm_fbdev_t *fbdev;
 
     // Page table entries.
     uint64_t    *ggtt_pte;
@@ -1036,6 +1053,8 @@ static inline uint8_t *xe2_dmc_shadow(xe2_dev_t *xe2, size_t offset)
 static void xe2_remove(rvvm_mmio_dev_t *dev)
 {
     xe2_dev_t *xe2 = dev->data;
+    if (xe2->fbdev)
+        rvvm_fbdev_dec_ref(xe2->fbdev);
     vma_free(xe2->ggtt_pte_valid, XE2_GGTT_PAGES * sizeof(bool));
     vma_free(xe2->ggtt_lo_addrs, XE2_GGTT_PAGES * sizeof(uint32_t));
     vma_free(xe2->ggtt_pte, XE2_GGTT_PAGES * sizeof(uint64_t));
@@ -1059,6 +1078,97 @@ static inline bool xe2_display_pending(xe2_dev_t *xe2)
     return false;
 }
 
+// Resolve one GGTT page to a readable host pointer, without the verbose logging
+// of xe2_ggtt_translate (this runs per-page, every frame). Returns the number of
+// bytes readable from the returned pointer before the next page in *avail.
+static const uint8_t *xe2_scanout_page(xe2_dev_t *xe2, uint64_t ggtt, size_t *avail)
+{
+    uint64_t page = ggtt >> 12;
+    uint64_t off  = ggtt & 0xfff;
+    *avail = 0x1000 - off;
+    if (page >= XE2_GGTT_PAGES)
+        return NULL;
+
+    uint64_t pte = xe2->ggtt_pte[page];
+    if (!(pte & 1)) // Not present
+        return NULL;
+
+    uint64_t addr = (pte & 0x0000FFFFFFFFF000ULL) + off;
+    if (pte & 2) { // Local (VRAM) memory
+        if (addr + *avail > XE2_VRAM_SIZE)
+            return NULL;
+        return xe2->vram + addr;
+    }
+    // System memory, reachable through the guest's DMA window
+    return pci_get_dma_ptr(xe2->pci_func, addr, *avail);
+}
+
+// Present pipe-A plane 1 onto the host window. The driver programs a linear
+// XRGB8888 framebuffer (fbcon) into a GPU buffer object whose surface address is
+// a GGTT offset; resolve it page by page and blit it into the window's VRAM,
+// then point the scanout at it. No-op when headless or the plane is disabled.
+static void xe2_scanout(xe2_dev_t *xe2)
+{
+    if (!xe2->fbdev)
+        return;
+
+    uint32_t ctl = xe2->display.plane_ctl;
+    if (!(ctl & XE2_REG_PLANE_CTL_X_ENABLE_MASK))
+        return;
+
+    // Only linear surfaces are blitted directly; tiled layouts (bits 12:10 != 0)
+    // would need detiling, which fbcon never uses, so skip them.
+    if (xe2_reg_field_get(XE2_REG_PLANE_CTL_X_TILED_MASK, ctl))
+        return;
+
+    uint32_t width  = (xe2->display.plane_size & 0x1fff) + 1;
+    uint32_t height = ((xe2->display.plane_size >> 16) & 0x1fff) + 1;
+    uint32_t stride = (xe2->display.plane_stride & 0x3ff) * 64;
+    if (!width || !height || !stride)
+        return;
+
+    // Pixel format from PLANE_CTL[27:24]; the order bit selects RGB vs BGR.
+    rvvm_rgb_t format;
+    switch ((ctl >> 24) & 0xf) {
+        case 14: format = RVVM_RGB_RGB565; break;      // RGB_565
+        case 2:  format = RVVM_RGB_XRGB2101010; break; // XRGB_2101010
+        case 4:                                        // XRGB_8888
+        default:
+            format = (ctl & XE2_REG_PLANE_CTL_X_ORDER_RGBX_MASK)
+                ? RVVM_RGB_XBGR8888 : RVVM_RGB_XRGB8888;
+            break;
+    }
+
+    size_t   vram_size = 0;
+    uint8_t *dst       = rvvm_fbdev_get_vram(xe2->fbdev, &vram_size);
+    size_t   need      = (size_t) stride * height;
+    if (!dst || need > vram_size)
+        return;
+
+    uint64_t surf   = xe2->display.plane_surf & ~0xfffULL;
+    size_t   copied = 0;
+    while (copied < need) {
+        size_t         avail = 0;
+        const uint8_t *src   = xe2_scanout_page(xe2, surf + copied, &avail);
+        size_t         chunk = (avail < need - copied) ? avail : need - copied;
+        if (src) {
+            memcpy(dst + copied, src, chunk);
+        } else {
+            memset(dst + copied, 0, chunk);
+        }
+        copied += chunk;
+    }
+
+    rvvm_fb_t fb = {
+        .buffer = dst,
+        .width  = width,
+        .height = height,
+        .stride = stride,
+        .format = format,
+    };
+    rvvm_fbdev_set_scanout(xe2->fbdev, &fb);
+}
+
 // Periodic display refresh callback, invoked by RVVM at roughly 60 Hz. For
 // every pipe with vblank enabled, advance the frame counter and raise its
 // vblank interrupt; raise flip-done too when that source is enabled, which
@@ -1067,6 +1177,9 @@ static void xe2_update(rvvm_mmio_dev_t *dev)
 {
     xe2_dev_t *xe2 = dev->data;
     spin_lock(&xe2->lock);
+
+    // Refresh the on-screen image from the guest's scanout buffer.
+    xe2_scanout(xe2);
 
     bool raise = false;
     for (uint32_t pipe = 0; pipe < XE2_PIPE_COUNT; pipe++) {
@@ -1091,6 +1204,11 @@ static void xe2_update(rvvm_mmio_dev_t *dev)
         pci_send_irq(xe2->pci_func, 0);
 
     spin_unlock(&xe2->lock);
+
+    // Push the refreshed scanout to the host window (draws & polls input).
+    // Done outside the device lock so the GUI redraw can't stall MMIO.
+    if (xe2->fbdev)
+        rvvm_fbdev_update(xe2->fbdev);
 }
 
 static rvvm_mmio_type_t xe2_type = {
@@ -2729,6 +2847,21 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->display.iir[(offset - XE2_REG_DE_PIPE_IIR(0)) / 0x10] &= ~read_uint32_le(data);
             break;
 
+        // Capture the pipe-A plane-1 scanout state so the refresh tick can blit
+        // the guest framebuffer onto the host window (see xe2_scanout).
+        case XE2_REG_PLANE_CTL_1_A:
+            xe2->display.plane_ctl = read_uint32_le(data);
+            break;
+        case XE2_REG_PLANE_STRIDE_1_A:
+            xe2->display.plane_stride = read_uint32_le(data);
+            break;
+        case XE2_REG_PLANE_SIZE_1_A:
+            xe2->display.plane_size = read_uint32_le(data);
+            break;
+        case XE2_REG_PLANE_SURF_1_A:
+            xe2->display.plane_surf = read_uint32_le(data);
+            break;
+
         // Cx0 PHY message bus: starting a command runs the transaction.
         case XE2_REG_CX0_M2P_MSGBUS_CTL(0):
         case XE2_REG_CX0_M2P_MSGBUS_CTL(1): {
@@ -2952,11 +3085,14 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
     return true;
 }
 
-PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
+PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus, rvvm_fbdev_t *fbdev)
 {
     xe2_dev_t *xe2 = safe_new_obj(xe2_dev_t);
     xe2->aux[0].edid_written = 0;
     xe2->steer_semaphore = 1; // Begin with unlocked state.
+    xe2->fbdev = fbdev;
+    if (fbdev)
+        rvvm_fbdev_inc_ref(fbdev);
     xe2->vram = vma_alloc(NULL, XE2_VRAM_SIZE, VMA_RDWR);
     xe2->ggtt_pte = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint64_t), VMA_RDWR);
     xe2->ggtt_lo_addrs = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint32_t), VMA_RDWR);
@@ -2995,9 +3131,9 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus)
     return pci_dev;
 }
 
-PUBLIC pci_dev_t *xe2_init_auto(rvvm_machine_t *machine)
+PUBLIC pci_dev_t *xe2_init_auto(rvvm_machine_t *machine, rvvm_fbdev_t *fbdev)
 {
-    return xe2_init(rvvm_get_pci_bus(machine));
+    return xe2_init(rvvm_get_pci_bus(machine), fbdev);
 }
 
 // Эти портреты безлики, он написал их
