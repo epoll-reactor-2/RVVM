@@ -478,6 +478,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_CTX_RING_CTL                                  11
 #define XE2_CTX_INT_STATUS_REPORT_PTR                     87
 #define XE2_CTX_INT_SRC_REPORT_PTR                        89
+#define XE2_CTX_CS_INT_VEC_DATA                           91
 
 // Ring command stream decode. Type lives in bits 31:29 (MI = 0, GFXPIPE = 3);
 // the MI opcode is bits 28:23. The completion postamble a job appends to its
@@ -1148,7 +1149,10 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2)
     xe2_dma_addr_t sts = xe2_ggtt_translate(xe2, sts_ggtt);
     xe2_dma_write32(xe2, sts, XE2_MEMIRQ_RENDER_STATUS_BYTE, XE2_MEMIRQ_BYTE_SET);
 
-    pci_send_irq(xe2->pci_func, 0);
+    // The engine reports on its own MSI-X vector, which the driver recorded in
+    // the context; the GuC owns vector 0, so raising 0 here would be ignored.
+    uint32_t msix_vec = xe2_lrc_ctx_reg(xe2, XE2_CTX_CS_INT_VEC_DATA) & 0xffff;
+    pci_send_irq(xe2->pci_func, msix_vec);
 }
 
 // GuC Command Transport: the driver writes H2G requests into a circular ring
@@ -1228,8 +1232,10 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
     // Publish the updated consumer head.
     xe2_dma_write32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0, head);
 
-    // A pure submission doorbell (no CT traffic) stands in for ring work;
-    // complete it so the job fence signals.
+    // The job-submission and CT-message doorbells share register 0x1901F0;
+    // raising completion on a doorbell that also carried a CT message corrupts
+    // the in-flight exchange (notably GuC opt-in). Restrict completion to
+    // doorbells with no concurrent CT traffic until the two are decoupled.
     if (!ct_message) {
         xe2_signal_render_completion(xe2);
     }
