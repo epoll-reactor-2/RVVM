@@ -264,10 +264,32 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_CX0_REG_SRAM_RD_DATA_H                          0xC09
 #define XE2_CX0_REG_SRAM_RD_DATA_L                          0xC08
 
-// XELPDP_PORT_CLOCK_CTL (PORT_A). PLL request/ack handshake, per lane.
+// XELPDP_PORT_CLOCK_CTL (PORT_A). PLL/refclk request/ack handshakes, per lane.
 #define XE2_REG_XELPDP_PORT_CLOCK_CTL                       0x640E0
 #define XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_REQUEST_MASK(lane) xe2_reg_bit(31 - 4 * (lane))
 #define XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_ACK_MASK(lane)     xe2_reg_bit(30 - 4 * (lane))
+#define XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_REQUEST_MASK(lane) xe2_reg_bit(29 - 4 * (lane))
+#define XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_ACK_MASK(lane)     xe2_reg_bit(28 - 4 * (lane))
+
+// PORT_BUF_CTL1/2 (PORT_A). The PHY enable sequence polls these status bits;
+// reflect or fix them so the sequence does not stall against zeroed registers.
+#define XE2_REG_XELPDP_PORT_BUF_CTL1                        0x64004
+#define XE2_REG_XELPDP_PORT_BUF_CTL1_PHY_IDLE_MASK          xe2_reg_bit(7)
+#define XE2_REG_XELPDP_PORT_BUF_CTL1_SOC_PHY_READY_MASK     xe2_reg_bit(24)
+#define XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_STATE_MASK    xe2_reg_bit(28)
+#define XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_ENABLE_MASK   xe2_reg_bit(29)
+#define XE2_REG_XELPDP_PORT_BUF_CTL2                        0x64008
+#define XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PIPE_RESET_MASK   xe2_reg_bit(31)
+#define XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PHY_STATUS_MASK   xe2_reg_bit(29)
+#define XE2_REG_XELPDP_PORT_BUF_CTL2_POWERDOWN_UPDATE_MASK  xe2_reg_genmask(25, 24)
+
+// Transcoder A enable registers. The post-modeset readback derives pipe-active
+// from these; they must read back enabled (TRANSCONF also exposes a state bit).
+#define XE2_REG_TRANS_DDI_FUNC_CTL_A                        0x60400
+#define XE2_REG_TRANS_DDI_FUNC_CTL_ENABLE_MASK              xe2_reg_bit(31)
+#define XE2_REG_TRANSCONF_A                                 0x70008
+#define XE2_REG_TRANSCONF_ENABLE_MASK                       xe2_reg_bit(31)
+#define XE2_REG_TRANSCONF_STATE_MASK                        xe2_reg_bit(30)
 
 #define XE2_REG_PP_STATUS                                   0x61200 // Panel power sequence
 #define XE2_REG_PP_ON_MASK                                  xe2_reg_bit(31)
@@ -818,6 +840,10 @@ typedef struct {
 
     xe2_cx0_lane_t cx0[XE2_CX0_LANE_TOTAL]; // Cx0 PHY per-lane message bus.
     uint32_t    port_clock_ctl;             // XELPDP_PORT_CLOCK_CTL (PORT_A).
+    uint32_t    port_buf_ctl1;              // XELPDP_PORT_BUF_CTL1 (PORT_A).
+    uint32_t    port_buf_ctl2;              // XELPDP_PORT_BUF_CTL2 (PORT_A).
+    uint32_t    trans_ddi_func_ctl;         // TRANS_DDI_FUNC_CTL (transcoder A).
+    uint32_t    transconf;                  // TRANSCONF (transcoder A).
 
     uint32_t    spi_address;
     uint32_t    spi_trigger;
@@ -2165,6 +2191,44 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, xe2->port_clock_ctl);
             break;
 
+        // PORT_BUF_CTL1: report the PHY/D2D status the enable sequence polls.
+        // SOC PHY is always ready; the D2D link state mirrors its enable bit;
+        // the PHY is never idle once driven.
+        case XE2_REG_XELPDP_PORT_BUF_CTL1: {
+            uint32_t cmd = xe2->port_buf_ctl1 | XE2_REG_XELPDP_PORT_BUF_CTL1_SOC_PHY_READY_MASK;
+            cmd &= ~XE2_REG_XELPDP_PORT_BUF_CTL1_PHY_IDLE_MASK;
+            if (xe2->port_buf_ctl1 & XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_ENABLE_MASK)
+                cmd |= XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_STATE_MASK;
+            write_uint32_le(data, cmd);
+            break;
+        }
+        // PORT_BUF_CTL2: the lane PHY status mirrors the pipe-reset request (so
+        // both the reset-start and reset-end polls observe the transition), and
+        // the powerdown-update bits read back cleared (treated as consumed).
+        case XE2_REG_XELPDP_PORT_BUF_CTL2: {
+            uint32_t cmd = xe2->port_buf_ctl2 & ~XE2_REG_XELPDP_PORT_BUF_CTL2_POWERDOWN_UPDATE_MASK;
+            if (xe2->port_buf_ctl2 & XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PIPE_RESET_MASK)
+                cmd |= XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PHY_STATUS_MASK;
+            else
+                cmd &= ~XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PHY_STATUS_MASK;
+            write_uint32_le(data, cmd);
+            break;
+        }
+
+        // Transcoder A enable state: read back what the driver wrote. TRANSCONF
+        // also exposes a "state" bit set whenever the transcoder is enabled, so
+        // the post-modeset readback sees the pipe as active.
+        case XE2_REG_TRANS_DDI_FUNC_CTL_A:
+            write_uint32_le(data, xe2->trans_ddi_func_ctl);
+            break;
+        case XE2_REG_TRANSCONF_A: {
+            uint32_t cmd = xe2->transconf;
+            if (cmd & XE2_REG_TRANSCONF_ENABLE_MASK)
+                cmd |= XE2_REG_TRANSCONF_STATE_MASK;
+            write_uint32_le(data, cmd);
+            break;
+        }
+
         case XE2_REG_BXT_DE_PLL_ENABLE: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_BXT_DE_PLL_ENABLE_LOCK_MASK, xe2->pll_enable);
             write_uint32_le(data, cmd);
@@ -2686,16 +2750,34 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         }
         case XE2_REG_XELPDP_PORT_CLOCK_CTL: {
             uint32_t cmd = read_uint32_le(data);
-            // Mirror each set PLL_REQUEST bit into its PLL_ACK bit on readback.
+            // Mirror each set PLL/refclk request bit into its ack bit (and clear
+            // the ack when the request drops) so the clock-enable polls succeed.
             for (size_t lane = 0; lane < XE2_CX0_LANE_TOTAL; lane++) {
                 if (cmd & XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_REQUEST_MASK(lane))
                     cmd |= XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_ACK_MASK(lane);
                 else
                     cmd &= ~XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_ACK_MASK(lane);
+
+                if (cmd & XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_REQUEST_MASK(lane))
+                    cmd |= XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_ACK_MASK(lane);
+                else
+                    cmd &= ~XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_ACK_MASK(lane);
             }
             xe2->port_clock_ctl = cmd;
             break;
         }
+        case XE2_REG_XELPDP_PORT_BUF_CTL1:
+            xe2->port_buf_ctl1 = read_uint32_le(data);
+            break;
+        case XE2_REG_XELPDP_PORT_BUF_CTL2:
+            xe2->port_buf_ctl2 = read_uint32_le(data);
+            break;
+        case XE2_REG_TRANS_DDI_FUNC_CTL_A:
+            xe2->trans_ddi_func_ctl = read_uint32_le(data);
+            break;
+        case XE2_REG_TRANSCONF_A:
+            xe2->transconf = read_uint32_le(data);
+            break;
 
         case XE2_REG_BXT_DE_PLL_ENABLE: {
             uint32_t cmd = read_uint32_le(data);
