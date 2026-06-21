@@ -493,6 +493,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_PLANE_CTL_X_MEDIA_DECOMPRESSION_ENABLE_MASK xe2_reg_bit(4)
 #define XE2_REG_PLANE_CTL_X_ROTATE_MASK                     xe2_reg_genmask(1, 0)
 
+#define XE2_REG_DP_A                                        0x64000
+#define XE2_REG_DP_B                                        0x64100
+#define XE2_REG_DP_C                                        0x64200
+#define XE2_REG_DP_D                                        0x64300
+#define XE2_REG_DP_X_PORT_EN_MASK                           xe2_reg_bit(31)
+
 #define XE2_GUC_ACTION_DEFAULT                              0x0
 #define XE2_GUC_ACTION_REQUEST_PREEMPTION                   0x2
 #define XE2_GUC_ACTION_REQUEST_ENGINE_RESET                 0x3
@@ -615,9 +621,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_HXG_MSG_0_TYPE                              xe2_reg_genmask(30, 28)
 #define XE2_GUC_HXG_TYPE_REQUEST                            0
 #define XE2_GUC_HXG_TYPE_EVENT                              1
-#define XE2_GUC_HXG_TYPE_RESPONSE_SUCCESS                  7
-#define XE2_GUC_HXG_MSG_0_ACTION                           xe2_reg_genmask(15, 0)
-#define XE2_GUC_HXG_RESPONSE_MSG_0_DATA0                   xe2_reg_genmask(27, 0)
+#define XE2_GUC_HXG_TYPE_FAST_REQUEST                       2
+#define XE2_GUC_HXG_TYPE_RESPONSE_SUCCESS                   7
+#define XE2_GUC_HXG_MSG_0_ACTION                            xe2_reg_genmask(15, 0)
+#define XE2_GUC_HXG_RESPONSE_MSG_0_DATA0                    xe2_reg_genmask(27, 0)
 
 // Logical Ring Context (LRC) image layout. The register state follows the
 // per-process HW status page (PPHWSP), one page in. Each entry below is a dword
@@ -749,15 +756,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_VRAM_SIZE                                       0x10000000 // 256 MiB
 
 // https://lists.freedesktop.org/archives/intel-xe/2023-June/005371.html
-#define XE2_GGTT_PTE_VALID                                  (1ULL << 0)
-#define XE2_GGTT_PAGES                                      0x100000
-#define XE2_GGTT_PTE_ADDR_MASK                              0x0000FFFFFFFFF000ULL
-#define XE2_GGTT_MMIO_BASE                                  0x800000 // 8 MiB
-#define XE2_GGTT_MMIO_SIZE                                  0x800000 // 8 MiB
+#define XE2_GGTT_PTE_VALID                                   (1ULL << 0)
+#define XE2_GGTT_PAGES                                       0x100000
+#define XE2_GGTT_PTE_ADDR_MASK                               0x0000FFFFFFFFF000ULL
+#define XE2_GGTT_MMIO_BASE                                   0x800000 // 8 MiB
+#define XE2_GGTT_MMIO_SIZE                                   0x800000 // 8 MiB
 
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
-#define DPCD_REG_REV                                        0x00
+#define DPCD_REG_REV                                         0x00
 // Receiver capability fields read as a 15-byte block from address 0x00. The
 // link rate and lane count must be non-zero or the sink's link config is
 // rejected and the eDP connector is torn down (no fixed mode, no fb0).
@@ -770,15 +777,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // (no separate link-rate table required).
 #define DPCD_REG_EDP_DPCD_REV                                0x700
 #define DPCD_EDP_REV_1_3                                     0x02
-#define DPCD_REG_RECEIVER_ALPM_CAP                          0x2E
-#define DPCD_REG_DSC_SUPPORT                                0x60
-#define DPCD_REG_PSR_SUPPORT                                0x70
-#define DPCD_REG_PANEL_REPLAY_CAP_SUPPORT                   0xB0
-#define DPCD_REG_SOURCE_OUI                                 0x300
+#define DPCD_REG_RECEIVER_ALPM_CAP                           0x2E
+#define DPCD_REG_DSC_SUPPORT                                 0x60
+#define DPCD_REG_PSR_SUPPORT                                 0x70
+#define DPCD_REG_PANEL_REPLAY_CAP_SUPPORT                    0xB0
+#define DPCD_REG_SOURCE_OUI                                  0x300
 
 // EDID address and size is not part of DPCD.
-#define DPCD_INTEL_EDID_ADDR                                0x50
-#define DPCD_INTEL_EDID_SIZE                                128
+#define DPCD_INTEL_EDID_ADDR                                 0x50
+#define DPCD_INTEL_EDID_SIZE                                 128
 
 // https://docs.amd.com/r/en-US/pg199-displayport-tx-subsystem/I2C-Over-AUX-Transactions
 //
@@ -1189,15 +1196,15 @@ static void xe2_update(rvvm_mmio_dev_t *dev)
 
     bool raise = false;
     for (uint32_t pipe = 0; pipe < XE2_PIPE_COUNT; pipe++) {
-        bool vblank_en = (xe2->display.ier[pipe] & XE2_REG_DE_PIPE_VBLANK_MASK)
-                      && !(xe2->display.imr[pipe] & XE2_REG_DE_PIPE_VBLANK_MASK);
+        bool vblank_en    =  (xe2->display.ier[pipe] & XE2_REG_DE_PIPE_VBLANK_MASK)
+                         && !(xe2->display.imr[pipe] & XE2_REG_DE_PIPE_VBLANK_MASK);
         if (!vblank_en)
             continue;
 
         xe2->display.frmcount[pipe]++;
         xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_VBLANK_MASK;
 
-        bool flip_done_en = (xe2->display.ier[pipe] & XE2_REG_DE_PIPE_FLIP_DONE_MASK)
+        bool flip_done_en =  (xe2->display.ier[pipe] & XE2_REG_DE_PIPE_FLIP_DONE_MASK)
                          && !(xe2->display.imr[pipe] & XE2_REG_DE_PIPE_FLIP_DONE_MASK);
         if (flip_done_en)
             xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_FLIP_DONE_MASK;
@@ -1257,15 +1264,15 @@ static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
     uint64_t off = ggtt & 0xfff;
     uint64_t pte = xe2->ggtt_pte[idx];
 
-    rvvm_info("PTE: ggtt addr:       0x%lx", ggtt);
-    rvvm_info("PTE: ggtt index:      0x%lx", idx);
-    rvvm_info("PTE: ggtt off:        0x%lx", off);
-    rvvm_info("PTE: raw pte:         0x%lx", pte);
-    rvvm_info("PTE:   result:        0x%llx", (pte & 0x0000FFFFFFFFF000ULL) + off);
-    rvvm_info("PTE: flag (NULL)?     %lu", pte & (1 << 9));
-    rvvm_info("PTE: flag (PS64)?     %lu", pte & (1 << 8));
-    rvvm_info("PTE: flag (RW)?       %lu", pte & (1 << 1));
-    rvvm_info("PTE: flag (present)?  %lu", pte & (1 << 0));
+    // rvvm_info("PTE: ggtt addr:       0x%lx", ggtt);
+    // rvvm_info("PTE: ggtt index:      0x%lx", idx);
+    // rvvm_info("PTE: ggtt off:        0x%lx", off);
+    // rvvm_info("PTE: raw pte:         0x%lx", pte);
+    // rvvm_info("PTE:   result:        0x%llx", (pte & 0x0000FFFFFFFFF000ULL) + off);
+    // rvvm_info("PTE: flag (NULL)?     %lu", pte & (1 << 9));
+    // rvvm_info("PTE: flag (PS64)?     %lu", pte & (1 << 8));
+    // rvvm_info("PTE: flag (RW)?       %lu", pte & (1 << 1));
+    // rvvm_info("PTE: flag (present)?  %lu", pte & (1 << 0));
 
     if (!(pte & 1)) {
         rvvm_warn("PTE 0x%lx is invalid!", pte);
@@ -1841,11 +1848,17 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 // driver's HUC_KERNEL_LOAD_INFO poll sees the firmware verified.
                 xe2->guc.huc_authenticated = true;
                 break;
+            case XE2_GUC_ACTION_TLB_INVALIDATION:
+                // Report completed invalidation without meaningful work.
+                xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_TLB_INVALIDATION_DONE, &fence, 1);
+                break;
             default:
                 break;
         }
 
         // A request expects a fence-matched response; an event does not.
+        // When XE2_GUC_HXG_TYPE_FAST_REQUEST is used, driver expects no
+        // response.
         if (type == XE2_GUC_HXG_TYPE_REQUEST) {
             xe2_guc_g2h_response(xe2, fence, 0);
         }
@@ -2095,10 +2108,13 @@ static inline bool xe2_skip_mmio_range(size_t offset)
     skip |= offset >= 0xF00000 && offset <= 0xFFFFFF;
     skip |= offset == XE2_REG_FLUSH_PENDING;
     skip |= offset == XE2_REG_GT_GMD_ID;
-    skip |= offset == XE2_REG_FLUSH_PENDING;
     skip |= offset == XE2_REG_PRIMARY_SPI_ADDRESS;
     skip |= offset == XE2_REG_PRIMARY_SPI_TRIGGER;
+    skip |= offset == XE2_REG_GT_FORCEWAKE_GT;
+    skip |= offset == XE2_REG_GT_FORCEWAKE_ACK_GT_MTL;
     skip |= offset == XE2_REG_PCH_PP_STATUS;
+    skip |= offset == 0xB404;
+    skip |= offset == 0x70000;
     return skip;
 }
 
@@ -2552,10 +2568,15 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
-        // PCI write: offset=80000, data=c0a4040, size = 4
-        //
-        //
-        // There begin cursed decompiled part.
+        case XE2_REG_DP_A:
+        case XE2_REG_DP_B:
+        case XE2_REG_DP_C:
+        case XE2_REG_DP_D: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_DP_X_PORT_EN_MASK, 1);
+            write_uint32_le(data, cmd);
+            break;
+        }
+
         case XE2_DMC_FW_MAIN_OFFSET:   // DMC program offset
         case XE2_DMC_FW_PIPE_A_OFFSET: // DMC program offset
         case XE2_DMC_FW_PIPE_B_OFFSET: // DMC program offset
@@ -2879,7 +2900,8 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             size_t   lane = (offset - XE2_REG_CX0_M2P_MSGBUS_CTL(0)) / 4;
             uint32_t cmd  = read_uint32_le(data);
             xe2->cx0[lane].m2p = cmd;
-            if (cmd & XE2_REG_CX0_M2P_TRANSACTION_PENDING_MASK)
+            if ((cmd & XE2_REG_CX0_M2P_TRANSACTION_PENDING_MASK) ||
+                (cmd & XE2_REG_CX0_M2P_TRANSACTION_RESET_MASK))
                 xe2_cx0_msgbus_transaction(&xe2->cx0[lane], cmd);
             break;
         }
