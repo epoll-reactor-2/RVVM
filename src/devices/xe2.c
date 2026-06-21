@@ -1059,6 +1059,12 @@ static void xe2_remove(rvvm_mmio_dev_t *dev)
     vma_free(xe2->ggtt_lo_addrs, XE2_GGTT_PAGES * sizeof(uint32_t));
     vma_free(xe2->ggtt_pte, XE2_GGTT_PAGES * sizeof(uint64_t));
     vma_free(xe2->vram, XE2_VRAM_SIZE);
+    free(xe2);
+}
+
+static void xe2_remove_vram(rvvm_mmio_dev_t *dev)
+{
+    UNUSED(dev);
 }
 
 // Bits of a pipe's DE_PIPE interrupt that are currently live, i.e. pending,
@@ -1215,6 +1221,11 @@ static rvvm_mmio_type_t xe2_type = {
     .name = "xe2",
     .remove = xe2_remove,
     .update = xe2_update,
+};
+
+static rvvm_mmio_type_t xe2_type_vram = {
+    .name = "xe2",
+    .remove = xe2_remove_vram,
 };
 
 static inline void xe2_ggtt_write_pte(xe2_dev_t *xe2, uint64_t index, uint64_t pte)
@@ -1795,7 +1806,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 hwlrca &= 0x0000FFFFFFFFF000ULL; // page addr only; drop desc flags + engine class/instance
                 xe2->hwlrca_addr = xe2_ggtt_translate(xe2, hwlrca);
                 xe2->pphwsp_addr = xe2_ggtt_translate(xe2, hwlrca);
-                rvvm_info("GuC CT: register context, PPHWSP 0x%llx -> 0x%llx",
+                rvvm_info("GuC CT: register context, PPHWSP 0x%lx -> 0x%lx",
                           (uint64_t) hwlrca, (uint64_t) xe2->pphwsp_addr.addr);
                 // The first registered context is rcs0 (irq_page 0); its source
                 // pointer reveals the shared memirq BO base for GuC signalling.
@@ -2087,6 +2098,7 @@ static inline bool xe2_skip_mmio_range(size_t offset)
     skip |= offset == XE2_REG_FLUSH_PENDING;
     skip |= offset == XE2_REG_PRIMARY_SPI_ADDRESS;
     skip |= offset == XE2_REG_PRIMARY_SPI_TRIGGER;
+    skip |= offset == XE2_REG_PCH_PP_STATUS;
     return skip;
 }
 
@@ -2137,7 +2149,6 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_PCODE_MAILBOX: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_PCODE_MAILBOX_READY_MASK, 0);
             cmd |= 0x0;
-            rvvm_info("PCODE error mask: %x", cmd & 0xFF);
             write_uint32_le(data, cmd);
             break;
         }
@@ -3120,6 +3131,7 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus, rvvm_fbdev_t *fbdev)
             .min_op_size    = 1,
             .max_op_size    = 4,
             .data           = xe2,
+            .type           = &xe2_type_vram,
             .mapping        = xe2->vram
         }
     };
