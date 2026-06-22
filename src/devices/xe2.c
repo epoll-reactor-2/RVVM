@@ -22,9 +22,43 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: GuC CT communication seems to be correct. Next stage is
-// understand messages format and handle it. We deal with same GuC actions
-// but another ones for DMA channel, not MMIO one (comments in XE2_REG_GUC_HOST_INTERRUPT).
+// Current status: Annoying power management. Framebuffer works, DRM commands not.
+//
+// [   31.642517] xe 0000:00:01.0: [drm] *ERROR* flip_done timed out
+// [   31.646773] xe 0000:00:01.0: [drm] *ERROR* [CRTC:88:pipe A] commit wait timed out
+//
+// [   24.484176] xe 0000:00:01.0: [drm] Use count on power well DC_off is already zero
+// [   24.485209] WARNING CPU: 0 PID: 9 at drivers/gpu/drm/i915/display/intel_display_power_well.c:148 intel_power_well_put+0x82/0x88 [xe]
+// [   24.488353] Modules linked in: xe drm_ttm_helper ttm i2c_algo_bit gpu_sched drm_buddy drm_client_lib drm_suballoc_helper drm_gpuvm drm_exec configfs drm_display_helper drm_kms_helper drm drm_panel_orientation_quirks backlight
+// [   24.489506] CPU: 0 UID: 0 PID: 9 Comm: kworker/0:0 Tainted: G     U  W           6.18.7 #14 NONE 
+// [   24.489769] Tainted: [U]=USER, [W]=WARN
+// [   24.489807] Hardware name: RVVM v0.7-git-g225e7e4-dirty (DT)
+// [   24.489949] Workqueue: display_unordered edp_panel_vdd_work [xe]
+// [   24.491221] epc : intel_power_well_put+0x82/0x88 [xe]
+// [   24.492453]  ra : intel_power_well_put+0x82/0x88 [xe]
+// [   24.493731] epc : ffffffff0186d2b2 ra : ffffffff0186d2b2 sp : ffffffc60004bc00
+// [   24.493821]  gp : ffffffff815901b0 tp : ffffffd60190de00 t0 : ffffffff8142c238
+// [   24.493860]  t1 : ffffffc630fda000 t2 : 0000000000000003 s0 : ffffffc60004bc20
+// [   24.494012]  s1 : ffffffd60364dc40 a0 : 0000000000000045 a1 : ffffffff8148c3d8
+// [   24.494051]  a2 : 0000000200000022 a3 : ffffffff815cd160 a4 : 0000000000000000
+// [   24.494088]  a5 : 0000000000000000 a6 : 0000000000000001 a7 : 0000000000000008
+// [   24.494124]  s2 : ffffffd60286e000 s3 : 0000000000000035 s4 : ffffffd60286e000
+// [   24.494165]  s5 : ffffffff01a59aa8 s6 : ffffffd60286e0d4 s7 : 0000000000000000
+// [   24.494200]  s8 : 00000000000c7204 s9 : ffffffff01a6f7f0 s10: ffffffd6024240c0
+// [   24.494237]  s11: ffffffd60362d830 t3 : ffffffffffffffff t4 : ffffffd6041a582f
+// [   24.494272]  t5 : 0000000000001e00 t6 : ffffffc60004ba18
+// [   24.494314] status: 0000000200000120 badaddr: 0000000000000000 cause: 0000000000000003
+// [   24.494453] [<ffffffff0186d2b2>] intel_power_well_put+0x82/0x88 [xe]
+// [   24.495818] [<ffffffff01866476>] __intel_display_power_put_domain+0xce/0x1b0 [xe]
+// [   24.497025] [<ffffffff01867e1c>] intel_display_power_put_unchecked+0x2c/0x50 [xe]
+// [   24.498104] [<ffffffff018cbb18>] intel_pps_vdd_off_sync_unlocked+0x214/0x2ac [xe]
+// [   24.499169] [<ffffffff018cbede>] edp_panel_vdd_work+0x92/0xa0 [xe]
+// [   24.500931] [<ffffffff8004266a>] process_one_work+0x15a/0x2e0
+// [   24.501578] [<ffffffff80043914>] worker_thread+0x2c4/0x420
+// [   24.501694] [<ffffffff8004ba24>] kthread+0xc0/0x178
+// [   24.501780] [<ffffffff800102ce>] ret_from_fork_kernel+0xe/0xcc
+// [   24.501883] [<ffffffff8089a672>] ret_from_fork_kernel_asm+0x16/0x18
+// [   24.502046] ---[ end trace 0000000000000000 ]---
 
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -212,7 +246,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_DPX_AUX_CH_CTL_TIME_OUT_MASK                xe2_reg_genmask(27, 26)
 #define XE2_REG_DPX_AUX_CH_CTL_RECEIVE_ERROR_MASK           xe2_reg_bit(25)
 #define XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK                xe2_reg_genmask(24, 20)
-#define XE2_REG_DPX_AUX_CH_CTL_PRECHARGE_2US_MASK           xe2_reg_genmask(19, 16)
+#define XE2_REG_DPX_AUX_CH_CTL_POWER_REQUEST                xe2_reg_bit(19)
+#define XE2_REG_DPX_AUX_CH_CTL_POWER_STATUS                 xe2_reg_bit(18)
 #define XE2_REG_DPX_AUX_CH_CTL_AUX_AKSV_SELECT_MASK         xe2_reg_bit(15)
 #define XE2_REG_DPX_AUX_CH_CTL_MANCHESTER_MASK              xe2_reg_bit(14)
 #define XE2_REG_DPX_AUX_CH_CTL_PSR_DATA_AUX_SKL_MASK        xe2_reg_bit(14)
@@ -498,6 +533,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_DP_C                                        0x64200
 #define XE2_REG_DP_D                                        0x64300
 #define XE2_REG_DP_X_PORT_EN_MASK                           xe2_reg_bit(31)
+
+#define XE2_REG_TGL_DP_TP_STATUS_A                          0x60544
+#define XE2_REG_TGL_DP_TP_STATUS_FEC_ENABLE_LIVE            xe2_reg_bit(28)
+#define XE2_REG_TGL_DP_TP_STATUS_IDLE_DONE                  xe2_reg_bit(25)
+#define XE2_REG_TGL_DP_TP_STATUS_ACT_SENT                   xe2_reg_bit(24)
+#define XE2_REG_TGL_DP_TP_STATUS_MODE_STATUS_MST            xe2_reg_bit(23)
+#define XE2_REG_TGL_DP_TP_STATUS_STREAMS_ENABLED_MASK       xe2_reg_genmask(18, 16) /* 17:16 on hsw but bit 18 mbz */
+#define XE2_REG_TGL_DP_TP_STATUS_AUTOTRAIN_DONE             xe2_reg_bit(12)
+#define XE2_REG_TGL_DP_TP_STATUS_PAYLOAD_MAPPING_VC2_MASK   xe2_reg_genmask(9, 8)
+#define XE2_REG_TGL_DP_TP_STATUS_PAYLOAD_MAPPING_VC1_MASK   xe2_reg_genmask(5, 4)
+#define XE2_REG_TGL_DP_TP_STATUS_PAYLOAD_MAPPING_VC0_MASK   xe2_reg_genmask(1, 0)
 
 #define XE2_GUC_ACTION_DEFAULT                              0x0
 #define XE2_GUC_ACTION_REQUEST_PREEMPTION                   0x2
@@ -922,6 +968,11 @@ typedef struct {
         uint32_t isr[XE2_PIPE_COUNT]; // Raw status read-back storage.
 
         uint32_t frmcount[XE2_PIPE_COUNT]; // Per-pipe frame counter.
+
+        uint32_t pipe_regs_shadow[0x2000 / 4];   /* 0x60000–0x61FFF */
+        uint32_t plane_regs_shadow[0x8000 / 4];  /* 0x70000–0x77FFF */
+
+        uint32_t dp_tp_status;
 
         // Scanout state of pipe A, plane 1 (the universal plane fbcon drives).
         // Captured from the driver's plane register writes; consumed by the
@@ -2341,6 +2392,8 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         // the PHY is never idle once driven.
         case XE2_REG_XELPDP_PORT_BUF_CTL1: {
             uint32_t cmd = xe2->port_buf_ctl1 | XE2_REG_XELPDP_PORT_BUF_CTL1_SOC_PHY_READY_MASK;
+            // BUG: Not complete idle logic.
+            // [   52.705927] xe 0000:00:01.0: [drm] *ERROR* Timeout waiting for DDI BUF A to get idle
             cmd &= ~XE2_REG_XELPDP_PORT_BUF_CTL1_PHY_IDLE_MASK;
             if (xe2->port_buf_ctl1 & XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_ENABLE_MASK)
                 cmd |= XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_STATE_MASK;
@@ -2553,7 +2606,10 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             if (xe2->aux[0].ctl & xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1)) {
                 xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_SEND_BUSY_MASK, 1);
                 xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_DONE_MASK, 1);
+                xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_POWER_REQUEST, 1);
                 xe2_emulate_aux_transfer(xe2, 0);
+            } else {
+                xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_POWER_REQUEST, 1);
             }
             write_uint32_le(data, xe2->aux[0].ctl);
             break;
@@ -2577,6 +2633,11 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
+        case XE2_REG_TGL_DP_TP_STATUS_A:
+            xe2->display.dp_tp_status |= xe2_reg_field_prep(XE2_REG_TGL_DP_TP_STATUS_IDLE_DONE, 1);
+            write_uint32_le(data, xe2->display.dp_tp_status);
+            break;
+
         case XE2_DMC_FW_MAIN_OFFSET:   // DMC program offset
         case XE2_DMC_FW_PIPE_A_OFFSET: // DMC program offset
         case XE2_DMC_FW_PIPE_B_OFFSET: // DMC program offset
@@ -2590,12 +2651,14 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
 
         case XE2_REG_PLANE_CTL_1_A:
-        case XE2_REG_PLANE_CTL_2_A:
+        // case XE2_REG_PLANE_CTL_2_A:
         case XE2_REG_PLANE_CTL_1_B:
-        case XE2_REG_PLANE_CTL_2_B: {
+        /* case XE2_REG_PLANE_CTL_2_B:*/ {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_ICL_FORMAT_MASK, 14) // RGB565
-                         | xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_KEY_ENABLE_MASK, 1);
+                         | xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_KEY_ENABLE_MASK, 1)
+                         | xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_ENABLE_MASK, 1);
             write_uint32_le(data, cmd);
+            write_uint32_le(data, xe2->display.plane_ctl);
             break;
         }
 
@@ -2769,6 +2832,18 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         uint32_t word = read_uint32_le(&xe2->firmware.main[offset - XE2_DMC_FW_MAIN_OFFSET]);
         write_uint32_le(data, word);
     }
+    if (offset >= 0x60000 && offset + 4 <= 0x62000) {
+        uint32_t shadow = xe2->display.pipe_regs_shadow[(offset - 0x60000) / 4];
+        if (shadow) {
+            write_uint32_le(data, shadow);
+        }
+    }
+    if (offset >= 0x70000 && offset + 4 <= 0x78000) {
+        uint32_t shadow = xe2->display.plane_regs_shadow[(offset - 0x70000) / 4];
+        if (shadow) {
+            write_uint32_le(data, shadow);
+        }
+    }
 
     // Replay the DMC loader's register writes so its post-load verification of
     // each mmio[i] entry matches (avoids the "DMC N mmio[i]/0xADDR incorrect"
@@ -2894,6 +2969,10 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->display.plane_surf = read_uint32_le(data);
             break;
 
+        case XE2_REG_TGL_DP_TP_STATUS_A:
+            xe2->display.dp_tp_status = read_uint32_le(data);
+            break;
+
         // Cx0 PHY message bus: starting a command runs the transaction.
         case XE2_REG_CX0_M2P_MSGBUS_CTL(0):
         case XE2_REG_CX0_M2P_MSGBUS_CTL(1): {
@@ -2956,6 +3035,10 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             break;
         case XE2_REG_PP_CONTROL:
             xe2->pp_control = read_uint32_le(data);
+            if (xe2->pp_control & XE2_REG_PP_CONTROL_POWER_ON_MASK)
+                xe2->pp_status = XE2_REG_PP_ON_MASK | XE2_REG_PP_READY_MASK;
+            else
+                xe2->pp_status &= ~(XE2_REG_PP_ON_MASK | XE2_REG_PP_READY_MASK);
             break;
         case XE2_REG_PP_ON_DELAYS:
             xe2->pp_on_delays = read_uint32_le(data);
@@ -2992,7 +3075,9 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         case XE2_REG_DC_STATE_EN: {
             uint32_t cmd = read_uint32_le(data);
             uint32_t mask = XE2_REG_DC_STATE_EN_DC3C0
-                          | XE2_REG_DC_STATE_EN_UPTO_DC5;
+                          | XE2_REG_DC_STATE_EN_UPTO_DC5
+                          | XE2_REG_DC_STATE_EN_DC9
+                          | XE2_REG_DC_STATE_EN_UPTO_DC6;
             xe2->dc_state &= ~mask;
             xe2->dc_state |= (cmd & mask);
             break;
@@ -3107,6 +3192,11 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         if (fw_off + size > xe2->firmware.main_loaded)
             xe2->firmware.main_loaded = fw_off + size;
     }
+    /* Shadow pipe and plane registers for modeset verify readback. */
+    if (offset >= 0x60000 && offset + size <= 0x62000)
+        xe2->display.pipe_regs_shadow[(offset - 0x60000) / 4] = read_uint32_le(data);
+    if (offset >= 0x70000 && offset + size <= 0x78000)
+        xe2->display.plane_regs_shadow[(offset - 0x70000) / 4] = read_uint32_le(data);
 
     // Latch DMC loader register writes so they read back during verification.
     uint8_t *dmc_shadow = xe2_dmc_shadow(xe2, offset);
