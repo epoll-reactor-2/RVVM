@@ -24,6 +24,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // Current status: Annoying power management. Framebuffer works, DRM commands not.
 //
+// Display State Buffer (DSB) registers shall be handled (base 0x70B00).
+//
 // [   31.642517] xe 0000:00:01.0: [drm] *ERROR* flip_done timed out
 // [   31.646773] xe 0000:00:01.0: [drm] *ERROR* [CRTC:88:pipe A] commit wait timed out
 //
@@ -227,6 +229,16 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_PIPE_B                                          0x1
 #define XE2_PIPE_C                                          0x2
 #define XE2_PIPE_D                                          0x3
+
+#define XE2_REG_PLANE_WM_1_A_0                              0x70240
+#define XE2_REG_PLANE_WM_1_B_0                              0x71240
+#define XE2_REG_PLANE_WM_2_A_0                              0x70340
+#define XE2_REG_PLANE_WM_2_B_0                              0x71340
+#define XE2_REG_PLANE_WM_X_X_0_ENABLE_MASK                  xe2_reg_bit(31)
+#define XE2_REG_PLANE_WM_X_X_0_IGNORE_LINES_MASK            xe2_reg_bit(30)
+#define XE2_REG_PLANE_WM_X_X_0_AUTO_MIN_ALLOC_EN_MASK       xe2_reg_bit(29)
+#define XE2_REG_PLANE_WM_X_X_0_LINES_MASK                   xe2_reg_bit(29)
+#define XE2_REG_PLANE_WM_X_X_0_BLOCKS_MASK                  xe2_reg_bit(29)
 
 #define XE2_REG_DE_MISC_ISR                                 0x44460
 #define XE2_REG_DE_MISC_IMR                                 0x44464
@@ -634,22 +646,22 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_SLPC_FREQ_MAX_UNSLICE_MASK                      xe2_reg_genmask(7, 0)
 #define XE2_SLPC_FREQ_MIN_UNSLICE_MASK                      xe2_reg_genmask(15, 8)
 
-#define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY             0x900
-#define GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_LEN             2
-#define GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY             0x901
-#define GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_LEN             2
-#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY                   0x902
-#define GUC_KLV_SELF_CFG_H2G_CTB_ADDR_LEN                   2
-#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY        0x903
-#define GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_LEN        2
-#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY                   0x904
-#define GUC_KLV_SELF_CFG_H2G_CTB_SIZE_LEN                   1
-#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY                   0x905
-#define GUC_KLV_SELF_CFG_G2H_CTB_ADDR_LEN                   2
-#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY        0x906
-#define GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_LEN        2
-#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY                   0x907
-#define GUC_KLV_SELF_CFG_G2H_CTB_SIZE_LEN                   1
+#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY         0x900
+#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_LEN         2
+#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY         0x901
+#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_LEN         2
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY               0x902
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_LEN               2
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY    0x903
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_LEN    2
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY               0x904
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_LEN               1
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY               0x905
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_LEN               2
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY    0x906
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_LEN    2
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY               0x907
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_SIZE_LEN               1
 
 // GuC Command Transport Buffer (CTB) message framing. Each ring message is one
 // CTB header dword followed by NUM_DWORDS payload dwords. The buffer descriptor
@@ -827,7 +839,49 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define DPCD_REG_DSC_SUPPORT                                 0x60
 #define DPCD_REG_PSR_SUPPORT                                 0x70
 #define DPCD_REG_PANEL_REPLAY_CAP_SUPPORT                    0xB0
+// DisplayPort maximum bandwidth rate.
+#define DPCD_REG_DP_LINK_BW_SET                              0x100
+#define DPCD_DP_LINK_RATE_TABLE                              0x00
+#define DPCD_DP_LINK_BW_1_62                                 0x06 // 1.62 Gbit/s per lane
+#define DPCD_DP_LINK_BW_2_7                                  0x0A // 2.7  Gbit/s per lane
+#define DPCD_DP_LINK_BW_5_4                                  0x14 // 5.4  Gbit/s per lane
+#define DPCD_DP_LINK_BW_8_1                                  0x1E // 8.1  Gbit/s per lane
+#define DPCD_DP_LINK_BW_10                                   0x01 // 10   Gbit/s per lane
+#define DPCD_DP_LINK_BW_13_5                                 0x04 // 13.5 Gbit/s per lane
+#define DPCD_DP_LINK_BW_20                                   0x02 // 20   Gbit/s per lane
+
+#define DPCD_REG_TRAINING_PATTERN_SET                        0x102
+#define DPCD_TRAINING_PATTERN_DISABLE                        0
+#define DPCD_TRAINING_PATTERN_1                              1
+#define DPCD_TRAINING_PATTERN_2                              2
+#define DPCD_TRAINING_PATTERN_2_CDS                          3
+#define DPCD_TRAINING_PATTERN_3                              3
+#define DPCD_TRAINING_PATTERN_4                              7
+#define DPCD_TRAINING_PATTERN_MASK                           0x3
+#define DPCD_TRAINING_PATTERN_MASK_1_4                       0xf
+
+#define DPCD_REG_TRAINING_LANE0_SET                          0x103
+#define DPCD_REG_TRAINING_LANE1_SET                          0x104
+#define DPCD_REG_TRAINING_LANE2_SET                          0x105
+#define DPCD_REG_TRAINING_LANE3_SET                          0x106
+#define DPCD_TRAINING_LANEX_SWING_LEVEL_0                    (0 << 0)
+#define DPCD_TRAINING_LANEX_SWING_LEVEL_1                    (1 << 0)
+#define DPCD_TRAINING_LANEX_SWING_LEVEL_2                    (2 << 0)
+#define DPCD_TRAINING_LANEX_SWING_LEVEL_3                    (3 << 0)
+
+#define DPCD_REG_LANE0_1_STATUS                              0x202
+#define DPCD_REG_LANE2_3_STATUS                              0x203
+#define DPCD_LANEX_X_CR_DONE                                 (1 << 0)
+#define DPCD_LANEX_X_CHANNEL_EQ_DONE                         (1 << 1)
+#define DPCD_LANEX_X_SYMBOL_LOCKED                           (1 << 1)
+
 #define DPCD_REG_SOURCE_OUI                                  0x300
+
+#define DPCD_REG_SET_POWER                                   0x600
+#define DPCD_SET_POWER_D0                                    0x1
+#define DPCD_SET_POWER_D3                                    0x1
+#define DPCD_SET_POWER_MASK                                  0x1
+#define DPCD_SET_POWER_D3_AUX_ON                             0x1
 
 // EDID address and size is not part of DPCD.
 #define DPCD_INTEL_EDID_ADDR                                 0x50
@@ -1372,12 +1426,12 @@ static void xe2_dma_write32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint
 static inline bool xe2_guc_klv_address_key(uint32_t key)
 {
     switch (key) {
-        case GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
-        case GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
-        case GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
-        case GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
-        case GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
-        case GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
             return 1;
         default:
             return 0;
@@ -1405,42 +1459,42 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
     }
 
     switch (key) {
-        case GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
             xe2->guc.memirq_status_addr = dma_addr;
             rvvm_info("GuC cfg: memirq status addr: 0x%lx", xe2->guc.memirq_status_addr.addr);
             break;
 
-        case GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
             xe2->guc.memirq_source_addr = dma_addr;
             rvvm_info("GuC cfg: memirq source addr: 0x%lx", xe2->guc.memirq_source_addr.addr);
             break;
 
-        case GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
             xe2->guc.ctb_h2g_addr = dma_addr;
             rvvm_info("GuC cfg: H2G CTB addr: 0x%lx", xe2->guc.ctb_h2g_addr.addr);
             break;
 
-        case GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY:
+        case XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY:
             rvvm_info("GuC cfg: H2G CTB size: %lu", value);
             xe2->guc.ctb_h2g_size = value;
             break;
 
-        case GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY:
+        case XE2_GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY:
             rvvm_info("GuC cfg: G2H CTB size: %lu", value);
             xe2->guc.ctb_g2h_size = value;
             break;
 
-        case GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
             xe2->guc.ctb_h2g_descriptor_addr = dma_addr;
             rvvm_info("GuC cfg: H2G CTB descriptor addr: 0x%lx", xe2->guc.ctb_h2g_descriptor_addr.addr);
             break;
 
-        case GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
             xe2->guc.ctb_g2h_addr = dma_addr;
             rvvm_info("GuC cfg: G2H CTB addr: 0x%lx", xe2->guc.ctb_g2h_addr.addr);
             break;
 
-        case GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
+        case XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
             xe2->guc.ctb_g2h_descriptor_addr = dma_addr;
             rvvm_info("GuC cfg: G2H CTB descriptor addr: 0x%lx", xe2->guc.ctb_g2h_descriptor_addr.addr);
             break;
@@ -1472,12 +1526,14 @@ static uint32_t xe2_guc_emit_hwconfig(xe2_dev_t *xe2, uint64_t ggtt_addr)
     return sizeof(table);
 }
 
-// GuC commands pipeline:
+// This kind of GuC communication used mainly to bootstrap GuC CT
+// channel.
 //
-// write (GUC FW SW 1): 32 bit header
-// write (GUC FW SW 2): 32 bit payload
-// write (GUC FW SW 3): 32 bit payload
-// write (GUC FW SW 4): 32 bit payload
+// Commands pipeline:
+//   write (GUC FW SW 1): 32 bit header
+//   write (GUC FW SW 2): 32 bit payload
+//   write (GUC FW SW 3): 32 bit payload
+//   write (GUC FW SW 4): 32 bit payload
 static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
 {
     uint32_t arg = 0U;
@@ -1489,19 +1545,19 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
     rvvm_info("GUC action (value lo):     %08x", h2g[3]);
 
     switch (h2g[0]) {
-        case XE2_GUC_ACTION_GET_HWCONFIG: { // 0x4100
+        case XE2_GUC_ACTION_GET_HWCONFIG: {
             uint64_t ggtt = (uint64_t) h2g[1] | (uint64_t) h2g[2] << 32;
             arg = xe2_guc_emit_hwconfig(xe2, ggtt);
             break;
         }
-        case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: { // 0x508
+        case XE2_GUC_ACTION_HOST2GUC_SELF_CFG: {
             arg = xe2_guc_action_self_cfg(xe2, h2g);
             break;
         }
-        case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB: // 0x4509
+        case XE2_GUC_ACTION_HOST2GUC_CONTROL_CTB:
             arg = 0; // GUC_CTB_CONTROL_ENABLE
             break;
-        case XE2_GUC_ACTION_OPT_IN_FEATURE_KLV: // 0x550E
+        case XE2_GUC_ACTION_OPT_IN_FEATURE_KLV:
             arg = 1;
             break;
         default:
@@ -1938,11 +1994,18 @@ static inline void xe2_aux_reply(xe2_aux_t *aux, const uint8_t *payload, size_t 
         buf[1 + i] = payload[i];
     }
     for (size_t d = 0; d < 5; d++) {
-        aux->data[d] = (uint32_t) buf[d * 4 + 0] << 24
-                     | (uint32_t) buf[d * 4 + 1] << 16
-                     | (uint32_t) buf[d * 4 + 2] <<  8
-                     | (uint32_t) buf[d * 4 + 3];
+        aux->data[d] = read_uint32_be_m(&buf[d * 4]);
     }
+}
+
+static inline void xe2_aux_reply_uint8(xe2_aux_t *aux, uint8_t cmd)
+{
+    xe2_aux_reply(aux, &cmd, 1);
+}
+
+static inline void xe2_aux_reply_uint16(xe2_aux_t *aux, uint16_t cmd)
+{
+    xe2_aux_reply(aux, (const uint8_t *) &cmd, 2);
 }
 
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
@@ -1964,6 +2027,7 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
     //      31 data | unused                 0
     //
     // 16 bytes total.
+
     switch (cmd) {
         case DPCD_REG_REV: {
             // Full receiver capability block. The driver reads it in one go and
@@ -1976,28 +2040,51 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
             xe2_aux_reply(aux, caps, sizeof(caps));
             break;
         }
-        case DPCD_REG_EDP_DPCD_REV: {
+        case DPCD_REG_EDP_DPCD_REV:
             // eDP capability block; rev 1.3 keeps the sink on the MAX_LINK_RATE
             // path, so no separate supported-link-rate table is needed.
-            uint8_t edp = DPCD_EDP_REV_1_3;
-            xe2_aux_reply(aux, &edp, 1);
+            xe2_aux_reply_uint8(aux, DPCD_EDP_REV_1_3);
             break;
-        }
         case DPCD_REG_RECEIVER_ALPM_CAP:
-            aux->data[0] = 0x01 << 16; // DP_ALPM_CAP
+            // DP_ALPM_CAP
+            xe2_aux_reply_uint8(aux, 1);
             break;
         case DPCD_REG_DSC_SUPPORT:
-            aux->data[0] = 0x03 << 16; // DP_DSC_DECOMPRESSION_IS_SUPPORTED & DP_DSC_PASSTHROUGH_IS_SUPPORTED
+            // DP_DSC_DECOMPRESSION_IS_SUPPORTED & DP_DSC_PASSTHROUGH_IS_SUPPORTED
+            xe2_aux_reply_uint8(aux, 3);
             break;
         case DPCD_REG_PSR_SUPPORT:
-            aux->data[0] = 0x01 << 16; // DP_PSR_IS_SUPPORTED
+            // DP_PSR_IS_SUPPORTED
+            xe2_aux_reply_uint8(aux, 1);
             break;
         case DPCD_REG_PANEL_REPLAY_CAP_SUPPORT:
-            aux->data[0] = 0x01 << 16; // DP_PANEL_REPLAY_SUPPORT
+            // DP_PANEL_REPLAY_SUPPORT
+            xe2_aux_reply_uint8(aux, 1);
             break;
         case DPCD_REG_SOURCE_OUI:
-            aux->data[0] = 0xAA01 << 8; // Probably hardcoded value
+            // Probably hardcoded value (0xAA01 after write).
+            xe2_aux_reply_uint16(aux, 0x01AA);
             break;
+        case DPCD_REG_DP_LINK_BW_SET:
+            // This is the Church of Satan where Anton LaVey, the
+            // high priest, says, "Live is evil spelt backwards".
+            xe2_aux_reply_uint8(aux, DPCD_DP_LINK_BW_5_4);
+            break;
+        case DPCD_REG_SET_POWER:
+            xe2_aux_reply_uint8(aux, DPCD_SET_POWER_D0);
+            break;
+        case DPCD_REG_TRAINING_PATTERN_SET:
+            xe2_aux_reply_uint8(aux, DPCD_TRAINING_PATTERN_3);
+            break;
+        case DPCD_REG_TRAINING_LANE0_SET:
+            xe2_aux_reply_uint8(aux, DPCD_TRAINING_LANEX_SWING_LEVEL_2);
+            break;
+        case DPCD_REG_LANE0_1_STATUS: {
+            uint8_t out = DPCD_LANEX_X_CR_DONE
+                        | DPCD_LANEX_X_CHANNEL_EQ_DONE;
+            xe2_aux_reply_uint8(aux, out);
+            break;
+        }
         case DPCD_INTEL_EDID_ADDR: {
             uint32_t header  = read_uint32_be_m(&xe2_edid[aux->edid_written +  0]) >> 8;
             uint32_t chunk_1 = read_uint32_be_m(&xe2_edid[aux->edid_written +  3]);
@@ -2033,8 +2120,8 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
             break;
         }
         default:
-            // Unhandled command. No reason to emit error or warning.
-            aux->data[0] = 0x00;
+            // Otherwise enable everything.
+            xe2_aux_reply_uint8(aux, 0xFF);
             break;
     }
 }
@@ -2742,6 +2829,16 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
+        case XE2_REG_PLANE_WM_1_A_0:
+        case XE2_REG_PLANE_WM_1_B_0:
+        case XE2_REG_PLANE_WM_2_A_0:
+        case XE2_REG_PLANE_WM_2_B_0: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_PLANE_WM_X_X_0_ENABLE_MASK, 1)
+                         | xe2_reg_field_prep(XE2_REG_PLANE_WM_X_X_0_IGNORE_LINES_MASK, 0);
+            write_uint32_le(data, cmd);
+            break;
+        }
+
         // Per-pipe Display-Engine interrupt registers.
         case XE2_REG_DE_PIPE_IMR(XE2_PIPE_A):
         case XE2_REG_DE_PIPE_IMR(XE2_PIPE_B):
@@ -2834,6 +2931,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
     }
     if (offset >= 0x60000 && offset + 4 <= 0x62000) {
         uint32_t shadow = xe2->display.pipe_regs_shadow[(offset - 0x60000) / 4];
+        rvvm_info("Pipe readback: 0x%zx -> 0x%x", offset, shadow);
         if (shadow) {
             write_uint32_le(data, shadow);
         }
