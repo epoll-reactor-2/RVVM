@@ -26,6 +26,13 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // Display State Buffer (DSB) registers shall be handled (base 0x70B00).
 //
+// DisplayPort training pattern incorrect:
+// [   59.962419] xe 0000:00:01.0: [drm:intel_dp_program_link_training_pattern [xe]] [CONNECTOR:262:eDP-1][ENCODER:261:DDI A/PHY A][DPRX] Using DP training pattern TPS2
+//
+// Another power management fuckup:
+// [   59.715708] xe 0000:00:01.0: [drm] *ERROR* [ENCODER:261:DDI A/PHY A] PPS 0 panel status timeout: PP_STATUS: 0x00000000 PP_CONTROL: 0x0000007b
+// [   59.724296] xe 0000:00:01.0: [drm] [1] PHY A failed to bring out of Lane reset after 5us.
+//
 // [   31.642517] xe 0000:00:01.0: [drm] *ERROR* flip_done timed out
 // [   31.646773] xe 0000:00:01.0: [drm] *ERROR* [CRTC:88:pipe A] commit wait timed out
 //
@@ -424,7 +431,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define XE2_REG_DC_STATE_EN                                 0x45504
 #define XE2_REG_DC_STATE_EN_DC3C0_MASK                      xe2_reg_bit(30)
-#define XE2_REG_DC_STATE_DC3CO_STATUS_MASK                  xe2_reg_bit(29)
+#define XE2_REG_DC_STATE_EN_DC3C0_STATUS_MASK               xe2_reg_bit(29)
+#define XE2_REG_DC_STATE_EN_HOLD_PHY_CLKREQ_PG1_LATCH_MASK  xe2_reg_bit(21)
+#define XE2_REG_DC_STATE_EN_HOLD_PHY_PG1_LATCH_MASK         xe2_reg_bit(20)
 #define XE2_REG_DC_STATE_EN_DC3C0                           (1 << 30)
 #define XE2_REG_DC_STATE_EN_UPTO_DC5                        (1 <<  0)
 #define XE2_REG_DC_STATE_EN_UPTO_DC6                        (2 <<  0)
@@ -955,6 +964,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define DPCD_LANEX_X_CR_DONE                                 (1 << 0)
 #define DPCD_LANEX_X_CHANNEL_EQ_DONE                         (1 << 1)
 #define DPCD_LANEX_X_SYMBOL_LOCKED                           (1 << 1)
+
+#define DPCD_TEST_RESPONSE                                   0x260
 
 #define DPCD_REG_SOURCE_OUI                                  0x300
 
@@ -2089,6 +2100,40 @@ static inline void xe2_aux_reply_uint16(xe2_aux_t *aux, uint16_t cmd)
     xe2_aux_reply(aux, (const uint8_t *) &cmd, 2);
 }
 
+// [   96.515625] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0: Noisy timestamp 140 us > 20 us [3 reps].
+// [   96.520828] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0 : v pINFO: PCI read: offset=70040, data=0
+// (0,1)@ 96.340760 -> 96.340745 [e 140 us, 3 rep]
+// [   96.525715] xe 0000:00:01.0: [drm:drm_update_vblank_count [drm]] updating vblank count on crtc 0: current=2180, diff=1, hw=2163 hw_last=2162
+// PCI write: offset=44200, data=80000000, size = 4
+// PCI write: offset=190008, data=80000000, size = 4
+// PCI write: offset=190008, data=0, size = 4
+// PCI read: offset=190008, data=0
+// PCI write: offset=190008, data=80000001, size = 4
+// PCI read: offset=190010, data=1190010
+// PCI write: offset=190010, data=80010000, size = 4
+// PCI read: offset=44200, data=416c000
+// PCI write: offset=44200, data=0, size = 4
+// PCI read: offset=44408, data=44200
+// PCI write: offset=44408, data=1, size = 4
+// PCI read: offset=70040, data=19de4b0
+// [   96.532649] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0: Noisy timestamp 137 us > 20 us [3 reps].
+// [   96.537937] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0 : v pPCI read: offset=70040, data=0
+// (0,1)@ 96.357823 -> 96.357809 [e 137 us, 3 rep]
+// [   96.543255] xe 0000:00:01.0: [drm:drm_update_vblank_count [drm]] updating vblank count on crtc 0: current=2181, diff=1, hw=2164 hw_last=2163
+// PCI write: offset=44200, data=80000000, size = 4
+// PCI write: offset=190008, data=80000000, size = 4
+// PCI write: offset=190008, data=0, size = 4
+// PCI read: offset=190008, data=0
+// PCI write: offset=190008, data=80000001, size = 4
+// PCI read: offset=190010, data=1190010
+// PCI write: offset=190010, data=80010000, size = 4
+// PCI read: offset=44200, data=416c000
+// PCI write: offset=44200, data=0, size = 4
+// PCI read: offset=44408, data=44200
+// PCI write: offset=44408, data=1, size = 4
+// PCI read: offset=70040, data=19de4b0
+// [   96.550204] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0: Noisy timestamp 127 us > 20 us [3 reps].
+// [   96.555186] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0 : v pPCI read: offset=70040, data=0
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
 {
     // Outgoing AUX request layout:
@@ -2108,6 +2153,8 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
     //      31 data | unused                 0
     //
     // 16 bytes total.
+
+    rvvm_info("AUX cmd: 0x%x", cmd);
 
     switch (cmd) {
         case DPCD_REG_REV: {
@@ -2155,7 +2202,7 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
             xe2_aux_reply_uint8(aux, DPCD_SET_POWER_D0);
             break;
         case DPCD_REG_TRAINING_PATTERN_SET:
-            xe2_aux_reply_uint8(aux, DPCD_TRAINING_PATTERN_3);
+            xe2_aux_reply_uint8(aux, DPCD_TRAINING_PATTERN_2_CDS);
             break;
         case DPCD_REG_TRAINING_LANE0_SET:
             xe2_aux_reply_uint8(aux, DPCD_TRAINING_LANEX_SWING_LEVEL_2);
@@ -2166,6 +2213,10 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
             xe2_aux_reply_uint8(aux, out);
             break;
         }
+        case DPCD_TEST_RESPONSE:
+            // ACK.
+            xe2_aux_reply_uint8(aux, 0x1);
+            break;
         case DPCD_INTEL_EDID_ADDR: {
             uint32_t header  = read_uint32_be_m(&xe2_edid[aux->edid_written +  0]) >> 8;
             uint32_t chunk_1 = read_uint32_be_m(&xe2_edid[aux->edid_written +  3]);
@@ -3252,13 +3303,7 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
             xe2->dbuf_ctl[3] = read_uint32_le(data);
             break;
         case XE2_REG_DC_STATE_EN: {
-            uint32_t cmd = read_uint32_le(data);
-            uint32_t mask = XE2_REG_DC_STATE_EN_DC3C0
-                          | XE2_REG_DC_STATE_EN_UPTO_DC5
-                          | XE2_REG_DC_STATE_EN_DC9
-                          | XE2_REG_DC_STATE_EN_UPTO_DC6;
-            xe2->dc_state &= ~mask;
-            xe2->dc_state |= (cmd & mask);
+            xe2->dc_state = read_uint32_le(data);
             break;
         }
 
