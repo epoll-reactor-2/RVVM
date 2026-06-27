@@ -675,6 +675,19 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES     0x100B
 #define XE2_GUC_ACTION_AUTHENTICATE_HUC                     0x4000
 #define XE2_GUC_ACTION_GET_HWCONFIG                         0x4100
+// Layout per 32-bit words:
+// 00: Command
+// 01: Flags
+// 02: Context ID
+// 03: Engine class
+// 04: Engine submit mask
+// 05: WQ desc lo
+// 06: WQ desc hi
+// 07: WQ base lo
+// 08: WQ base hi
+// 09: WQ size
+// 10: HWLRCA lo
+// 11: HWLRCA hi
 #define XE2_GUC_ACTION_REGISTER_CONTEXT                     0x4502
 
 // hwconfig table attributes (key/length/value triplets). The driver reads the
@@ -965,6 +978,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define DPCD_LANEX_X_CHANNEL_EQ_DONE                         (1 << 1)
 #define DPCD_LANEX_X_SYMBOL_LOCKED                           (1 << 1)
 
+#define DPCD_TEST_REQUEST                                    0x218
+#define DPCD_TEST_REQUEST_LINK_TRAINING                      (1 << 0)
+#define DPCD_TEST_REQUEST_LINK_VIDEO_PATTERN                 (1 << 1)
+#define DPCD_TEST_REQUEST_LINK_EDID_READ                     (1 << 2)
+#define DPCD_TEST_REQUEST_LINK_PHY_TEST_PATTERN              (1 << 3) // DPCD >= 1.1
+#define DPCD_TEST_REQUEST_LINK_FAUX_PATTERN                  (1 << 4) // DPCD >= 1.2
+#define DPCD_TEST_REQUEST_LINK_AUDIO_PATTERN                 (1 << 5) // DPCD >= 1.2
+#define DPCD_TEST_REQUEST_LINK_AUDIO_DISABLED_VIDEO          (1 << 6) // DPCD >= 1.2
+
 #define DPCD_TEST_RESPONSE                                   0x260
 
 #define DPCD_REG_SOURCE_OUI                                  0x300
@@ -1113,10 +1135,9 @@ typedef struct {
         uint32_t iir[XE2_PIPE_COUNT]; // Pending bits (write-1-to-clear).
         uint32_t isr[XE2_PIPE_COUNT]; // Raw status read-back storage.
 
-        uint32_t frmcount[XE2_PIPE_COUNT]; // Per-pipe frame counter.
-
-        uint32_t pipe_regs_shadow[0x2000 / 4];   /* 0x60000–0x61FFF */
-        uint32_t plane_regs_shadow[0x8000 / 4];  /* 0x70000–0x77FFF */
+        uint32_t frmcount[XE2_PIPE_COUNT];       // Per-pipe frame counter.
+        uint32_t pipe_regs_shadow[0x2000 / 4];   // 0x60000–0x61FFF
+        uint32_t plane_regs_shadow[0x8000 / 4];  // 0x70000–0x77FFF
 
         uint32_t dp_tp_status;
 
@@ -2213,9 +2234,8 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
             xe2_aux_reply_uint8(aux, out);
             break;
         }
-        case DPCD_TEST_RESPONSE:
-            // ACK.
-            xe2_aux_reply_uint8(aux, 0x1);
+        case DPCD_TEST_REQUEST:
+            xe2_aux_reply_uint8(aux, DPCD_TEST_REQUEST_LINK_TRAINING);
             break;
         case DPCD_INTEL_EDID_ADDR: {
             uint32_t header  = read_uint32_be_m(&xe2_edid[aux->edid_written +  0]) >> 8;
@@ -2961,15 +2981,17 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
-        case XE2_REG_PLANE_WM_1_A_0:
-        case XE2_REG_PLANE_WM_1_B_0:
-        case XE2_REG_PLANE_WM_2_A_0:
-        case XE2_REG_PLANE_WM_2_B_0: {
-            uint32_t cmd = xe2_reg_field_prep(XE2_REG_PLANE_WM_X_X_0_ENABLE_MASK, 1)
-                         | xe2_reg_field_prep(XE2_REG_PLANE_WM_X_X_0_IGNORE_LINES_MASK, 0);
-            write_uint32_le(data, cmd);
-            break;
-        }
+
+        // This is shadowed by plane/pipe_regs_shadow.
+        // case XE2_REG_PLANE_WM_1_A_0:
+        // case XE2_REG_PLANE_WM_1_B_0:
+        // case XE2_REG_PLANE_WM_2_A_0:
+        // case XE2_REG_PLANE_WM_2_B_0: {
+        //     uint32_t cmd = xe2_reg_field_prep(XE2_REG_PLANE_WM_X_X_0_ENABLE_MASK, 1)
+        //                  | xe2_reg_field_prep(XE2_REG_PLANE_WM_X_X_0_IGNORE_LINES_MASK, 0);
+        //     write_uint32_le(data, cmd);
+        //     break;
+        // }
 
         // Per-pipe Display-Engine interrupt registers.
         case XE2_REG_DE_PIPE_IMR(XE2_PIPE_A):
