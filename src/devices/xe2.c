@@ -333,6 +333,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_XELPDP_PORT_BUF_CTL1_SOC_PHY_READY_MASK     xe2_reg_bit(24)
 #define XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_STATE_MASK    xe2_reg_bit(28)
 #define XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_ENABLE_MASK   xe2_reg_bit(29)
+#define XE2_REG_XELPDP_PORT_BUF_CTL1_ENABLE                 xe2_reg_bit(31)
 #define XE2_REG_XELPDP_PORT_BUF_CTL2                        0x64008
 #define XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PIPE_RESET_MASK   xe2_reg_bit(31)
 #define XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PHY_STATUS_MASK   xe2_reg_bit(29)
@@ -345,6 +346,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_TRANSCONF_A                                 0x70008
 #define XE2_REG_TRANSCONF_ENABLE_MASK                       xe2_reg_bit(31)
 #define XE2_REG_TRANSCONF_STATE_MASK                        xe2_reg_bit(30)
+
+#define XE2_REG_WM_LINETIME_A                               0x45270
+#define XE2_REG_WM_LINETIME_B                               0x45274
+#define XE2_REG_WM_LINETIME_X_HSW_LINETIME_MASK             xe2_reg_genmask( 8,  0)
+#define XE2_REG_WM_LINETIME_X_HSW_IPS_LINETIME_MASK         xe2_reg_genmask(24, 16)
 
 #define XE2_REG_PP_STATUS                                   0x61200 // Panel power sequence
 #define XE2_REG_PP_ON_MASK                                  xe2_reg_bit(31)
@@ -976,7 +982,24 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define DPCD_REG_LANE2_3_STATUS                              0x203
 #define DPCD_LANEX_X_CR_DONE                                 (1 << 0)
 #define DPCD_LANEX_X_CHANNEL_EQ_DONE                         (1 << 1)
-#define DPCD_LANEX_X_SYMBOL_LOCKED                           (1 << 1)
+#define DPCD_LANEX_X_SYMBOL_LOCKED                           (1 << 2)
+#define DPCD_LANEX_X_CHANNEL_EQ_BITS                         ( DPCD_LANEX_X_CR_DONE \
+                                                             | DPCD_LANEX_X_CHANNEL_EQ_DONE \
+                                                             | DPCD_LANEX_X_SYMBOL_LOCKED )
+
+#define DPCD_REG_LANE_ALIGN_STATUS_UPDATED                   0x204
+#define DPCD_INTERLANE_ALIGN_DONE                            (1 << 0)
+#define DPCD_128B132B_DPRX_EQ_INTERLANE_ALIGN_DONE           (1 << 2) /* 2.0 E11 */
+#define DPCD_128B132B_DPRX_CDS_INTERLANE_ALIGN_DONE          (1 << 3) /* 2.0 E11 */
+#define DPCD_128B132B_LT_FAILED                              (1 << 4) /* 2.0 E11 */
+#define DPCD_DOWNSTREAM_PORT_STATUS_CHANGED                  (1 << 6)
+#define DPCD_LINK_STATUS_UPDATED                             (1 << 7)
+
+#define DPCD_SINK_STATUS                                     0x205
+#define DPCD_RECEIVE_PORT_0_STATUS                           (1 << 0)
+#define DPCD_RECEIVE_PORT_1_STATUS                           (1 << 1)
+#define DPCD_STREAM_REGENERATION_STATUS                      (1 << 2) /* 2.0 */
+#define DPCD_INTRA_HOP_AUX_REPLY_INDICATION                  (1 << 3) /* 2.0 */
 
 #define DPCD_TEST_REQUEST                                    0x218
 #define DPCD_TEST_REQUEST_LINK_TRAINING                      (1 << 0)
@@ -2229,9 +2252,16 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
             xe2_aux_reply_uint8(aux, DPCD_TRAINING_LANEX_SWING_LEVEL_2);
             break;
         case DPCD_REG_LANE0_1_STATUS: {
-            uint8_t out = DPCD_LANEX_X_CR_DONE
-                        | DPCD_LANEX_X_CHANNEL_EQ_DONE;
-            xe2_aux_reply_uint8(aux, out);
+            // DPCD driver expects 6-byte reply pack.
+            uint8_t status[6] = {
+                /* 0x202 */ [0] = DPCD_LANEX_X_CHANNEL_EQ_BITS,
+                /* 0x203 */ [1] = DPCD_LANEX_X_CHANNEL_EQ_BITS,
+                /* 0x204 */ [2] = DPCD_INTERLANE_ALIGN_DONE,
+                /* 0x205 */ [3] = DPCD_RECEIVE_PORT_0_STATUS,
+                /* 0x206 */ [4] = 0, // Adjust request for lane 0/1
+                /* 0x207 */ [5] = 0  // Adjust request for lane 2/3
+            };
+            xe2_aux_reply(aux, status, sizeof(status));
             break;
         }
         case DPCD_TEST_REQUEST:
@@ -2628,14 +2658,20 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
 
         // PORT_BUF_CTL1: report the PHY/D2D status the enable sequence polls.
         // SOC PHY is always ready; the D2D link state mirrors its enable bit;
-        // the PHY is never idle once driven.
+        // the PHY is idle after disable and cannot be idle after enable.
         case XE2_REG_XELPDP_PORT_BUF_CTL1: {
-            uint32_t cmd = xe2->port_buf_ctl1 | XE2_REG_XELPDP_PORT_BUF_CTL1_SOC_PHY_READY_MASK;
-            // BUG: Not complete idle logic.
-            // [   52.705927] xe 0000:00:01.0: [drm] *ERROR* Timeout waiting for DDI BUF A to get idle
-            cmd &= ~XE2_REG_XELPDP_PORT_BUF_CTL1_PHY_IDLE_MASK;
-            if (xe2->port_buf_ctl1 & XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_ENABLE_MASK)
-                cmd |= XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_STATE_MASK;
+            uint32_t cmd = xe2->port_buf_ctl1;
+            if (cmd & XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_ENABLE_MASK) {
+                cmd |=  XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_STATE_MASK;
+            } else {
+                cmd &= ~XE2_REG_XELPDP_PORT_BUF_CTL1_D2D_LINK_STATE_MASK;
+            }
+
+            if (cmd & XE2_REG_XELPDP_PORT_BUF_CTL1_ENABLE) {
+                cmd &= ~XE2_REG_XELPDP_PORT_BUF_CTL1_PHY_IDLE_MASK;
+            } else {
+                cmd |=  XE2_REG_XELPDP_PORT_BUF_CTL1_PHY_IDLE_MASK;
+            }
             write_uint32_le(data, cmd);
             break;
         }
@@ -2648,6 +2684,14 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
                 cmd |= XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PHY_STATUS_MASK;
             else
                 cmd &= ~XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PHY_STATUS_MASK;
+            write_uint32_le(data, cmd);
+            break;
+        }
+
+        case XE2_REG_WM_LINETIME_A:
+        case XE2_REG_WM_LINETIME_B: {
+            uint32_t cmd = xe2_reg_field_prep(XE2_REG_WM_LINETIME_X_HSW_IPS_LINETIME_MASK, 120)
+                         | xe2_reg_field_prep(XE2_REG_WM_LINETIME_X_HSW_LINETIME_MASK, 120);
             write_uint32_le(data, cmd);
             break;
         }
@@ -2980,7 +3024,6 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
-
 
         // This is shadowed by plane/pipe_regs_shadow.
         // case XE2_REG_PLANE_WM_1_A_0:
