@@ -22,52 +22,14 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // MCR (Multicast/Replicated)
 // MTL (Meteor Lake)
 //
-// Current status: Annoying power management. Framebuffer works, DRM commands not.
+// Current status: Basic DRM programs and weston works with following
+// boot arguments:
+// - fbcon=map:0 xe.enable_dc=0 xe.enable_dsb=0 xe.disable_power_well=0
 //
-// Display State Buffer (DSB) registers shall be handled (base 0x70B00).
-//
-// DisplayPort training pattern incorrect:
-// [   59.962419] xe 0000:00:01.0: [drm:intel_dp_program_link_training_pattern [xe]] [CONNECTOR:262:eDP-1][ENCODER:261:DDI A/PHY A][DPRX] Using DP training pattern TPS2
-//
-// Another power management fuckup:
-// [   59.715708] xe 0000:00:01.0: [drm] *ERROR* [ENCODER:261:DDI A/PHY A] PPS 0 panel status timeout: PP_STATUS: 0x00000000 PP_CONTROL: 0x0000007b
-// [   59.724296] xe 0000:00:01.0: [drm] [1] PHY A failed to bring out of Lane reset after 5us.
-//
-// [   31.642517] xe 0000:00:01.0: [drm] *ERROR* flip_done timed out
-// [   31.646773] xe 0000:00:01.0: [drm] *ERROR* [CRTC:88:pipe A] commit wait timed out
-//
-// [   24.484176] xe 0000:00:01.0: [drm] Use count on power well DC_off is already zero
-// [   24.485209] WARNING CPU: 0 PID: 9 at drivers/gpu/drm/i915/display/intel_display_power_well.c:148 intel_power_well_put+0x82/0x88 [xe]
-// [   24.488353] Modules linked in: xe drm_ttm_helper ttm i2c_algo_bit gpu_sched drm_buddy drm_client_lib drm_suballoc_helper drm_gpuvm drm_exec configfs drm_display_helper drm_kms_helper drm drm_panel_orientation_quirks backlight
-// [   24.489506] CPU: 0 UID: 0 PID: 9 Comm: kworker/0:0 Tainted: G     U  W           6.18.7 #14 NONE 
-// [   24.489769] Tainted: [U]=USER, [W]=WARN
-// [   24.489807] Hardware name: RVVM v0.7-git-g225e7e4-dirty (DT)
-// [   24.489949] Workqueue: display_unordered edp_panel_vdd_work [xe]
-// [   24.491221] epc : intel_power_well_put+0x82/0x88 [xe]
-// [   24.492453]  ra : intel_power_well_put+0x82/0x88 [xe]
-// [   24.493731] epc : ffffffff0186d2b2 ra : ffffffff0186d2b2 sp : ffffffc60004bc00
-// [   24.493821]  gp : ffffffff815901b0 tp : ffffffd60190de00 t0 : ffffffff8142c238
-// [   24.493860]  t1 : ffffffc630fda000 t2 : 0000000000000003 s0 : ffffffc60004bc20
-// [   24.494012]  s1 : ffffffd60364dc40 a0 : 0000000000000045 a1 : ffffffff8148c3d8
-// [   24.494051]  a2 : 0000000200000022 a3 : ffffffff815cd160 a4 : 0000000000000000
-// [   24.494088]  a5 : 0000000000000000 a6 : 0000000000000001 a7 : 0000000000000008
-// [   24.494124]  s2 : ffffffd60286e000 s3 : 0000000000000035 s4 : ffffffd60286e000
-// [   24.494165]  s5 : ffffffff01a59aa8 s6 : ffffffd60286e0d4 s7 : 0000000000000000
-// [   24.494200]  s8 : 00000000000c7204 s9 : ffffffff01a6f7f0 s10: ffffffd6024240c0
-// [   24.494237]  s11: ffffffd60362d830 t3 : ffffffffffffffff t4 : ffffffd6041a582f
-// [   24.494272]  t5 : 0000000000001e00 t6 : ffffffc60004ba18
-// [   24.494314] status: 0000000200000120 badaddr: 0000000000000000 cause: 0000000000000003
-// [   24.494453] [<ffffffff0186d2b2>] intel_power_well_put+0x82/0x88 [xe]
-// [   24.495818] [<ffffffff01866476>] __intel_display_power_put_domain+0xce/0x1b0 [xe]
-// [   24.497025] [<ffffffff01867e1c>] intel_display_power_put_unchecked+0x2c/0x50 [xe]
-// [   24.498104] [<ffffffff018cbb18>] intel_pps_vdd_off_sync_unlocked+0x214/0x2ac [xe]
-// [   24.499169] [<ffffffff018cbede>] edp_panel_vdd_work+0x92/0xa0 [xe]
-// [   24.500931] [<ffffffff8004266a>] process_one_work+0x15a/0x2e0
-// [   24.501578] [<ffffffff80043914>] worker_thread+0x2c4/0x420
-// [   24.501694] [<ffffffff8004ba24>] kthread+0xc0/0x178
-// [   24.501780] [<ffffffff800102ce>] ret_from_fork_kernel+0xe/0xcc
-// [   24.501883] [<ffffffff8089a672>] ret_from_fork_kernel_asm+0x16/0x18
-// [   24.502046] ---[ end trace 0000000000000000 ]---
+// XDG setup:
+// export XDG_RUNTIME_DIR=/tmp/runtime-$USER
+// mkdir -p "$XDG_RUNTIME_DIR"
+// chmod 700 "$XDG_RUNTIME_DIR"
 
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -647,7 +609,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_REG_TGL_DP_TP_STATUS_IDLE_DONE                  xe2_reg_bit(25)
 #define XE2_REG_TGL_DP_TP_STATUS_ACT_SENT                   xe2_reg_bit(24)
 #define XE2_REG_TGL_DP_TP_STATUS_MODE_STATUS_MST            xe2_reg_bit(23)
-#define XE2_REG_TGL_DP_TP_STATUS_STREAMS_ENABLED_MASK       xe2_reg_genmask(18, 16) /* 17:16 on hsw but bit 18 mbz */
+#define XE2_REG_TGL_DP_TP_STATUS_STREAMS_ENABLED_MASK       xe2_reg_genmask(18, 16) // 17:16 on hsw but bit 18 mbz
 #define XE2_REG_TGL_DP_TP_STATUS_AUTOTRAIN_DONE             xe2_reg_bit(12)
 #define XE2_REG_TGL_DP_TP_STATUS_PAYLOAD_MAPPING_VC2_MASK   xe2_reg_genmask(9, 8)
 #define XE2_REG_TGL_DP_TP_STATUS_PAYLOAD_MAPPING_VC1_MASK   xe2_reg_genmask(5, 4)
@@ -989,17 +951,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define DPCD_REG_LANE_ALIGN_STATUS_UPDATED                   0x204
 #define DPCD_INTERLANE_ALIGN_DONE                            (1 << 0)
-#define DPCD_128B132B_DPRX_EQ_INTERLANE_ALIGN_DONE           (1 << 2) /* 2.0 E11 */
-#define DPCD_128B132B_DPRX_CDS_INTERLANE_ALIGN_DONE          (1 << 3) /* 2.0 E11 */
-#define DPCD_128B132B_LT_FAILED                              (1 << 4) /* 2.0 E11 */
+#define DPCD_128B132B_DPRX_EQ_INTERLANE_ALIGN_DONE           (1 << 2) // 2.0 E11
+#define DPCD_128B132B_DPRX_CDS_INTERLANE_ALIGN_DONE          (1 << 3) // 2.0 E11
+#define DPCD_128B132B_LT_FAILED                              (1 << 4) // 2.0 E11
 #define DPCD_DOWNSTREAM_PORT_STATUS_CHANGED                  (1 << 6)
 #define DPCD_LINK_STATUS_UPDATED                             (1 << 7)
 
 #define DPCD_SINK_STATUS                                     0x205
 #define DPCD_RECEIVE_PORT_0_STATUS                           (1 << 0)
 #define DPCD_RECEIVE_PORT_1_STATUS                           (1 << 1)
-#define DPCD_STREAM_REGENERATION_STATUS                      (1 << 2) /* 2.0 */
-#define DPCD_INTRA_HOP_AUX_REPLY_INDICATION                  (1 << 3) /* 2.0 */
+#define DPCD_STREAM_REGENERATION_STATUS                      (1 << 2) // 2.0
+#define DPCD_INTRA_HOP_AUX_REPLY_INDICATION                  (1 << 3) // 2.0
 
 #define DPCD_TEST_REQUEST                                    0x218
 #define DPCD_TEST_REQUEST_LINK_TRAINING                      (1 << 0)
@@ -1439,14 +1401,14 @@ static void xe2_update(rvvm_mmio_dev_t *dev)
     for (uint32_t pipe = 0; pipe < XE2_PIPE_COUNT; pipe++) {
         bool vblank_en    =  (xe2->display.ier[pipe] & XE2_REG_DE_PIPE_VBLANK_MASK)
                          && !(xe2->display.imr[pipe] & XE2_REG_DE_PIPE_VBLANK_MASK);
-        if (!vblank_en)
-            continue;
-
-        xe2->display.frmcount[pipe]++;
-        xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_VBLANK_MASK;
-
         bool flip_done_en =  (xe2->display.ier[pipe] & XE2_REG_DE_PIPE_FLIP_DONE_MASK)
                          && !(xe2->display.imr[pipe] & XE2_REG_DE_PIPE_FLIP_DONE_MASK);
+
+        if (vblank_en) {
+            xe2->display.frmcount[pipe]++;
+            xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_VBLANK_MASK;
+        }
+
         if (flip_done_en)
             xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_FLIP_DONE_MASK;
 
@@ -2144,40 +2106,6 @@ static inline void xe2_aux_reply_uint16(xe2_aux_t *aux, uint16_t cmd)
     xe2_aux_reply(aux, (const uint8_t *) &cmd, 2);
 }
 
-// [   96.515625] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0: Noisy timestamp 140 us > 20 us [3 reps].
-// [   96.520828] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0 : v pINFO: PCI read: offset=70040, data=0
-// (0,1)@ 96.340760 -> 96.340745 [e 140 us, 3 rep]
-// [   96.525715] xe 0000:00:01.0: [drm:drm_update_vblank_count [drm]] updating vblank count on crtc 0: current=2180, diff=1, hw=2163 hw_last=2162
-// PCI write: offset=44200, data=80000000, size = 4
-// PCI write: offset=190008, data=80000000, size = 4
-// PCI write: offset=190008, data=0, size = 4
-// PCI read: offset=190008, data=0
-// PCI write: offset=190008, data=80000001, size = 4
-// PCI read: offset=190010, data=1190010
-// PCI write: offset=190010, data=80010000, size = 4
-// PCI read: offset=44200, data=416c000
-// PCI write: offset=44200, data=0, size = 4
-// PCI read: offset=44408, data=44200
-// PCI write: offset=44408, data=1, size = 4
-// PCI read: offset=70040, data=19de4b0
-// [   96.532649] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0: Noisy timestamp 137 us > 20 us [3 reps].
-// [   96.537937] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0 : v pPCI read: offset=70040, data=0
-// (0,1)@ 96.357823 -> 96.357809 [e 137 us, 3 rep]
-// [   96.543255] xe 0000:00:01.0: [drm:drm_update_vblank_count [drm]] updating vblank count on crtc 0: current=2181, diff=1, hw=2164 hw_last=2163
-// PCI write: offset=44200, data=80000000, size = 4
-// PCI write: offset=190008, data=80000000, size = 4
-// PCI write: offset=190008, data=0, size = 4
-// PCI read: offset=190008, data=0
-// PCI write: offset=190008, data=80000001, size = 4
-// PCI read: offset=190010, data=1190010
-// PCI write: offset=190010, data=80010000, size = 4
-// PCI read: offset=44200, data=416c000
-// PCI write: offset=44200, data=0, size = 4
-// PCI read: offset=44408, data=44200
-// PCI write: offset=44408, data=1, size = 4
-// PCI read: offset=70040, data=19de4b0
-// [   96.550204] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0: Noisy timestamp 127 us > 20 us [3 reps].
-// [   96.555186] xe 0000:00:01.0: [drm:drm_crtc_vblank_helper_get_vblank_timestamp_internal [drm]] crtc 0 : v pPCI read: offset=70040, data=0
 static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
 {
     // Outgoing AUX request layout:
@@ -2934,9 +2862,7 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
 
         case XE2_REG_PLANE_CTL_1_A:
-        // case XE2_REG_PLANE_CTL_2_A:
-        case XE2_REG_PLANE_CTL_1_B:
-        /* case XE2_REG_PLANE_CTL_2_B:*/ {
+        case XE2_REG_PLANE_CTL_1_B: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_ICL_FORMAT_MASK, 14) // RGB565
                          | xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_KEY_ENABLE_MASK, 1)
                          | xe2_reg_field_prep(XE2_REG_PLANE_CTL_X_ENABLE_MASK, 1);
@@ -3024,17 +2950,6 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             write_uint32_le(data, cmd);
             break;
         }
-
-        // This is shadowed by plane/pipe_regs_shadow.
-        // case XE2_REG_PLANE_WM_1_A_0:
-        // case XE2_REG_PLANE_WM_1_B_0:
-        // case XE2_REG_PLANE_WM_2_A_0:
-        // case XE2_REG_PLANE_WM_2_B_0: {
-        //     uint32_t cmd = xe2_reg_field_prep(XE2_REG_PLANE_WM_X_X_0_ENABLE_MASK, 1)
-        //                  | xe2_reg_field_prep(XE2_REG_PLANE_WM_X_X_0_IGNORE_LINES_MASK, 0);
-        //     write_uint32_le(data, cmd);
-        //     break;
-        // }
 
         // Per-pipe Display-Engine interrupt registers.
         case XE2_REG_DE_PIPE_IMR(XE2_PIPE_A):
@@ -3481,7 +3396,8 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         if (fw_off + size > xe2->firmware.main_loaded)
             xe2->firmware.main_loaded = fw_off + size;
     }
-    /* Shadow pipe and plane registers for modeset verify readback. */
+
+    // Shadow pipe and plane registers for modeset verify readback.
     if (offset >= 0x60000 && offset + size <= 0x62000)
         xe2->display.pipe_regs_shadow[(offset - 0x60000) / 4] = read_uint32_le(data);
     if (offset >= 0x70000 && offset + size <= 0x78000)
