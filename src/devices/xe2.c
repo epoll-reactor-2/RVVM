@@ -27,9 +27,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // - fbcon=map:0 xe.enable_dc=0 xe.enable_dsb=0 xe.disable_power_well=0
 //
 // XDG setup:
-// export XDG_RUNTIME_DIR=/tmp/runtime-$USER
-// mkdir -p "$XDG_RUNTIME_DIR"
-// chmod 700 "$XDG_RUNTIME_DIR"
+/*
+killall -9 Xorg
+export XDG_RUNTIME_DIR=/tmp/runtime-$USER
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+weston
+
+killall -9 Xorg
+glmark2-es2-drm
+
+*/
 
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -640,7 +648,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_GUC_ACTION_SET_CONTEXT_PREEMPTION_TIMEOUT       0x1007
 #define XE2_GUC_ACTION_CONTEXT_RESET_NOTIFICATION           0x1008
 #define XE2_GUC_ACTION_ENGINE_FAILURE_NOTIFICATION          0x1009
+
 #define XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES     0x100B
+#define XE2_UPDATE_CONTEXT_POLICIES_KLV_EXECUTION_QUANTUM   0x2001
+#define XE2_UPDATE_CONTEXT_POLICIES_KLV_PREEMPTION_TIMEOUT  0x2002
+#define XE2_UPDATE_CONTEXT_POLICIES_KLV_SCHEDULING_PRIORITY 0x2003
+#define XE2_UPDATE_CONTEXT_POLICIES_KLV_PREEMPT_TO_IDLE_ON_QUANTUM_EXPIRY \
+                                                            0x2004
+#define XE2_UPDATE_CONTEXT_POLICIES_KLV_SLPM_GT_FREQUENCY   0x2005
+
 #define XE2_GUC_ACTION_AUTHENTICATE_HUC                     0x4000
 #define XE2_GUC_ACTION_GET_HWCONFIG                         0x4100
 // Layout per 32-bit words:
@@ -697,63 +713,63 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // SLPC (single-loop power controller / GT frequency) request sub-events. The
 // SLPC request action 0x3003 carries an event id in msg[1] bits[31:8] and an
 // argument count in bits[7:0]; the host publishes task state into a shared BO.
-#define XE2_SLPC_EVENT_ID_MASK                              xe2_reg_genmask(31, 8)
-#define XE2_SLPC_EVENT_ARGC_MASK                            xe2_reg_genmask(7, 0)
-#define XE2_SLPC_EVENT_RESET                                0
-#define XE2_SLPC_EVENT_QUERY_TASK_STATE                     5
-#define XE2_SLPC_EVENT_PARAMETER_SET                        6
-#define XE2_SLPC_EVENT_PARAMETER_UNSET                      7
-#define XE2_SLPC_GLOBAL_STATE_RUNNING                       3
+#define XE2_SLPC_EVENT_ID_MASK                            xe2_reg_genmask(31, 8)
+#define XE2_SLPC_EVENT_ARGC_MASK                          xe2_reg_genmask(7, 0)
+#define XE2_SLPC_EVENT_RESET                              0
+#define XE2_SLPC_EVENT_QUERY_TASK_STATE                   5
+#define XE2_SLPC_EVENT_PARAMETER_SET                      6
+#define XE2_SLPC_EVENT_PARAMETER_UNSET                    7
+#define XE2_SLPC_GLOBAL_STATE_RUNNING                     3
 
 // Shared-data byte offsets. The header occupies cacheline 0 (size @0,
 // global_state @4); platform info fills cacheline 1; the task-state cacheline
 // (status @0, freq @4) begins at cacheline 2.
-#define XE2_SLPC_OFF_HEADER_SIZE                            0x00
-#define XE2_SLPC_OFF_GLOBAL_STATE                           0x04
-#define XE2_SLPC_OFF_TASK_STATE_FREQ                        0x84
-#define XE2_SLPC_SHARED_DATA_SIZE                           0x2000
+#define XE2_SLPC_OFF_HEADER_SIZE                          0x00
+#define XE2_SLPC_OFF_GLOBAL_STATE                         0x04
+#define XE2_SLPC_OFF_TASK_STATE_FREQ                      0x84
+#define XE2_SLPC_SHARED_DATA_SIZE                         0x2000
 
 // task_state_data.freq sub-fields (raw ratios, 50/3 MHz per unit).
-#define XE2_SLPC_FREQ_MAX_UNSLICE_MASK                      xe2_reg_genmask(7, 0)
-#define XE2_SLPC_FREQ_MIN_UNSLICE_MASK                      xe2_reg_genmask(15, 8)
+#define XE2_SLPC_FREQ_MAX_UNSLICE_MASK                    xe2_reg_genmask(7, 0)
+#define XE2_SLPC_FREQ_MIN_UNSLICE_MASK                    xe2_reg_genmask(15, 8)
 
-#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY         0x900
-#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_LEN         2
-#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY         0x901
-#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_LEN         2
-#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY               0x902
-#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_LEN               2
-#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY    0x903
-#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_LEN    2
-#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY               0x904
-#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_LEN               1
-#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY               0x905
-#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_LEN               2
-#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY    0x906
-#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_LEN    2
-#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY               0x907
-#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_SIZE_LEN               1
+#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY       0x900
+#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_LEN       2
+#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY       0x901
+#define XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_LEN       2
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY             0x902
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_LEN             2
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY  0x903
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_LEN  2
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY             0x904
+#define XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_LEN             1
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY             0x905
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_LEN             2
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY  0x906
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_LEN  2
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_SIZE_KEY             0x907
+#define XE2_GUC_KLV_SELF_CFG_G2H_CTB_SIZE_LEN             1
 
 // GuC Command Transport Buffer (CTB) message framing. Each ring message is one
 // CTB header dword followed by NUM_DWORDS payload dwords. The buffer descriptor
 // holds head (consumer) and tail (producer) as dword indices into a circular
 // command buffer.
-#define XE2_GUC_CTB_HDR_LEN                                 1
-#define XE2_GUC_CTB_MSG_0_FENCE                             xe2_reg_genmask(31, 16)
-#define XE2_GUC_CTB_MSG_0_FORMAT                            xe2_reg_genmask(15, 12)
-#define XE2_GUC_CTB_FORMAT_HXG                              0
-#define XE2_GUC_CTB_MSG_0_NUM_DWORDS                        xe2_reg_genmask(7, 0)
+#define XE2_GUC_CTB_HDR_LEN                               1
+#define XE2_GUC_CTB_MSG_0_FENCE                           xe2_reg_genmask(31, 16)
+#define XE2_GUC_CTB_MSG_0_FORMAT                          xe2_reg_genmask(15, 12)
+#define XE2_GUC_CTB_FORMAT_HXG                            0
+#define XE2_GUC_CTB_MSG_0_NUM_DWORDS                      xe2_reg_genmask(7, 0)
 
 // Host <-> GuC (HXG) message header, carried as the first payload dword.
-#define XE2_GUC_HXG_MSG_0_ORIGIN                            xe2_reg_bit(31)
-#define XE2_GUC_HXG_ORIGIN_GUC                              1
-#define XE2_GUC_HXG_MSG_0_TYPE                              xe2_reg_genmask(30, 28)
-#define XE2_GUC_HXG_TYPE_REQUEST                            0
-#define XE2_GUC_HXG_TYPE_EVENT                              1
-#define XE2_GUC_HXG_TYPE_FAST_REQUEST                       2
-#define XE2_GUC_HXG_TYPE_RESPONSE_SUCCESS                   7
-#define XE2_GUC_HXG_MSG_0_ACTION                            xe2_reg_genmask(15, 0)
-#define XE2_GUC_HXG_RESPONSE_MSG_0_DATA0                    xe2_reg_genmask(27, 0)
+#define XE2_GUC_HXG_MSG_0_ORIGIN                          xe2_reg_bit(31)
+#define XE2_GUC_HXG_ORIGIN_GUC                            1
+#define XE2_GUC_HXG_MSG_0_TYPE                            xe2_reg_genmask(30, 28)
+#define XE2_GUC_HXG_TYPE_REQUEST                          0
+#define XE2_GUC_HXG_TYPE_EVENT                            1
+#define XE2_GUC_HXG_TYPE_FAST_REQUEST                     2
+#define XE2_GUC_HXG_TYPE_RESPONSE_SUCCESS                 7
+#define XE2_GUC_HXG_MSG_0_ACTION                          xe2_reg_genmask(15, 0)
+#define XE2_GUC_HXG_RESPONSE_MSG_0_DATA0                  xe2_reg_genmask(27, 0)
 
 // Logical Ring Context (LRC) image layout. The register state follows the
 // per-process HW status page (PPHWSP), one page in. Each entry below is a dword
@@ -785,12 +801,14 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define XE2_MI_OP_BATCH_BUFFER_END                        0x0a
 #define XE2_MI_OP_STORE_DATA_IMM                          0x20
 #define XE2_MI_OP_FLUSH_DW                                0x26
-#define XE2_MI_SDI_GGTT                                   (1u << 22)
-#define XE2_MI_FLUSH_DW_OP_STOREDW                        (1u << 14)
-#define XE2_MI_FLUSH_DW_USE_GTT                           (1u << 2)
-#define XE2_PIPE_CONTROL_SIG                              0x7a // (h >> 24)
-#define XE2_PIPE_CONTROL_QW_WRITE                         (1u << 14)
-#define XE2_PIPE_CONTROL_GLOBAL_GTT                       (1u << 24)
+#define XE2_MI_OP_BATCH_BUFFER_START                      0x31
+#define XE2_MI_OP_BATCH_BUFFER_START_PPGTT                xe2_reg_bit( 8)
+#define XE2_MI_SDI_GGTT                                   xe2_reg_bit(22)
+#define XE2_MI_FLUSH_DW_OP_STOREDW                        xe2_reg_bit(14)
+#define XE2_MI_FLUSH_DW_USE_GTT                           xe2_reg_bit( 2)
+#define XE2_PIPE_CONTROL_SIG                              0x7a             // (h >> 24)
+#define XE2_PIPE_CONTROL_QW_WRITE                         xe2_reg_bit( 14)
+#define XE2_PIPE_CONTROL_GLOBAL_GTT                       xe2_reg_bit( 24)
 
 // Memory-based interrupts (memirq). The engine's source-report and
 // status-report GGTT pointers are baked into its LRC register state (the driver
@@ -814,189 +832,189 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // wired to this handler; it consults these registers to locate the source. The
 // GuC sits in GT_INTR_DW bank 0 at INTR_GUC (bit 25), reported as engine class
 // OTHER (4) instance GUC (0) in the identity register.
-#define XE2_REG_DG1_MSTR_TILE_INTR                          0x190008
-#define XE2_REG_GFX_MSTR_IRQ                                0x190010
-#define XE2_REG_GT_INTR_DW0                                 0x190018
-#define XE2_REG_GT_INTR_DW1                                 0x19001C
-#define XE2_REG_INTR_IDENTITY_REG0                          0x190060
-#define XE2_REG_INTR_IDENTITY_REG1                          0x190064
-#define XE2_REG_IIR_REG_SELECTOR0                           0x190070
-#define XE2_REG_IIR_REG_SELECTOR1                           0x190074
-#define XE2_IRQ_MASTER_BIT                                  (1U << 31)
-#define XE2_IRQ_DG1_TILE0_BIT                               (1U << 0)
-#define XE2_IRQ_GT_DW0_BIT                                  (1U << 0)
-#define XE2_IRQ_DISPLAY_BIT                                 (1U << 16) // GFX_MSTR_IRQ display source
-#define XE2_IRQ_INTR_GUC_BIT                                (1U << 25)
-#define XE2_IRQ_INTR_DATA_VALID                             (1U << 31)
-#define XE2_IRQ_ENGINE_CLASS_OTHER                          4
-#define XE2_IRQ_GUC_INSTANCE                                0
+#define XE2_REG_DG1_MSTR_TILE_INTR                        0x190008
+#define XE2_REG_GFX_MSTR_IRQ                              0x190010
+#define XE2_REG_GT_INTR_DW0                               0x190018
+#define XE2_REG_GT_INTR_DW1                               0x19001C
+#define XE2_REG_INTR_IDENTITY_REG0                        0x190060
+#define XE2_REG_INTR_IDENTITY_REG1                        0x190064
+#define XE2_REG_IIR_REG_SELECTOR0                         0x190070
+#define XE2_REG_IIR_REG_SELECTOR1                         0x190074
+#define XE2_IRQ_MASTER_BIT                                (1U << 31)
+#define XE2_IRQ_DG1_TILE0_BIT                             (1U << 0)
+#define XE2_IRQ_GT_DW0_BIT                                (1U << 0)
+#define XE2_IRQ_DISPLAY_BIT                               (1U << 16) // GFX_MSTR_IRQ display source
+#define XE2_IRQ_INTR_GUC_BIT                              (1U << 25)
+#define XE2_IRQ_INTR_DATA_VALID                           (1U << 31)
+#define XE2_IRQ_ENGINE_CLASS_OTHER                        4
+#define XE2_IRQ_GUC_INSTANCE                              0
 // GuC interrupt cause carried in the identity register's intr_vec (bits 15:0);
 // the GuC handler queues the G2H worker only when GUC_INTR_GUC2HOST is set.
-#define XE2_IRQ_GUC2HOST_VEC                                (1U << 15)
+#define XE2_IRQ_GUC2HOST_VEC                              (1U << 15)
 
-#define XE2_HW_ENGINE_RENDER_RING_BASE                      0x02000
-#define XE2_HW_ENGINE_BSD_RING_BASE                         0x1C0000
-#define XE2_HW_ENGINE_BSD2_RING_BASE                        0x1C4000
-#define XE2_HW_ENGINE_BSD3_RING_BASE                        0x1D0000
-#define XE2_HW_ENGINE_BSD4_RING_BASE                        0x1D4000
-#define XE2_HW_ENGINE_XEHP_BSD5_RING_BASE                   0x1E0000
-#define XE2_HW_ENGINE_XEHP_BSD6_RING_BASE                   0x1E4000
-#define XE2_HW_ENGINE_XEHP_BSD7_RING_BASE                   0x1F0000
-#define XE2_HW_ENGINE_XEHP_BSD8_RING_BASE                   0x1F4000
-#define XE2_HW_ENGINE_VEBOX_RING_BASE                       0x1C8000
-#define XE2_HW_ENGINE_VEBOX2_RING_BASE                      0x1D8000
-#define XE2_HW_ENGINE_XEHP_VEBOX3_RING_BASE                 0x1E8000
-#define XE2_HW_ENGINE_XEHP_VEBOX4_RING_BASE                 0x1F8000
-#define XE2_HW_ENGINE_COMPUTE0_RING_BASE                    0x1A000
-#define XE2_HW_ENGINE_COMPUTE1_RING_BASE                    0x1C000
-#define XE2_HW_ENGINE_COMPUTE2_RING_BASE                    0x1E000
-#define XE2_HW_ENGINE_COMPUTE3_RING_BASE                    0x26000
-#define XE2_HW_ENGINE_BLT_RING_BASE                         0x22000
-#define XE2_HW_ENGINE_XEHPC_BCS1_RING_BASE                  0x3E0000
-#define XE2_HW_ENGINE_XEHPC_BCS2_RING_BASE                  0x3E2000
-#define XE2_HW_ENGINE_XEHPC_BCS3_RING_BASE                  0x3E4000
-#define XE2_HW_ENGINE_XEHPC_BCS4_RING_BASE                  0x3E6000
-#define XE2_HW_ENGINE_XEHPC_BCS5_RING_BASE                  0x3E8000
-#define XE2_HW_ENGINE_XEHPC_BCS6_RING_BASE                  0x3EA000
-#define XE2_HW_ENGINE_XEHPC_BCS7_RING_BASE                  0x3EC000
-#define XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE                  0x3EE000
-#define XE2_HW_ENGINE_GSCCS_RING_BASE                       0x11A000
+#define XE2_HW_ENGINE_RENDER_RING_BASE                    0x02000
+#define XE2_HW_ENGINE_BSD_RING_BASE                       0x1C0000
+#define XE2_HW_ENGINE_BSD2_RING_BASE                      0x1C4000
+#define XE2_HW_ENGINE_BSD3_RING_BASE                      0x1D0000
+#define XE2_HW_ENGINE_BSD4_RING_BASE                      0x1D4000
+#define XE2_HW_ENGINE_XEHP_BSD5_RING_BASE                 0x1E0000
+#define XE2_HW_ENGINE_XEHP_BSD6_RING_BASE                 0x1E4000
+#define XE2_HW_ENGINE_XEHP_BSD7_RING_BASE                 0x1F0000
+#define XE2_HW_ENGINE_XEHP_BSD8_RING_BASE                 0x1F4000
+#define XE2_HW_ENGINE_VEBOX_RING_BASE                     0x1C8000
+#define XE2_HW_ENGINE_VEBOX2_RING_BASE                    0x1D8000
+#define XE2_HW_ENGINE_XEHP_VEBOX3_RING_BASE               0x1E8000
+#define XE2_HW_ENGINE_XEHP_VEBOX4_RING_BASE               0x1F8000
+#define XE2_HW_ENGINE_COMPUTE0_RING_BASE                  0x1A000
+#define XE2_HW_ENGINE_COMPUTE1_RING_BASE                  0x1C000
+#define XE2_HW_ENGINE_COMPUTE2_RING_BASE                  0x1E000
+#define XE2_HW_ENGINE_COMPUTE3_RING_BASE                  0x26000
+#define XE2_HW_ENGINE_BLT_RING_BASE                       0x22000
+#define XE2_HW_ENGINE_XEHPC_BCS1_RING_BASE                0x3E0000
+#define XE2_HW_ENGINE_XEHPC_BCS2_RING_BASE                0x3E2000
+#define XE2_HW_ENGINE_XEHPC_BCS3_RING_BASE                0x3E4000
+#define XE2_HW_ENGINE_XEHPC_BCS4_RING_BASE                0x3E6000
+#define XE2_HW_ENGINE_XEHPC_BCS5_RING_BASE                0x3E8000
+#define XE2_HW_ENGINE_XEHPC_BCS6_RING_BASE                0x3EA000
+#define XE2_HW_ENGINE_XEHPC_BCS7_RING_BASE                0x3EC000
+#define XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE                0x3EE000
+#define XE2_HW_ENGINE_GSCCS_RING_BASE                     0x11A000
 
-#define XE2_REG_HW_ENGINE_CLASS(base)                       (base + 0x8C)
-#define XE2_REG_HW_ENGINE_CLASS_INSTANCE_ID_MASK            xe2_reg_genmask(9, 4)
-#define XE2_REG_HW_ENGINE_CLASS_ID_MASK                     xe2_reg_genmask(2, 0)
+#define XE2_REG_HW_ENGINE_CLASS(base)                     (base + 0x8C)
+#define XE2_REG_HW_ENGINE_CLASS_INSTANCE_ID_MASK          xe2_reg_genmask(9, 4)
+#define XE2_REG_HW_ENGINE_CLASS_ID_MASK                   xe2_reg_genmask(2, 0)
 
-#define XE2_REG_HW_ENGINE_RING_IDLEDLY(base)                (base + 0x23C)
+#define XE2_REG_HW_ENGINE_RING_IDLEDLY(base)              (base + 0x23C)
 #define XE2_REG_HW_ENGINE_RING_IDLEDLY_INHIBIT_SWITCH_UNTIL_PREEMPTED_MASK \
-                                                            xe2_reg_bit(31)
-#define XE2_REG_HW_ENGINE_RING_IDLEDLY_IDLE_DELAY_MASK      xe2_reg_genmask(20, 0)
+                                                          xe2_reg_bit(31)
+#define XE2_REG_HW_ENGINE_RING_IDLEDLY_IDLE_DELAY_MASK    xe2_reg_genmask(20, 0)
 
-#define XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(base)          (base + 0x54)
+#define XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT(base)        (base + 0x54)
 #define XE2_REG_HW_ENGINE_RING_PWRCTX_MAXCNT_IDLE_WAIT_TIME_MASK \
-                                                            xe2_reg_genmask(19, 0)
+                                                          xe2_reg_genmask(19, 0)
 
-#define XE2_REG_HW_ENGINE_RING_MI_MODE(base)                (base + 0x9C)
+#define XE2_REG_HW_ENGINE_RING_MI_MODE(base)              (base + 0x9C)
 
-#define XE2_REG_HW_ENGINE_RING_TAIL(base)                   (base + 0x30)
-#define XE2_REG_HW_ENGINE_RING_HEAD(base)                   (base + 0x34)
-#define XE2_REG_HW_ENGINE_RING_START(base)                  (base + 0x38)
-#define XE2_REG_HW_ENGINE_RING_CTL(base)                    (base + 0x3C)
+#define XE2_REG_HW_ENGINE_RING_TAIL(base)                 (base + 0x30)
+#define XE2_REG_HW_ENGINE_RING_HEAD(base)                 (base + 0x34)
+#define XE2_REG_HW_ENGINE_RING_START(base)                (base + 0x38)
+#define XE2_REG_HW_ENGINE_RING_CTL(base)                  (base + 0x3C)
 
-#define XE2_VRAM_SIZE                                       0x10000000 // 256 MiB
+#define XE2_VRAM_SIZE                                     0x10000000 // 256 MiB
 
 // https://lists.freedesktop.org/archives/intel-xe/2023-June/005371.html
-#define XE2_GGTT_PTE_VALID                                   (1ULL << 0)
-#define XE2_GGTT_PAGES                                       0x100000
-#define XE2_GGTT_PTE_ADDR_MASK                               0x0000FFFFFFFFF000ULL
-#define XE2_GGTT_MMIO_BASE                                   0x800000 // 8 MiB
-#define XE2_GGTT_MMIO_SIZE                                   0x800000 // 8 MiB
+#define XE2_GGTT_PTE_VALID                                (1ULL << 0)
+#define XE2_GGTT_PAGES                                    0x100000
+#define XE2_GGTT_PTE_ADDR_MASK                            0x0000FFFFFFFFF000ULL
+#define XE2_GGTT_MMIO_BASE                                0x800000 // 8 MiB
+#define XE2_GGTT_MMIO_SIZE                                0x800000 // 8 MiB
 
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
-#define DPCD_REG_REV                                         0x00
+#define DPCD_REG_REV                                      0x00
 // Receiver capability fields read as a 15-byte block from address 0x00. The
 // link rate and lane count must be non-zero or the sink's link config is
 // rejected and the eDP connector is torn down (no fixed mode, no fb0).
-#define DPCD_REG_MAX_LINK_RATE                               0x01
-#define DPCD_REG_MAX_LANE_COUNT                              0x02
-#define DPCD_RECEIVER_CAP_SIZE                               15
-#define DPCD_LINK_RATE_HBR2                                  0x14  // 5.4 Gbps
-#define DPCD_LANE_COUNT_4_ENHANCED                           0x84  // 4 lanes | enhanced framing
+#define DPCD_REG_MAX_LINK_RATE                            0x01
+#define DPCD_REG_MAX_LANE_COUNT                           0x02
+#define DPCD_RECEIVER_CAP_SIZE                            15
+#define DPCD_LINK_RATE_HBR2                               0x14  // 5.4 Gbps
+#define DPCD_LANE_COUNT_4_ENHANCED                        0x84  // 4 lanes | enhanced framing
 // eDP-specific revision block; eDP 1.3 keeps the sink on the MAX_LINK_RATE path
 // (no separate link-rate table required).
-#define DPCD_REG_EDP_DPCD_REV                                0x700
-#define DPCD_EDP_REV_1_3                                     0x02
-#define DPCD_REG_RECEIVER_ALPM_CAP                           0x2E
-#define DPCD_REG_DSC_SUPPORT                                 0x60
-#define DPCD_REG_PSR_SUPPORT                                 0x70
-#define DPCD_REG_PANEL_REPLAY_CAP_SUPPORT                    0xB0
+#define DPCD_REG_EDP_DPCD_REV                             0x700
+#define DPCD_EDP_REV_1_3                                  0x02
+#define DPCD_REG_RECEIVER_ALPM_CAP                        0x2E
+#define DPCD_REG_DSC_SUPPORT                              0x60
+#define DPCD_REG_PSR_SUPPORT                              0x70
+#define DPCD_REG_PANEL_REPLAY_CAP_SUPPORT                 0xB0
 // DisplayPort maximum bandwidth rate.
-#define DPCD_REG_DP_LINK_BW_SET                              0x100
-#define DPCD_DP_LINK_RATE_TABLE                              0x00
-#define DPCD_DP_LINK_BW_1_62                                 0x06 // 1.62 Gbit/s per lane
-#define DPCD_DP_LINK_BW_2_7                                  0x0A // 2.7  Gbit/s per lane
-#define DPCD_DP_LINK_BW_5_4                                  0x14 // 5.4  Gbit/s per lane
-#define DPCD_DP_LINK_BW_8_1                                  0x1E // 8.1  Gbit/s per lane
-#define DPCD_DP_LINK_BW_10                                   0x01 // 10   Gbit/s per lane
-#define DPCD_DP_LINK_BW_13_5                                 0x04 // 13.5 Gbit/s per lane
-#define DPCD_DP_LINK_BW_20                                   0x02 // 20   Gbit/s per lane
+#define DPCD_REG_DP_LINK_BW_SET                           0x100
+#define DPCD_DP_LINK_RATE_TABLE                           0x00
+#define DPCD_DP_LINK_BW_1_62                              0x06 // 1.62 Gbit/s per lane
+#define DPCD_DP_LINK_BW_2_7                               0x0A // 2.7  Gbit/s per lane
+#define DPCD_DP_LINK_BW_5_4                               0x14 // 5.4  Gbit/s per lane
+#define DPCD_DP_LINK_BW_8_1                               0x1E // 8.1  Gbit/s per lane
+#define DPCD_DP_LINK_BW_10                                0x01 // 10   Gbit/s per lane
+#define DPCD_DP_LINK_BW_13_5                              0x04 // 13.5 Gbit/s per lane
+#define DPCD_DP_LINK_BW_20                                0x02 // 20   Gbit/s per lane
 
-#define DPCD_REG_TRAINING_PATTERN_SET                        0x102
-#define DPCD_TRAINING_PATTERN_DISABLE                        0
-#define DPCD_TRAINING_PATTERN_1                              1
-#define DPCD_TRAINING_PATTERN_2                              2
-#define DPCD_TRAINING_PATTERN_2_CDS                          3
-#define DPCD_TRAINING_PATTERN_3                              3
-#define DPCD_TRAINING_PATTERN_4                              7
-#define DPCD_TRAINING_PATTERN_MASK                           0x3
-#define DPCD_TRAINING_PATTERN_MASK_1_4                       0xf
+#define DPCD_REG_TRAINING_PATTERN_SET                     0x102
+#define DPCD_TRAINING_PATTERN_DISABLE                     0
+#define DPCD_TRAINING_PATTERN_1                           1
+#define DPCD_TRAINING_PATTERN_2                           2
+#define DPCD_TRAINING_PATTERN_2_CDS                       3
+#define DPCD_TRAINING_PATTERN_3                           3
+#define DPCD_TRAINING_PATTERN_4                           7
+#define DPCD_TRAINING_PATTERN_MASK                        0x3
+#define DPCD_TRAINING_PATTERN_MASK_1_4                    0xf
 
-#define DPCD_REG_TRAINING_LANE0_SET                          0x103
-#define DPCD_REG_TRAINING_LANE1_SET                          0x104
-#define DPCD_REG_TRAINING_LANE2_SET                          0x105
-#define DPCD_REG_TRAINING_LANE3_SET                          0x106
-#define DPCD_TRAINING_LANEX_SWING_LEVEL_0                    (0 << 0)
-#define DPCD_TRAINING_LANEX_SWING_LEVEL_1                    (1 << 0)
-#define DPCD_TRAINING_LANEX_SWING_LEVEL_2                    (2 << 0)
-#define DPCD_TRAINING_LANEX_SWING_LEVEL_3                    (3 << 0)
+#define DPCD_REG_TRAINING_LANE0_SET                       0x103
+#define DPCD_REG_TRAINING_LANE1_SET                       0x104
+#define DPCD_REG_TRAINING_LANE2_SET                       0x105
+#define DPCD_REG_TRAINING_LANE3_SET                       0x106
+#define DPCD_TRAINING_LANEX_SWING_LEVEL_0                 (0 << 0)
+#define DPCD_TRAINING_LANEX_SWING_LEVEL_1                 (1 << 0)
+#define DPCD_TRAINING_LANEX_SWING_LEVEL_2                 (2 << 0)
+#define DPCD_TRAINING_LANEX_SWING_LEVEL_3                 (3 << 0)
 
-#define DPCD_REG_LANE0_1_STATUS                              0x202
-#define DPCD_REG_LANE2_3_STATUS                              0x203
-#define DPCD_LANEX_X_CR_DONE                                 (1 << 0)
-#define DPCD_LANEX_X_CHANNEL_EQ_DONE                         (1 << 1)
-#define DPCD_LANEX_X_SYMBOL_LOCKED                           (1 << 2)
-#define DPCD_LANEX_X_CHANNEL_EQ_BITS                         ( DPCD_LANEX_X_CR_DONE \
-                                                             | DPCD_LANEX_X_CHANNEL_EQ_DONE \
-                                                             | DPCD_LANEX_X_SYMBOL_LOCKED )
+#define DPCD_REG_LANE0_1_STATUS                           0x202
+#define DPCD_REG_LANE2_3_STATUS                           0x203
+#define DPCD_LANEX_X_CR_DONE                              (1 << 0)
+#define DPCD_LANEX_X_CHANNEL_EQ_DONE                      (1 << 1)
+#define DPCD_LANEX_X_SYMBOL_LOCKED                        (1 << 2)
+#define DPCD_LANEX_X_CHANNEL_EQ_BITS                      ( DPCD_LANEX_X_CR_DONE \
+                                                          | DPCD_LANEX_X_CHANNEL_EQ_DONE \
+                                                          | DPCD_LANEX_X_SYMBOL_LOCKED )
 
-#define DPCD_REG_LANE_ALIGN_STATUS_UPDATED                   0x204
-#define DPCD_INTERLANE_ALIGN_DONE                            (1 << 0)
-#define DPCD_128B132B_DPRX_EQ_INTERLANE_ALIGN_DONE           (1 << 2) // 2.0 E11
-#define DPCD_128B132B_DPRX_CDS_INTERLANE_ALIGN_DONE          (1 << 3) // 2.0 E11
-#define DPCD_128B132B_LT_FAILED                              (1 << 4) // 2.0 E11
-#define DPCD_DOWNSTREAM_PORT_STATUS_CHANGED                  (1 << 6)
-#define DPCD_LINK_STATUS_UPDATED                             (1 << 7)
+#define DPCD_REG_LANE_ALIGN_STATUS_UPDATED                0x204
+#define DPCD_INTERLANE_ALIGN_DONE                         (1 << 0)
+#define DPCD_128B132B_DPRX_EQ_INTERLANE_ALIGN_DONE        (1 << 2) // 2.0 E11
+#define DPCD_128B132B_DPRX_CDS_INTERLANE_ALIGN_DONE       (1 << 3) // 2.0 E11
+#define DPCD_128B132B_LT_FAILED                           (1 << 4) // 2.0 E11
+#define DPCD_DOWNSTREAM_PORT_STATUS_CHANGED               (1 << 6)
+#define DPCD_LINK_STATUS_UPDATED                          (1 << 7)
 
-#define DPCD_SINK_STATUS                                     0x205
-#define DPCD_RECEIVE_PORT_0_STATUS                           (1 << 0)
-#define DPCD_RECEIVE_PORT_1_STATUS                           (1 << 1)
-#define DPCD_STREAM_REGENERATION_STATUS                      (1 << 2) // 2.0
-#define DPCD_INTRA_HOP_AUX_REPLY_INDICATION                  (1 << 3) // 2.0
+#define DPCD_SINK_STATUS                                  0x205
+#define DPCD_RECEIVE_PORT_0_STATUS                        (1 << 0)
+#define DPCD_RECEIVE_PORT_1_STATUS                        (1 << 1)
+#define DPCD_STREAM_REGENERATION_STATUS                   (1 << 2) // 2.0
+#define DPCD_INTRA_HOP_AUX_REPLY_INDICATION               (1 << 3) // 2.0
 
-#define DPCD_TEST_REQUEST                                    0x218
-#define DPCD_TEST_REQUEST_LINK_TRAINING                      (1 << 0)
-#define DPCD_TEST_REQUEST_LINK_VIDEO_PATTERN                 (1 << 1)
-#define DPCD_TEST_REQUEST_LINK_EDID_READ                     (1 << 2)
-#define DPCD_TEST_REQUEST_LINK_PHY_TEST_PATTERN              (1 << 3) // DPCD >= 1.1
-#define DPCD_TEST_REQUEST_LINK_FAUX_PATTERN                  (1 << 4) // DPCD >= 1.2
-#define DPCD_TEST_REQUEST_LINK_AUDIO_PATTERN                 (1 << 5) // DPCD >= 1.2
-#define DPCD_TEST_REQUEST_LINK_AUDIO_DISABLED_VIDEO          (1 << 6) // DPCD >= 1.2
+#define DPCD_TEST_REQUEST                                 0x218
+#define DPCD_TEST_REQUEST_LINK_TRAINING                   (1 << 0)
+#define DPCD_TEST_REQUEST_LINK_VIDEO_PATTERN              (1 << 1)
+#define DPCD_TEST_REQUEST_LINK_EDID_READ                  (1 << 2)
+#define DPCD_TEST_REQUEST_LINK_PHY_TEST_PATTERN           (1 << 3) // DPCD >= 1.1
+#define DPCD_TEST_REQUEST_LINK_FAUX_PATTERN               (1 << 4) // DPCD >= 1.2
+#define DPCD_TEST_REQUEST_LINK_AUDIO_PATTERN              (1 << 5) // DPCD >= 1.2
+#define DPCD_TEST_REQUEST_LINK_AUDIO_DISABLED_VIDEO       (1 << 6) // DPCD >= 1.2
 
-#define DPCD_TEST_RESPONSE                                   0x260
+#define DPCD_TEST_RESPONSE                                0x260
 
-#define DPCD_REG_SOURCE_OUI                                  0x300
+#define DPCD_REG_SOURCE_OUI                               0x300
 
-#define DPCD_REG_SET_POWER                                   0x600
-#define DPCD_SET_POWER_D0                                    0x1
-#define DPCD_SET_POWER_D3                                    0x1
-#define DPCD_SET_POWER_MASK                                  0x1
-#define DPCD_SET_POWER_D3_AUX_ON                             0x1
+#define DPCD_REG_SET_POWER                                0x600
+#define DPCD_SET_POWER_D0                                 0x1
+#define DPCD_SET_POWER_D3                                 0x1
+#define DPCD_SET_POWER_MASK                               0x1
+#define DPCD_SET_POWER_D3_AUX_ON                          0x1
 
 // EDID address and size is not part of DPCD.
-#define DPCD_INTEL_EDID_ADDR                                 0x50
-#define DPCD_INTEL_EDID_SIZE                                 128
+#define DPCD_INTEL_EDID_ADDR                              0x50
+#define DPCD_INTEL_EDID_SIZE                              128
 
 // https://docs.amd.com/r/en-US/pg199-displayport-tx-subsystem/I2C-Over-AUX-Transactions
 //
 // Pay attention: Driver natively emulates I2C transactions. Thus, pseudo-I2C
 // commands goes through PCI.
-#define DPCD_REQ_I2C_WRITE                                  0x0
-#define DPCD_REQ_I2C_READ                                   0x1
-#define DPCD_REQ_I2C_WRITE_STATUS_UPDATE                    0x2
-#define DPCD_REQ_I2C_WRITE_MOT                              0x4 // Middle of transaction
-#define DPCD_REQ_I2C_READ_MOT                               0x5 // Middle of transaction
-#define DPCD_REQ_NATIVE_WRITE                               0x8
-#define DPCD_REQ_NATIVE_READ                                0x9
+#define DPCD_REQ_I2C_WRITE                                0x0
+#define DPCD_REQ_I2C_READ                                 0x1
+#define DPCD_REQ_I2C_WRITE_STATUS_UPDATE                  0x2
+#define DPCD_REQ_I2C_WRITE_MOT                            0x4 // Middle of transaction
+#define DPCD_REQ_I2C_READ_MOT                             0x5 // Middle of transaction
+#define DPCD_REQ_NATIVE_WRITE                             0x8
+#define DPCD_REQ_NATIVE_READ                              0x9
 
 // Auxiliary channel entry.
 typedef struct {
@@ -1750,11 +1768,11 @@ static uint32_t xe2_lrc_ctx_reg(xe2_dev_t *xe2, uint32_t idx)
 // Perform a ring post-sync store: write a value to a GGTT address.
 static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
 {
-    if (ggtt_addr == 0) {
+    if (unlikely(ggtt_addr == 0)) {
         return;
     }
     xe2_dma_addr_t dst = xe2_ggtt_translate(xe2, ggtt_addr);
-    if (dst.addr == 0) {
+    if (unlikely(dst.addr == 0)) {
         return;
     }
     xe2_dma_write32(xe2, dst, 0, value);
@@ -1794,6 +1812,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
         uint32_t len = 1;
 
         if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_MI) {
+            rvvm_info("MI opcode: %x", XE2_MI_OPCODE(h));
             switch (XE2_MI_OPCODE(h)) {
                 case XE2_MI_OP_NOOP:
                 case XE2_MI_OP_ARB_CHECK:
@@ -1823,6 +1842,38 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
                         }
                     }
                     break;
+                // Key command to start receiving batch buffers from the guest.
+                // Guest there only publishes batch address. We only should do something
+                // with that on MI_USER_INTERRUPT.
+                //
+                // Note that this uses PPGTT instead of normal GGTT. This means
+                // page table lookup should be implemented to interpret 39-bit
+                // addressing.
+                //
+                // Typical PPGTT address:
+                // 0x4000300000
+                // 0100000000000000001100010001010111010000
+                // |      |       |       |       |       |
+                // 39     32      24     16       8       0
+                //
+                // Tiled resources VA translation table L3 pointer table says:
+                // For physical memory option, address bits [47:39] has to be programmed to "0" as it is defined the
+                // limit of physical memory allocation.
+                case XE2_MI_OP_BATCH_BUFFER_START: { // 0x31
+                    // opcode: 411042049
+                    uint32_t lo = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
+                    uint32_t hi = xe2_dma_read32(xe2, ring, ((i + 2) % ring_dw) * 4);
+                    rvvm_addr_t bo = (uint64_t) lo
+                                   | (uint64_t) hi << 32;
+                    if (h & XE2_MI_OP_BATCH_BUFFER_START_PPGTT) {
+                        ;
+                    } else {
+                        ;
+                    }
+                    rvvm_info("MI batch buffer start: BO - 0x%lx", bo);
+                    len = 2;
+                    break;
+                }
                 default:
                     len = (h & 0xff) + 2;
                     break;
@@ -2007,7 +2058,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
         uint32_t type   = xe2_reg_field_get(XE2_GUC_HXG_MSG_0_TYPE, msg[0]);
         uint32_t action = xe2_reg_field_get(XE2_GUC_HXG_MSG_0_ACTION, msg[0]);
 
-        rvvm_info("GuC CT: action=0x%x type=%u fence=0x%x dwords=%u", action, type, fence, num_dwords);
+        rvvm_info("GuC CT: action=0x%x type=%u fence=0x%x (%u) dwords=%u", action, type, fence, fence, num_dwords);
 
         switch (action) {
             case XE2_GUC_ACTION_REGISTER_CONTEXT: {
@@ -2032,6 +2083,13 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 xe2_track_context(xe2, xe2->pphwsp_addr);
                 break;
             }
+            // A brushstroke liturgy, the first of three offerings to be
+            // conjured as tribute to the renderer.
+            case XE2_GUC_ACTION_DEREGISTER_CONTEXT: {
+                uint32_t done = msg[1]; // GuC ID.
+                xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_DEREGISTER_CONTEXT_DONE, &done, 1);
+                break;
+            }
             case XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET: {
                 // The driver enables (or disables) scheduling on a context and
                 // blocks on a matching SCHED_CONTEXT_MODE_DONE event before it
@@ -2040,6 +2098,23 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 // pending_disable wait clears and the reserved G2H space frees.
                 uint32_t done[2] = { msg[1], msg[2] };
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
+                break;
+            }
+            case XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES: { // 0x100B
+                // GuC CT: action=0x100b type=2 fence=0x8c5e (35934) dwords=10
+                // GuC update context policies dword[0]: 0x2000100b
+                // GuC update context policies dword[1]: 0x0
+                // GuC update context policies dword[2]: 0x20030001
+                // GuC update context policies dword[3]: 0x0
+                // GuC update context policies dword[4]: 0x20010001
+                // GuC update context policies dword[5]: 0x3e8
+                // GuC update context policies dword[6]: 0x20020001
+                // GuC update context policies dword[7]: 0x9c400
+                // GuC update context policies dword[8]: 0x20050001
+                // GuC update context policies dword[9]: 0x0
+                for (uint32_t i = 0; i < num_dwords; ++i) {
+                    rvvm_info("GuC update context policies dword[%u]: 0x%x", i, msg[i]);
+                }
                 break;
             }
             case XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST: {
@@ -2919,6 +2994,8 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
         }
 
+        // These assumed to be read-only for guest. When XE2_MI_OP_BATCH_BUFFER_START
+        // was issued, driver polls these registers to get some reasonable value.
         case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_RENDER_RING_BASE):
             rvvm_info("Read ring head: HW engine renderer");
             write_uint32_le(data, 0);
@@ -2937,6 +3014,10 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
         case XE2_REG_HW_ENGINE_RING_TAIL(XE2_HW_ENGINE_XEHPC_BCS8_RING_BASE):
             rvvm_info("Read ring tail: HW engine BCS8");
             write_uint32_le(data, 0);
+            break;
+
+        case XE2_REG_HW_ENGINE_RING_CTL(XE2_HW_ENGINE_RENDER_RING_BASE):
+            rvvm_info("Read ring ctl: HW engine renderer");
             break;
 
         // Top-level display interrupt control. Report enable bit (if set by
