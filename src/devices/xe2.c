@@ -1959,7 +1959,7 @@ static void xe2_track_context(xe2_dev_t *xe2, xe2_dma_addr_t pphwsp)
     if (free_slot < 0) {
         return;
     }
-    xe2->pphwsp_addr = pphwsp;
+    xe2->pphwsp_addr              = pphwsp;
     xe2->ctx[free_slot].pphwsp    = pphwsp;
     xe2->ctx[free_slot].last_tail = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
     xe2->ctx[free_slot].valid     = true;
@@ -2061,16 +2061,19 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
         rvvm_info("GuC CT: action=0x%x type=%u fence=0x%x (%u) dwords=%u", action, type, fence, fence, num_dwords);
 
         switch (action) {
+            // Note that context ID = GuC ID.
             case XE2_GUC_ACTION_REGISTER_CONTEXT: {
                 // The registered context address points at the per-process HW
                 // status page (PPHWSP), which is the first page of the context.
                 rvvm_addr_t hwlrca = (rvvm_addr_t) msg[10]
                                    | (rvvm_addr_t) msg[11] << 32;
                 hwlrca &= 0x0000FFFFFFFFF000ULL; // page addr only; drop desc flags + engine class/instance
+                // BUG: Possibly problematic. Only one HWLRCA/PPHWSP address stored.
+                //      Should be specified for each engine.
                 xe2->hwlrca_addr = xe2_ggtt_translate(xe2, hwlrca);
                 xe2->pphwsp_addr = xe2_ggtt_translate(xe2, hwlrca);
-                rvvm_info("GuC CT: register context, PPHWSP 0x%lx -> 0x%lx",
-                          (uint64_t) hwlrca, (uint64_t) xe2->pphwsp_addr.addr);
+                rvvm_info("GuC CT: register context, PPHWSP 0x%lx -> 0x%lx, engine class: %u",
+                          (uint64_t) hwlrca, (uint64_t) xe2->pphwsp_addr.addr, msg[3]);
                 // The first registered context is rcs0 (irq_page 0); its source
                 // pointer reveals the shared memirq BO base for GuC signalling.
                 if (xe2->guc.memirq_base_ggtt == 0) {
@@ -2090,13 +2093,36 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_DEREGISTER_CONTEXT_DONE, &done, 1);
                 break;
             }
+            // Note that driver expects no response on similar request
+            // XE2_GUC_ACTION_SCHED_CONTEXT
             case XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET: {
                 // The driver enables (or disables) scheduling on a context and
                 // blocks on a matching SCHED_CONTEXT_MODE_DONE event before it
                 // can submit or tear down. msg[1] = guc_id, msg[2] = runnable
                 // state (enable/disable); echo both back so its pending_enable/
                 // pending_disable wait clears and the reserved G2H space frees.
+                //
+                // This called only when context was not registered yet.
+                //
+                // This called inside:
+                // static const struct drm_sched_backend_ops drm_sched_ops = {
+	            //        .run_job = guc_exec_queue_run_job,
+                //        ...
+                // }
+                //
+                // I suspect DRM waits on some condition that is not met.
+                // Trace:
+                //
+                // [<ffffffff018eab70>] enable_scheduling+0x6c/0x5d0 [xe]
+                // [<ffffffff0179fc22>] guc_exec_queue_timedout_job+0x5fa/0xbcc [xe]
+                // [<ffffffff017227ce>] drm_sched_job_timedout+0xa2/0x258 [gpu_sched]
+                // [<ffffffff8004266a>] process_one_work+0x15a/0x2e0
+                // [<ffffffff80043914>] worker_thread+0x2c4/0x420
+                // [<ffffffff8004ba24>] kthread+0xc0/0x178
+                // [<ffffffff800102ce>] ret_from_fork_kernel+0xe/0xcc
+                // [<ffffffff8089e4da>] ret_from_fork_kernel_asm+0x16/0x18
                 uint32_t done[2] = { msg[1], msg[2] };
+                rvvm_info("GuC SCHED_CONTEXT_MODE_SET: %s", msg[2] ? "enable" : "disable");
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
                 break;
             }
@@ -3428,6 +3454,11 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
 
         case XE2_REG_GUC_HOST_INTERRUPT:
             xe2_guc_host_interrupt(xe2);
+            break;
+
+        // This is not called at all.
+        case XE2_REG_HW_ENGINE_RING_START(XE2_HW_ENGINE_RENDER_RING_BASE):
+            rvvm_info("Write ring start: HW engine renderer: 0x%x", read_uint32_le(data));
             break;
 
         case XE2_REG_HW_ENGINE_RING_HEAD(XE2_HW_ENGINE_RENDER_RING_BASE):
