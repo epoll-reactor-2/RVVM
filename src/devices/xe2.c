@@ -775,13 +775,15 @@ glmark2-es2-drm
 // per-process HW status page (PPHWSP), one page in. Each entry below is a dword
 // index into that register state; the value lives at (LRC base + 0x1000 + i*4).
 #define XE2_LRC_REGS_OFFSET                               0x1000
-#define XE2_CTX_RING_HEAD                                 5
-#define XE2_CTX_RING_TAIL                                 7
-#define XE2_CTX_RING_START                                9
-#define XE2_CTX_RING_CTL                                  11
-#define XE2_CTX_INT_STATUS_REPORT_PTR                     87
-#define XE2_CTX_INT_SRC_REPORT_PTR                        89
-#define XE2_CTX_CS_INT_VEC_DATA                           91
+#define XE2_CTX_RING_HEAD                                 0x5
+#define XE2_CTX_RING_TAIL                                 0x7
+#define XE2_CTX_RING_START                                0x9
+#define XE2_CTX_RING_CTL                                  0xB
+#define XE2_CTX_RING_PDP0_UDW                             0x31
+#define XE2_CTX_RING_PDP0_LDW                             0x33
+#define XE2_CTX_INT_STATUS_REPORT_PTR                     0x57
+#define XE2_CTX_INT_SRC_REPORT_PTR                        0x59
+#define XE2_CTX_CS_INT_VEC_DATA                           0x5B
 
 // Up to four engine contexts (rcs0/bcs0/ccs0/...) may be registered at once.
 #define XE2_MAX_CONTEXTS                                  8
@@ -1789,6 +1791,9 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
     uint32_t head      = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_HEAD);
     uint32_t tail      = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
     uint32_t ctl       = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_CTL);
+    uint32_t ppgtt_lo  = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_PDP0_LDW);
+    uint32_t ppgtt_hi  = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_PDP0_UDW);
+    rvvm_addr_t ppgtt  = ((rvvm_addr_t) ppgtt_hi << 32) | (rvvm_addr_t) ppgtt_lo;
 
     if (ring_ggtt == 0 || head == tail) {
         return false;
@@ -1798,6 +1803,8 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
     if (ring.addr == 0) {
         return false;
     }
+
+    rvvm_info("Got PPGTT address: 0x%lx (from %x, %x)", ppgtt, ppgtt_lo, ppgtt_hi);
 
     // RING_CTL holds (size - PAGE_SIZE) page-aligned; recover the dword count.
     uint32_t ring_bytes = (ctl & 0x003ff000U) + 0x1000U;
@@ -1811,8 +1818,10 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
         uint32_t h   = xe2_dma_read32(xe2, ring, i * 4);
         uint32_t len = 1;
 
+        rvvm_info("General opcode: 0x%x, instruction type: 0x%x", h, XE2_INSTR_TYPE(h));
+
         if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_MI) {
-            rvvm_info("MI opcode: %x", XE2_MI_OPCODE(h));
+            rvvm_info("MI opcode: 0x%x", XE2_MI_OPCODE(h));
             switch (XE2_MI_OPCODE(h)) {
                 case XE2_MI_OP_NOOP:
                 case XE2_MI_OP_ARB_CHECK:
@@ -1866,11 +1875,15 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
                     rvvm_addr_t bo = (uint64_t) lo
                                    | (uint64_t) hi << 32;
                     if (h & XE2_MI_OP_BATCH_BUFFER_START_PPGTT) {
-                        ;
+                        rvvm_info("MI batch buffer start (PPGTT): BO - 0x%lx", bo);
                     } else {
-                        ;
+                        rvvm_info("MI batch buffer start (GGTT): BO - 0x%lx", bo);
+                        xe2_dma_addr_t dma = xe2_ggtt_translate(xe2, bo);
+                        for (size_t __i = 0; __i < 4; ++__i) {
+                            uint32_t cmd = xe2_dma_read32(xe2, dma, __i * sizeof(uint32_t));
+                            rvvm_info("Read GGTT cmd: 0x%x", cmd);
+                        }
                     }
-                    rvvm_info("MI batch buffer start: BO - 0x%lx", bo);
                     len = 2;
                     break;
                 }
@@ -1973,14 +1986,17 @@ static void xe2_complete_advanced_contexts(xe2_dev_t *xe2)
 {
     for (size_t i = 0; i < XE2_MAX_CONTEXTS; i++) {
         if (!xe2->ctx[i].valid) {
+            rvvm_info("%s: Context %zu is not valid", __FUNCTION__, i);
             continue;
         }
         xe2->pphwsp_addr = xe2->ctx[i].pphwsp;
         uint32_t tail = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
         if (tail == xe2->ctx[i].last_tail) {
+            rvvm_info("%s: Context %zu tail was not updated (%u, %u)", __FUNCTION__, i, tail, xe2->ctx[i].last_tail);
             continue;
         }
         xe2->ctx[i].last_tail = tail;
+        rvvm_info("%s: Context %zu needs completion", __FUNCTION__, i);
         xe2_signal_render_completion(xe2);
     }
 }
