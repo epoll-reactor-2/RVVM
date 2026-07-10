@@ -93,7 +93,7 @@ USE_JNI         ?= 0 # Enable JNI support in librvvm
 
 # Acceleration
 # Enable JIT by default on x86_64, arm64, riscv64
-USE_JIT ?= $(if $(filter x86_64 arm64 riscv64,$(ARCH)),1,0)
+USE_JIT ?= $(if $(filter x86_64 arm64 riscv64 loongarch64,$(ARCH)),1,0)
 USE_KVM ?= 0
 
 # Misc toggles for debugging host platform/compiler issues
@@ -146,7 +146,7 @@ override SRC_USE_LIBRETRO  := $(SRCDIR)/bindings/libretro/libretro.c
 override SRC_USE_JNI       := $(SRCDIR)/bindings/jni/rvvm_jni.c
 
 # Useflag dependencies
-override RVJIT_SUPPORTS_ARCH := $(if $(filter i386 x86_64 arm% riscv%,$(ARCH)),1)
+override RVJIT_SUPPORTS_ARCH := $(if $(filter i386 x86_64 arm% riscv% loongarch64,$(ARCH)),1)
 override DEPS_USE_JIT        := RVJIT_SUPPORTS_ARCH
 
 override DEPS_USE_X11       := USE_GUI
