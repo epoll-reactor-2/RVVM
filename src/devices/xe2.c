@@ -794,7 +794,9 @@ glmark2-es2-drm
 // GGTT post-sync write) and raises MI_USER_INTERRUPT.
 #define XE2_INSTR_TYPE(h)                                 ((h) >> 29)
 #define XE2_INSTR_TYPE_MI                                 0
+#define XE2_INSTR_TYPE_GSC                                2
 #define XE2_INSTR_TYPE_GFXPIPE                            3
+#define XE2_INSTR_TYPE_GFX_STATE                          4
 #define XE2_MI_OPCODE(h)                                  (((h) >> 23) & 0x3f)
 #define XE2_MI_OP_NOOP                                    0x00
 #define XE2_MI_OP_USER_INTERRUPT                          0x02
@@ -802,6 +804,7 @@ glmark2-es2-drm
 #define XE2_MI_OP_ARB_ON_OFF                              0x08
 #define XE2_MI_OP_BATCH_BUFFER_END                        0x0a
 #define XE2_MI_OP_STORE_DATA_IMM                          0x20
+#define XE2_MI_OP_STORE_REG_IMM                           0x24
 #define XE2_MI_OP_FLUSH_DW                                0x26
 #define XE2_MI_OP_BATCH_BUFFER_START                      0x31
 #define XE2_MI_OP_BATCH_BUFFER_START_PPGTT                xe2_reg_bit( 8)
@@ -811,6 +814,8 @@ glmark2-es2-drm
 #define XE2_PIPE_CONTROL_SIG                              0x7a             // (h >> 24)
 #define XE2_PIPE_CONTROL_QW_WRITE                         xe2_reg_bit( 14)
 #define XE2_PIPE_CONTROL_GLOBAL_GTT                       xe2_reg_bit( 24)
+
+#define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)
 
 // Memory-based interrupts (memirq). The engine's source-report and
 // status-report GGTT pointers are baked into its LRC register state (the driver
@@ -1049,6 +1054,13 @@ typedef struct {
 } xe2_dma_addr_t;
 
 typedef struct {
+    uint32_t    control;
+    uint32_t    status;
+    uint32_t    on_delays;
+    uint32_t    off_delays;
+} xe2_power_control_t;
+
+typedef struct {
     pci_func_t *pci_func;
     spinlock_t  lock;
     uint32_t    forcewake_gsc;
@@ -1057,11 +1069,10 @@ typedef struct {
     uint32_t    gt_gdrst;
     uint32_t    pll_enable;
     uint32_t    dbuf_ctl[4];
-    uint32_t    pp_control;
-    uint32_t    pp_status;
-    uint32_t    pp_on_delays;
-    uint32_t    pp_off_delays;
-    uint32_t    dc_state;
+
+    xe2_power_control_t pp;
+    xe2_power_control_t pp_pch;
+    uint32_t            dc_state;
 
     uint32_t    steer_semaphore;
     uint32_t    wopcm_size;
@@ -1357,9 +1368,9 @@ static void xe2_scanout(xe2_dev_t *xe2)
     if (xe2_reg_field_get(XE2_REG_PLANE_CTL_X_TILED_MASK, ctl))
         return;
 
-    uint32_t width  = (xe2->display.plane_size & 0x1fff) + 1;
+    uint32_t width  =  (xe2->display.plane_size & 0x1fff) + 1;
     uint32_t height = ((xe2->display.plane_size >> 16) & 0x1fff) + 1;
-    uint32_t stride = (xe2->display.plane_stride & 0x3ff) * 64;
+    uint32_t stride =  (xe2->display.plane_stride & 0x3ff) * 64;
     if (!width || !height || !stride)
         return;
 
@@ -1891,15 +1902,17 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
                     len = (h & 0xff) + 2;
                     break;
             }
-        } else if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_GFXPIPE
-                   && (h >> 24) == XE2_PIPE_CONTROL_SIG) {
-            len = (h & 0xff) + 2;
-            uint32_t flags = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
-            if ((flags & XE2_PIPE_CONTROL_QW_WRITE)
-                && (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
-                uint32_t a = xe2_dma_read32(xe2, ring, ((i + 2) % ring_dw) * 4);
-                uint32_t v = xe2_dma_read32(xe2, ring, ((i + 4) % ring_dw) * 4);
-                xe2_ring_store(xe2, a, v);
+        } else if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_GFXPIPE) {
+            rvvm_info("GFX opcode: 0x%x", XE2_GFXPIPE_OPCODE(h));
+            if ((h >> 24) == XE2_PIPE_CONTROL_SIG) {
+                len = (h & 0xff) + 2;
+                uint32_t flags = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
+                if ((flags & XE2_PIPE_CONTROL_QW_WRITE)
+                    && (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
+                    uint32_t a = xe2_dma_read32(xe2, ring, ((i + 2) % ring_dw) * 4);
+                    uint32_t v = xe2_dma_read32(xe2, ring, ((i + 4) % ring_dw) * 4);
+                    xe2_ring_store(xe2, a, v);
+                }
             }
         } else {
             len = (h & 0xff) + 2;
@@ -1947,7 +1960,7 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2)
 
     // The engine reports on its own MSI-X vector, which the driver recorded in
     // the context; the GuC owns vector 0, so raising 0 here would be ignored.
-    uint32_t msix_vec = xe2_lrc_ctx_reg(xe2, XE2_CTX_CS_INT_VEC_DATA) & 0xffff;
+    uint32_t msix_vec = xe2_lrc_ctx_reg(xe2, XE2_CTX_CS_INT_VEC_DATA) & 0xFFFF;
     pci_send_irq(xe2->pci_func, msix_vec);
 }
 
@@ -1986,18 +1999,19 @@ static void xe2_complete_advanced_contexts(xe2_dev_t *xe2)
 {
     for (size_t i = 0; i < XE2_MAX_CONTEXTS; i++) {
         if (!xe2->ctx[i].valid) {
-            rvvm_info("%s: Context %zu is not valid", __FUNCTION__, i);
+            rvvm_info("%s: Context %zu (PPHWSP: 0x%lx) is not valid", __FUNCTION__, i, xe2->ctx[i].pphwsp.addr);
             continue;
         }
         xe2->pphwsp_addr = xe2->ctx[i].pphwsp;
         uint32_t tail = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
         if (tail == xe2->ctx[i].last_tail) {
-            rvvm_info("%s: Context %zu tail was not updated (%u, %u)", __FUNCTION__, i, tail, xe2->ctx[i].last_tail);
+            rvvm_info("%s: Context %zu (PPHWSP: 0x%lx) tail was not updated (%u, %u)", __FUNCTION__,
+                      i, xe2->pphwsp_addr.addr, tail, xe2->ctx[i].last_tail);
             continue;
         }
-        xe2->ctx[i].last_tail = tail;
-        rvvm_info("%s: Context %zu needs completion", __FUNCTION__, i);
         xe2_signal_render_completion(xe2);
+        xe2->ctx[i].last_tail = tail;
+        rvvm_info("%s: Context %zu (PPHWSP: 0x%lx) needs completion", __FUNCTION__, i, xe2->pphwsp_addr.addr);
     }
 }
 
@@ -2020,6 +2034,13 @@ static void xe2_slpc_publish(xe2_dev_t *xe2)
 // Handle an SLPC request sub-event. The reset/query events carry the shared-data
 // BO address in the first argument; parameter set/unset carry an id (+value).
 // Every variant publishes the running state so the driver's poll succeeds.
+//
+// Noticed difference in behaviour of following programs
+// 1. drm_red: few lines of code painting screen with red color
+// 2. glmark2-es2-drm: not works, polls on XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET.
+//
+// drm_red does not interact with GuC action 0x3003 (XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST),
+// whereas OpenGL renderer does. Maybe, driver expects something and waits for event by polling.
 static void xe2_slpc_request(xe2_dev_t *xe2, const uint32_t *msg)
 {
     uint32_t event = xe2_reg_field_get(XE2_SLPC_EVENT_ID_MASK, msg[1]);
@@ -2460,6 +2481,7 @@ static inline void xe2_cx0_msgbus_transaction(xe2_cx0_lane_t *lane, uint32_t cmd
 
 static inline bool xe2_skip_mmio_range(size_t offset)
 {
+    return 1;
     bool skip = 0;
     skip |= offset >= 0x050000 && offset <= 0x05FFFF;
     skip |= offset >= 0x090000 && offset <= 0x09FFFF;
@@ -2648,33 +2670,31 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
             break;
 
         case XE2_REG_PP_STATUS:
-            write_uint32_le(data, xe2->pp_status);
+            write_uint32_le(data, xe2->pp.status);
             break;
         case XE2_REG_PP_CONTROL:
-            xe2->pp_control |= xe2_reg_field_prep(XE2_REG_PP_CONTROL_POWER_ON_MASK, 1)
+            xe2->pp.control |= xe2_reg_field_prep(XE2_REG_PP_CONTROL_POWER_ON_MASK, 1)
                             |  xe2_reg_field_prep(XE2_REG_PP_CONTROL_EPD_FORCE_VDD_MASK, 1);
-            write_uint32_le(data, xe2->pp_control);
+            write_uint32_le(data, xe2->pp.control);
             break;
         case XE2_REG_PP_ON_DELAYS:
-            write_uint32_le(data, xe2->pp_on_delays);
+            write_uint32_le(data, xe2->pp.on_delays);
             break;
         case XE2_REG_PP_OFF_DELAYS:
-            write_uint32_le(data, xe2->pp_off_delays);
+            write_uint32_le(data, xe2->pp.off_delays);
             break;
 
         case XE2_REG_PCH_PP_STATUS:
-            write_uint32_le(data, xe2->pp_status);
+            write_uint32_le(data, xe2->pp_pch.status);
             break;
         case XE2_REG_PCH_PP_CONTROL:
-            xe2->pp_control |= xe2_reg_field_prep(XE2_REG_PP_CONTROL_POWER_ON_MASK, 1)
-                            |  xe2_reg_field_prep(XE2_REG_PP_CONTROL_EPD_FORCE_VDD_MASK, 1);
-            write_uint32_le(data, xe2->pp_control);
+            write_uint32_le(data, xe2->pp_pch.control);
             break;
         case XE2_REG_PCH_PP_ON_DELAYS:
-            write_uint32_le(data, xe2->pp_on_delays);
+            write_uint32_le(data, xe2->pp_pch.on_delays);
             break;
         case XE2_REG_PCH_PP_OFF_DELAYS:
-            write_uint32_le(data, xe2->pp_off_delays);
+            write_uint32_le(data, xe2->pp_pch.off_delays);
             break;
 
         case XE2_REG_HSW_POWER_WELL_CTL1:
@@ -3364,33 +3384,33 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         }
 
         case XE2_REG_PP_STATUS:
-            xe2->pp_status = read_uint32_le(data);
+            xe2->pp.status = read_uint32_le(data);
             break;
         case XE2_REG_PP_CONTROL:
-            xe2->pp_control = read_uint32_le(data);
-            if (xe2->pp_control & XE2_REG_PP_CONTROL_POWER_ON_MASK)
-                xe2->pp_status = XE2_REG_PP_ON_MASK | XE2_REG_PP_READY_MASK;
+            xe2->pp.control = read_uint32_le(data);
+            if (xe2->pp.control & XE2_REG_PP_CONTROL_POWER_ON_MASK)
+                xe2->pp.status = XE2_REG_PP_ON_MASK | XE2_REG_PP_READY_MASK;
             else
-                xe2->pp_status &= ~(XE2_REG_PP_ON_MASK | XE2_REG_PP_READY_MASK);
+                xe2->pp.status &= ~(XE2_REG_PP_ON_MASK | XE2_REG_PP_READY_MASK);
             break;
         case XE2_REG_PP_ON_DELAYS:
-            xe2->pp_on_delays = read_uint32_le(data);
+            xe2->pp.on_delays = read_uint32_le(data);
             break;
         case XE2_REG_PP_OFF_DELAYS:
-            xe2->pp_off_delays = read_uint32_le(data);
+            xe2->pp.off_delays = read_uint32_le(data);
             break;
 
         case XE2_REG_PCH_PP_STATUS:
-            xe2->pp_status = read_uint32_le(data);
+            xe2->pp_pch.status = read_uint32_le(data);
             break;
         case XE2_REG_PCH_PP_CONTROL:
-            xe2->pp_control = read_uint32_le(data);
+            xe2->pp_pch.control = read_uint32_le(data);
             break;
         case XE2_REG_PCH_PP_ON_DELAYS:
-            xe2->pp_on_delays = read_uint32_le(data);
+            xe2->pp_pch.on_delays = read_uint32_le(data);
             break;
         case XE2_REG_PCH_PP_OFF_DELAYS:
-            xe2->pp_off_delays = read_uint32_le(data);
+            xe2->pp_pch.off_delays = read_uint32_le(data);
             break;
 
         case XE2_REG_DBUF_CTL_S0:
@@ -3405,10 +3425,9 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
         case XE2_REG_DBUF_CTL_S3:
             xe2->dbuf_ctl[3] = read_uint32_le(data);
             break;
-        case XE2_REG_DC_STATE_EN: {
+        case XE2_REG_DC_STATE_EN:
             xe2->dc_state = read_uint32_le(data);
             break;
-        }
 
         case XE2_REG_DMC_SSP_BASE:
             xe2->firmware.dmc_base = read_uint32_le(data);
