@@ -757,8 +757,8 @@ static void handle_ipv4(tap_dev_t* tap, const uint8_t* buffer, size_t size)
         // This is a fragmented frame
         return;
     }
-    if (unlikely(size < total_length)) {
-        // Encoded size exceeds frame size
+    if (unlikely(total_length < header_length || size < total_length)) {
+        // Bogus IP header length or encoded size exceeds frame size
         return;
     }
 
