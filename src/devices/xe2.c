@@ -804,7 +804,7 @@ glmark2-es2-drm
 #define XE2_MI_OP_ARB_ON_OFF                              0x08
 #define XE2_MI_OP_BATCH_BUFFER_END                        0x0a
 #define XE2_MI_OP_STORE_DATA_IMM                          0x20
-#define XE2_MI_OP_STORE_REG_IMM                           0x24
+#define XE2_MI_OP_STORE_REG_MEM                           0x24
 #define XE2_MI_OP_FLUSH_DW                                0x26
 #define XE2_MI_OP_BATCH_BUFFER_START                      0x31
 #define XE2_MI_OP_BATCH_BUFFER_START_PPGTT                xe2_reg_bit( 8)
@@ -1797,6 +1797,27 @@ static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
 // GGTT write). We do not run the batch itself; only its completion postamble has
 // observable side effects the driver waits on (the seqno reaching the fence
 // value). Returns true if a user interrupt was found in the stream.
+//
+// Init sequence being sent in every tested scenario:
+//
+// MI opcode: 0x24       XE2_MI_OP_STORE_REG_MEM
+// MI opcode: 0x20       XE2_MI_OP_STORE_DATA_IMM
+// MI opcode: 0x8        XE2_MI_OP_ARB_ON_OFF
+// MI opcode: 0x31       XE2_MI_OP_BATCH_BUFFER_START
+// MI opcode: 0x0        XE2_MI_OP_NOOP
+// MI opcode: 0x5        XE2_MI_OP_ARB_CHECK
+// MI opcode: 0x26       XE2_MI_OP_FLUSH_DW
+// MI opcode: 0x5        XE2_MI_OP_ARB_CHECK
+// MI opcode: 0x31       XE2_MI_OP_BATCH_BUFFER_START
+// MI opcode: 0x0        XE2_MI_OP_NOOP
+// MI opcode: 0x26       XE2_MI_OP_FLUSH_DW
+//
+// ... emit_user_interrupt
+// MI opcode: 0x2        XE2_MI_OP_USER_INTERRUPT
+// MI opcode: 0x8        XE2_MI_OP_ARB_ON_OFF
+// MI opcode: 0x5        XE2_MI_OP_ARB_CHECK
+//
+// .....................................
 //
 // I suspect there is synchronization problem or garbage being sent
 // from kernel, because this function getting such buffer:
