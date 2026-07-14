@@ -1360,18 +1360,19 @@ static void xe2_scanout(xe2_dev_t *xe2)
         return;
 
     uint32_t ctl = xe2->display.plane_ctl;
-    if (!(ctl & XE2_REG_PLANE_CTL_X_ENABLE_MASK))
+    if (unlikely(!(ctl & XE2_REG_PLANE_CTL_X_ENABLE_MASK)))
         return;
 
     // Only linear surfaces are blitted directly; tiled layouts (bits 12:10 != 0)
     // would need detiling, which fbcon never uses, so skip them.
-    if (xe2_reg_field_get(XE2_REG_PLANE_CTL_X_TILED_MASK, ctl))
+    if (unlikely(xe2_reg_field_get(XE2_REG_PLANE_CTL_X_TILED_MASK, ctl)))
         return;
 
-    uint32_t width  =  (xe2->display.plane_size & 0x1fff) + 1;
-    uint32_t height = ((xe2->display.plane_size >> 16) & 0x1fff) + 1;
-    uint32_t stride =  (xe2->display.plane_stride & 0x3ff) * 64;
-    if (!width || !height || !stride)
+    uint32_t width  =  (xe2->display.plane_size & 0x1FFF) + 1;
+    uint32_t height = ((xe2->display.plane_size >> 16) & 0x1FFF) + 1;
+    uint32_t stride =  (xe2->display.plane_stride & 0x3FF) * 64;
+
+    if (unlikely(!width || !height || !stride))
         return;
 
     // Pixel format from PLANE_CTL[27:24]; the order bit selects RGB vs BGR.
@@ -1388,16 +1389,16 @@ static void xe2_scanout(xe2_dev_t *xe2)
 
     size_t   vram_size = 0;
     uint8_t *dst       = rvvm_fbdev_get_vram(xe2->fbdev, &vram_size);
-    size_t   need      = (size_t) stride * height;
-    if (!dst || need > vram_size)
+    size_t   needed    = (size_t) stride * height;
+    if (!dst || needed > vram_size)
         return;
 
     uint64_t surf   = xe2->display.plane_surf & ~0xfffULL;
     size_t   copied = 0;
-    while (copied < need) {
+    while (copied < needed) {
         size_t         avail = 0;
         const uint8_t *src   = xe2_scanout_page(xe2, surf + copied, &avail);
-        size_t         chunk = (avail < need - copied) ? avail : need - copied;
+        size_t         chunk = (avail < needed - copied) ? avail : needed - copied;
         if (src) {
             memcpy(dst + copied, src, chunk);
         } else {
@@ -1796,6 +1797,28 @@ static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
 // GGTT write). We do not run the batch itself; only its completion postamble has
 // observable side effects the driver waits on (the seqno reaching the fence
 // value). Returns true if a user interrupt was found in the stream.
+//
+// I suspect there is synchronization problem or garbage being sent
+// from kernel, because this function getting such buffer:
+//
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
+// General opcode: 0x0, instruction type: 0x0
+// MI opcode: 0x0
 static bool xe2_ring_replay(xe2_dev_t *xe2)
 {
     uint32_t ring_ggtt = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_START);
@@ -2004,14 +2027,15 @@ static void xe2_complete_advanced_contexts(xe2_dev_t *xe2)
         }
         xe2->pphwsp_addr = xe2->ctx[i].pphwsp;
         uint32_t tail = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_TAIL);
+        rvvm_info("Read LRC tail from ring: 0x%x", tail);
         if (tail == xe2->ctx[i].last_tail) {
             rvvm_info("%s: Context %zu (PPHWSP: 0x%lx) tail was not updated (%u, %u)", __FUNCTION__,
                       i, xe2->pphwsp_addr.addr, tail, xe2->ctx[i].last_tail);
             continue;
         }
+        rvvm_info("%s: Context %zu (PPHWSP: 0x%lx) needs completion", __FUNCTION__, i, xe2->pphwsp_addr.addr);
         xe2_signal_render_completion(xe2);
         xe2->ctx[i].last_tail = tail;
-        rvvm_info("%s: Context %zu (PPHWSP: 0x%lx) needs completion", __FUNCTION__, i, xe2->pphwsp_addr.addr);
     }
 }
 
