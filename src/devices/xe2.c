@@ -26,8 +26,28 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // boot arguments:
 // - fbcon=map:0 xe.enable_dc=0 xe.enable_dsb=0 xe.disable_power_well=0
 //
-// XDG setup:
+// When running DRM-based OpenGL benchmark (corrupted seqno):
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
+// xe 0000:00:01.0: [drm] Check your /sys/class/drm/card0/device/devcoredump/data
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=3, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=3, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=3, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
+// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=2, not started
+
 /*
+XDG setup:
+
 killall -9 Xorg
 export XDG_RUNTIME_DIR=/tmp/runtime-$USER
 mkdir -p "$XDG_RUNTIME_DIR"
@@ -1816,30 +1836,6 @@ static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
 // MI opcode: 0x2        XE2_MI_OP_USER_INTERRUPT
 // MI opcode: 0x8        XE2_MI_OP_ARB_ON_OFF
 // MI opcode: 0x5        XE2_MI_OP_ARB_CHECK
-//
-// .....................................
-//
-// I suspect there is synchronization problem or garbage being sent
-// from kernel, because this function getting such buffer:
-//
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
-// General opcode: 0x0, instruction type: 0x0
-// MI opcode: 0x0
 static bool xe2_ring_replay(xe2_dev_t *xe2)
 {
     uint32_t ring_ggtt = xe2_lrc_ctx_reg(xe2, XE2_CTX_RING_START);
@@ -1871,6 +1867,8 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
 
     for (uint32_t guard = 0; i != end && guard < ring_dw; guard++) {
         uint32_t h   = xe2_dma_read32(xe2, ring, i * 4);
+        // How many bytes was consumed by incoming command. That far we
+        // will go over the buffer in the next iteration.
         uint32_t len = 1;
 
         rvvm_info("General opcode: 0x%x, instruction type: 0x%x", h, XE2_INSTR_TYPE(h));
@@ -1889,7 +1887,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
                     user_int = true;
                     break;
                 case XE2_MI_OP_STORE_DATA_IMM:
-                    len = (h & 0x3ff) + 2;
+                    len = (h & 0x3FF) + 2;
                     if (h & XE2_MI_SDI_GGTT) {
                         uint32_t a = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
                         uint32_t v = xe2_dma_read32(xe2, ring, ((i + 3) % ring_dw) * 4);
@@ -1898,6 +1896,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
                     break;
                 case XE2_MI_OP_FLUSH_DW:
                     len = (h & 0x3f) + 2;
+                    rvvm_info("MI flush dw len: %u", len);
                     if (h & XE2_MI_FLUSH_DW_OP_STOREDW) {
                         uint32_t a = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
                         uint32_t v = xe2_dma_read32(xe2, ring, ((i + 3) % ring_dw) * 4);
@@ -1924,7 +1923,6 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
                 // For physical memory option, address bits [47:39] has to be programmed to "0" as it is defined the
                 // limit of physical memory allocation.
                 case XE2_MI_OP_BATCH_BUFFER_START: { // 0x31
-                    // opcode: 411042049
                     uint32_t lo = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
                     uint32_t hi = xe2_dma_read32(xe2, ring, ((i + 2) % ring_dw) * 4);
                     rvvm_addr_t bo = (uint64_t) lo
@@ -1939,17 +1937,21 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
                             rvvm_info("Read GGTT cmd: 0x%x", cmd);
                         }
                     }
-                    len = 2;
+                    len = 3;
                     break;
                 }
                 default:
-                    len = (h & 0xff) + 2;
+                    len = (h & 0xFF) + 2;
                     break;
             }
         } else if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_GFXPIPE) {
+            // We need to verify GFX commands encoding and set proper length
+            // depending on it. Length is crucial because on incorrect value we
+            // will advance the command buffer with corrupted offset and whole
+            // following command processing will explode.
             rvvm_info("GFX opcode: 0x%x", XE2_GFXPIPE_OPCODE(h));
             if ((h >> 24) == XE2_PIPE_CONTROL_SIG) {
-                len = (h & 0xff) + 2;
+                len = (h & 0xFF) + 2;
                 uint32_t flags = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
                 if ((flags & XE2_PIPE_CONTROL_QW_WRITE)
                     && (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
@@ -1959,7 +1961,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
                 }
             }
         } else {
-            len = (h & 0xff) + 2;
+            len = (h & 0xFF) + 2;
         }
 
         if (len == 0) {
@@ -1990,17 +1992,16 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2)
 
     uint32_t src_ggtt = xe2_lrc_ctx_reg(xe2, XE2_CTX_INT_SRC_REPORT_PTR);
     uint32_t sts_ggtt = xe2_lrc_ctx_reg(xe2, XE2_CTX_INT_STATUS_REPORT_PTR);
-    if (src_ggtt == 0 || sts_ggtt == 0) {
-        return;
+
+    if (src_ggtt && sts_ggtt) {
+        // Render source byte: its IIR bit in the engine's source-report page.
+        xe2_dma_addr_t src = xe2_ggtt_translate(xe2, src_ggtt);
+        xe2_dma_write32(xe2, src, XE2_MEMIRQ_RENDER_SRC_BYTE, XE2_MEMIRQ_BYTE_SET);
+
+        // Render user-interrupt byte: byte 0 of the engine's status vector.
+        xe2_dma_addr_t sts = xe2_ggtt_translate(xe2, sts_ggtt);
+        xe2_dma_write32(xe2, sts, XE2_MEMIRQ_RENDER_STATUS_BYTE, XE2_MEMIRQ_BYTE_SET);
     }
-
-    // Render source byte: its IIR bit in the engine's source-report page.
-    xe2_dma_addr_t src = xe2_ggtt_translate(xe2, src_ggtt);
-    xe2_dma_write32(xe2, src, XE2_MEMIRQ_RENDER_SRC_BYTE, XE2_MEMIRQ_BYTE_SET);
-
-    // Render user-interrupt byte: byte 0 of the engine's status vector.
-    xe2_dma_addr_t sts = xe2_ggtt_translate(xe2, sts_ggtt);
-    xe2_dma_write32(xe2, sts, XE2_MEMIRQ_RENDER_STATUS_BYTE, XE2_MEMIRQ_BYTE_SET);
 
     // The engine reports on its own MSI-X vector, which the driver recorded in
     // the context; the GuC owns vector 0, so raising 0 here would be ignored.
