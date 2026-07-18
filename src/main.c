@@ -24,6 +24,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <util/feature_test.h>
 
 #include <rvvm/rvvm.h>
+#include <rvvm/rvvm_board.h>
 
 #include <util/utils.h>
 
@@ -31,23 +32,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <core/gdbstub.h>
 #include <core/rvvm_user.h>
 
-#include <devices/ata.h>
-#include <devices/bochs-display.h>
 #include <devices/framebuffer.h>
 #include <devices/i2c-oc.h>
 #include <devices/ns16550a.h>
-#include <devices/nvme.h>
-#include <devices/pci-bus.h>
-#include <devices/pci-vfio.h>
-#include <devices/riscv-aclint.h>
-#include <devices/riscv-aplic.h>
-#include <devices/riscv-imsic.h>
-#include <devices/riscv-plic.h>
-#include <devices/rtc-goldfish.h>
 #include <devices/rtl8169.h>
 #include <devices/sound-hda.h>
-#include <devices/syscon.h>
-#include <devices/usb-xhci.h>
 
 #include <gui/gui_window.h>
 
@@ -239,12 +228,12 @@ static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_de
     while ((arg_name = rvvm_next_arg(&arg_val, &arg_iter))) {
         if (arg_val) {
             if (rvvm_strcmp(arg_name, "i") || rvvm_strcmp(arg_name, "image") || rvvm_strcmp(arg_name, "nvme")) {
-                if (!nvme_init_auto(machine, arg_val, true)) {
+                if (!rvvm_nvme_init_auto(machine, arg_val)) {
                     rvvm_error("Failed to attach image \"%s\"", arg_val);
                     return false;
                 }
             } else if (rvvm_strcmp(arg_name, "ata")) {
-                if (!ata_init_auto(machine, arg_val, true)) {
+                if (!rvvm_ata_init_auto(machine, arg_val)) {
                     rvvm_error("Failed to attach image \"%s\"", arg_val);
                     return false;
                 }
@@ -274,7 +263,7 @@ static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_de
                 }
 #endif
             } else if (rvvm_strcmp(arg_name, "vfio_pci")) {
-                if (!pci_vfio_init_auto(machine, arg_val)) {
+                if (!rvvm_pci_vfio_init(machine, arg_val, RVVM_PCI_ADDR_ANY)) {
                     return false;
                 }
             }
@@ -333,24 +322,11 @@ static int rvvm_cli_main(int argc, char** argv)
     }
 
     // Initialize basic peripherals (Interrupt controllers, PCI bus, clocks, power management)
-    riscv_clint_init_auto(machine);
+    rvvm_board_riscv_virt_init(machine, rvvm_has_arg("riscv_aia"));
 
-    if (rvvm_has_arg("riscv_aia")) {
-        // Use RISC-V Advanced Interrupt Architecture (IMSIC + APLIC)
-        riscv_imsic_init_auto(machine);
-        riscv_aplic_init_auto(machine);
-    } else {
-        // Use SiFive PLIC
-        riscv_plic_init_auto(machine);
-    }
-
-    pci_bus_init_auto(machine);
     i2c_oc_init_auto(machine);
 
     // usb_xhci_init(rvvm_get_pci_bus(machine));
-
-    rtc_goldfish_init_auto(machine);
-    syscon_init_auto(machine);
 
     if (rvvm_has_arg("gdbstub")) {
         gdbstub_init(machine, rvvm_getarg("gdbstub"));
@@ -362,7 +338,7 @@ static int rvvm_cli_main(int argc, char** argv)
 
     if (!rvvm_has_arg("nogui") && !rvvm_has_arg("res")) {
         if (rvvm_has_arg("bochs_display")) {
-            gui_window_t* win = gui_rvvm_init(RVVM_BOCHS_DISPLAY_VRAM, NULL, machine);
+            gui_window_t* win = gui_rvvm_init(0x1000000UL, NULL, machine);
             rvvm_bochs_display_init_auto(machine, gui_window_get_fbdev(win));
         } else {
             gui_window_t* win = gui_rvvm_init(0, NULL, machine);
@@ -371,14 +347,14 @@ static int rvvm_cli_main(int argc, char** argv)
     }
 
     if (rvvm_has_arg("hda_test")) {
-        sound_hda_init_auto(machine);
+        sound_hda_init(machine);
     }
 
     tap_dev_t* tap = NULL;
 #ifdef USE_NET
     if (!rvvm_has_arg("nonet")) {
         tap = tap_open();
-        rtl8169_init(rvvm_get_pci_bus(machine), tap);
+        rvvm_rtl8169_init(machine, tap, RVVM_PCI_ADDR_ANY);
     }
 #endif
 
