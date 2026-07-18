@@ -13,8 +13,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_fdt.h>
 #include <rvvm/rvvm_region.h>
 
-#include "mem_ops.h"
-#include "utils.h"
+#include <util/mem_ops.h>
+#include <util/utils.h>
 
 PUSH_OPTIMIZATION_SIZE
 
@@ -23,6 +23,8 @@ typedef struct {
 
     uint8_t  buffer[0x1000];
     uint32_t dirty;
+
+    bool fw;
 } mtd_ram_t;
 
 TSAN_SUPPRESS
@@ -50,13 +52,15 @@ static void mtd_ram_write(rvvm_reg_dev_t* dev, const void* data, size_t size, si
 
 static void mtd_ram_reset(rvvm_reg_dev_t* dev)
 {
-    mtd_ram_t*      mtd  = rvvm_region_data(dev);
-    rvvm_machine_t* mach = rvvm_region_machine(dev);
-    rvvm_addr_t     addr = rvvm_get_opt(mach, RVVM_OPT_RESET_PC);
-    rvvm_addr_t     size = rvvm_blk_get_size(mtd->blk);
-    void*           ptr  = rvvm_get_dma_ptr(mach, addr, size);
-    if (ptr) {
-        rvvm_blk_read(mtd->blk, ptr, size, 0);
+    mtd_ram_t*      mtd     = rvvm_region_data(dev);
+    rvvm_machine_t* machine = rvvm_region_machine(dev);
+    if (mtd->fw) {
+        rvvm_addr_t addr = rvvm_get_opt(machine, RVVM_OPT_RESET_PC);
+        rvvm_addr_t size = rvvm_blk_get_size(mtd->blk);
+        void*       ptr  = rvvm_get_dma_ptr(machine, addr, size);
+        if (ptr) {
+            rvvm_blk_read(mtd->blk, ptr, size, 0);
+        }
     }
 }
 
@@ -79,17 +83,15 @@ static void mtd_ram_cleanup(rvvm_reg_dev_t* dev)
 }
 
 static const rvvm_reg_type_t mtd_ram_type = {
-    .name     = "mtd-ram",
-    .read     = mtd_ram_read,
-    .write    = mtd_ram_write,
-    .reset    = mtd_ram_reset,
-    .suspend  = mtd_ram_suspend,
-    .cleanup  = mtd_ram_cleanup,
-    .min_size = 1,
-    .max_size = 16,
+    .name    = "mtd-ram",
+    .read    = mtd_ram_read,
+    .write   = mtd_ram_write,
+    .reset   = mtd_ram_reset,
+    .suspend = mtd_ram_suspend,
+    .cleanup = mtd_ram_cleanup,
 };
 
-RVVM_PUBLIC rvvm_reg_dev_t* mtd_ram_init_blk(rvvm_machine_t* machine, rvvm_addr_t addr, rvvm_blk_dev_t* blk)
+RVVM_PUBLIC rvvm_reg_dev_t* rvvm_mtd_ram_init(rvvm_machine_t* machine, rvvm_blk_dev_t* blk, rvvm_addr_t addr, bool fw)
 {
     mtd_ram_t* mtd = safe_new_obj(mtd_ram_t);
 
@@ -101,6 +103,7 @@ RVVM_PUBLIC rvvm_reg_dev_t* mtd_ram_init_blk(rvvm_machine_t* machine, rvvm_addr_
     };
 
     mtd->blk = blk;
+    mtd->fw  = fw;
 
     rvvm_blk_read_head(mtd->blk, mtd->buffer, sizeof(mtd->buffer));
 
