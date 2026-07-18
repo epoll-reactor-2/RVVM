@@ -7,11 +7,20 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#include "bochs-display.h"
+/*
+ * TODO: Snapshots
+ */
 
-#include "mem_ops.h"
-#include "utils.h"
-#include "vma_ops.h"
+#include <rvvm/rvvm_board.h>
+#include <rvvm/rvvm_fb.h>
+#include <rvvm/rvvm_pci.h>
+#include <rvvm/rvvm_region.h>
+#include <rvvm/rvvm_snapshot.h>
+
+#include <util/atomics.h>
+#include <util/mem_ops.h>
+#include <util/utils.h>
+#include <util/vma_ops.h>
 
 PUSH_OPTIMIZATION_SIZE
 
@@ -59,12 +68,17 @@ typedef struct {
 /*
  * Enable register bits
  */
-#define BOCHS_ENABLE          0x01 // Enable the display engine, applies XRES/YRES/BPP and disallows writes to them
-#define BOCHS_ENABLE_CAPS     0x02 // Enable capabilities (XRES/YRES/BPP report max values instead)
-#define BOCHS_ENABLE_8BIT     0x20 // Enable 8-bit DAC (x86 VGA only)
-#define BOCHS_ENABLE_LFB      0x40 // Enable Linear Framebuffer in BAR 0 (x86 VGA only)
-#define BOCHS_ENABLE_NOCLR    0x80 // Do not zero VRAM on enable
-#define BOCHS_ENABLE_MASK     0xE3 // Mask of valid bits
+#define BOCHS_ENABLE          0x0001 // Enable the display engine, applies XRES/YRES/BPP and disallows writes to them
+#define BOCHS_ENABLE_CAPS     0x0002 // Enable capabilities (XRES/YRES/BPP report max values instead)
+#define BOCHS_ENABLE_8BIT     0x0020 // Enable 8-bit DAC (x86 VGA only)
+#define BOCHS_ENABLE_LFB      0x0040 // Enable Linear Framebuffer in BAR 0 (x86 VGA only)
+#define BOCHS_ENABLE_NOCLR    0x0080 // Do not zero VRAM on enable
+#define BOCHS_ENABLE_MASK     0x00E3 // Mask of valid bits
+
+/*
+ * Bochs display VRAM size
+ */
+#define BOCHS_VRAM_SIZE       0x1000000UL
 
 static void bochs_display_update_mode(bochs_display_t* disp, bool upd_res)
 {
@@ -82,13 +96,13 @@ static void bochs_display_update_mode(bochs_display_t* disp, bool upd_res)
     rvvm_fbdev_set_scanout(disp->fbdev, &fb);
 }
 
-static bool bochs_display_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void bochs_display_read(rvvm_reg_dev_t* dev, void* data, size_t size, size_t off)
 {
-    bochs_display_t* disp = dev->data;
+    bochs_display_t* disp = rvvm_region_data(dev);
     uint16_t         val  = 0;
     UNUSED(size);
 
-    switch (offset) {
+    switch (off) {
         case BOCHS_REG_ID:
             val = atomic_load_uint32_relax(&disp->version);
             if (val < BOCHS_VER_ID0 || val > BOCHS_VER_ID5) {
@@ -129,7 +143,7 @@ static bool bochs_display_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, 
             val = atomic_load_uint32_relax(&disp->yoff);
             break;
         case BOCHS_REG_VRAM: {
-            size_t vram_size = RVVM_BOCHS_DISPLAY_VRAM;
+            size_t vram_size = BOCHS_VRAM_SIZE;
             rvvm_fbdev_get_vram(disp->fbdev, &vram_size);
             val = vram_size >> 16;
             break;
@@ -144,16 +158,15 @@ static bool bochs_display_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, 
     }
 
     write_uint16_le(data, val);
-    return true;
 }
 
-static bool bochs_display_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void bochs_display_write(rvvm_reg_dev_t* dev, const void* data, size_t size, size_t off)
 {
-    bochs_display_t* disp = dev->data;
+    bochs_display_t* disp = rvvm_region_data(dev);
     uint16_t         val  = read_uint16_le(data);
     UNUSED(size);
 
-    switch (offset) {
+    switch (off) {
         case BOCHS_REG_ID:
             atomic_store_uint32_relax(&disp->version, val);
             break;
@@ -196,46 +209,46 @@ static bool bochs_display_write(rvvm_mmio_dev_t* dev, void* data, size_t offset,
             }
             break;
     }
-
-    return true;
 }
 
-static bool bochs_vram_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void bochs_vram_write(rvvm_reg_dev_t* dev, const void* data, size_t size, size_t off)
 {
-    bochs_display_t* disp = dev->data;
+    bochs_display_t* disp = rvvm_region_data(dev);
     rvvm_fbdev_dirty(disp->fbdev);
-    UNUSED(data);
-    UNUSED(offset);
-    UNUSED(size);
-    return true;
+    UNUSED(data && off && size);
 }
 
-static void bochs_display_remove(rvvm_mmio_dev_t* dev)
+static void bochs_display_cleanup(rvvm_reg_dev_t* dev)
 {
-    bochs_display_t* disp = dev->data;
+    bochs_display_t* disp = rvvm_region_data(dev);
     if (rvvm_fbdev_dec_ref(disp->fbdev)) {
         safe_free(disp);
     }
 }
 
-static void bochs_display_update(rvvm_mmio_dev_t* dev)
+static void bochs_display_poll(rvvm_reg_dev_t* dev)
 {
-    bochs_display_t* disp = dev->data;
+    bochs_display_t* disp = rvvm_region_data(dev);
     rvvm_fbdev_update(disp->fbdev);
 }
 
-static const rvvm_mmio_type_t bochs_vram_type = {
-    .name   = "bochs_vram",
-    .remove = bochs_display_remove,
+static const rvvm_reg_type_t bochs_vram_type = {
+    .name    = "bochs-vram",
+    .write   = bochs_vram_write,
+    .cleanup = bochs_display_cleanup,
 };
 
-static const rvvm_mmio_type_t bochs_display_type = {
-    .name   = "bochs_display",
-    .remove = bochs_display_remove,
-    .update = bochs_display_update,
+static const rvvm_reg_type_t bochs_display_type = {
+    .name     = "bochs-display",
+    .read     = bochs_display_read,
+    .write    = bochs_display_write,
+    .poll     = bochs_display_poll,
+    .cleanup  = bochs_display_cleanup,
+    .min_size = 2,
+    .max_size = 2,
 };
 
-pci_dev_t* rvvm_bochs_display_init(pci_bus_t* pci_bus, rvvm_fbdev_t* fbdev)
+rvvm_pci_func_t* rvvm_bochs_display_init(rvvm_machine_t* machine, rvvm_fbdev_t* fbdev, rvvm_pci_addr_t addr)
 {
     if (!fbdev) {
         return NULL;
@@ -243,43 +256,34 @@ pci_dev_t* rvvm_bochs_display_init(pci_bus_t* pci_bus, rvvm_fbdev_t* fbdev)
 
     bochs_display_t* disp = safe_new_obj(bochs_display_t);
 
-    size_t vram_size = RVVM_BOCHS_DISPLAY_VRAM;
+    size_t vram_size = BOCHS_VRAM_SIZE;
     void*  vram      = rvvm_fbdev_get_vram(fbdev, &vram_size);
 
     // Handle is released twice
     rvvm_fbdev_inc_ref(fbdev);
     disp->fbdev = fbdev;
 
-    pci_func_desc_t bochs_desc = {
+    rvvm_reg_desc_t bochs_vram = {
+        .size = vram_size,
+        .data = disp,
+        .mmap = vram,
+        .type = &bochs_vram_type,
+    };
+    rvvm_reg_desc_t bochs_disp = {
+        .size = 0x1000,
+        .data = disp,
+        .type = &bochs_display_type,
+    };
+    rvvm_pci_func_desc_t bochs_desc = {
         .vendor_id  = 0x1234, // Not in PCI ID database yet, should be Bochs
         .device_id  = 0x1111, // Not in PCI ID database yet, should be Bochs-Display
-        .class_code = 0x0380, // Display controller (Legacy-free, no VGA)
-        .rev        = 2,      // Revision 2
-        .bar[0] = {
-            .size    = vram_size,
-            .data    = disp,
-            .mapping = vram,
-            .type    = &bochs_vram_type,
-            .write   = bochs_vram_write,
-        },
-        .bar[2] = {
-            .size        = 0x1000,
-            .data        = disp,
-            .type        = &bochs_display_type,
-            .read        = bochs_display_read,
-            .write       = bochs_display_write,
-            .min_op_size = 2,
-            .max_op_size = 2,
-        },
+        .class_code = 0x0380, // Display controller, Legacy-free (no VGA)
+        .revision   = 0x02,   // Rev. 2
+        .bar[0]     = &bochs_vram,
+        .bar[2]     = &bochs_disp,
     };
 
-    pci_dev_t* pci_dev = pci_attach_func(pci_bus, &bochs_desc);
-    return pci_dev;
-}
-
-pci_dev_t* rvvm_bochs_display_init_auto(rvvm_machine_t* machine, rvvm_fbdev_t* fbdev)
-{
-    return rvvm_bochs_display_init(rvvm_get_pci_bus(machine), fbdev);
+    return rvvm_pci_func_init(machine, &bochs_desc, addr);
 }
 
 POP_OPTIMIZATION_SIZE
