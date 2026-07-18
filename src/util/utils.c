@@ -10,16 +10,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 // Must be included before <stdio.h>
-#include "feature_test.h"
+#include <util/feature_test.h>
 
-#include "utils.h"
-
-#include "blk_io.h"
-#include "rvtimer.h"
-#include "spinlock.h"
-#include "stacktrace.h"
-#include "threading.h"
-#include "vector.h"
+#include <util/blk_io.h>
+#include <util/locking.h>
+#include <util/rvtimer.h>
+#include <util/stacktrace.h>
+#include <util/threading.h>
+#include <util/utils.h>
+#include <util/vector.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -858,24 +857,24 @@ PRINT_FORMAT void rvvm_fatal(const char* format_str, ...)
 slow_path void do_once_finalize(uint32_t* ticket)
 {
     while (atomic_load_uint32_ex(ticket, ATOMIC_ACQUIRE) != 2) {
-        thread_sched_yield();
+        rvvm_sched_yield();
     }
 }
 
 typedef void (*deinit_func_t)(void);
 
 static vector_t(deinit_func_t) deinit_funcs = ZERO_INIT;
-static spinlock_t              deinit_lock  = ZERO_INIT;
+static rvvm_lock_t             deinit_lock  = ZERO_INIT;
 static bool                    deinit_made  = false;
 
 void call_at_deinit(void (*function)(void))
 {
-    spin_lock_busy_loop(&deinit_lock);
+    rvvm_spin_lock(&deinit_lock);
     if (!deinit_made) {
         vector_push_back(deinit_funcs, function);
         function = NULL;
     }
-    spin_unlock(&deinit_lock);
+    rvvm_spin_unlock(&deinit_lock);
     if (function) {
         function();
     }
@@ -884,14 +883,14 @@ void call_at_deinit(void (*function)(void))
 static deinit_func_t dequeue_func(void)
 {
     deinit_func_t ret = NULL;
-    spin_lock_busy_loop(&deinit_lock);
+    rvvm_spin_lock(&deinit_lock);
     deinit_made = true;
     if (vector_size(deinit_funcs)) {
         size_t end = vector_size(deinit_funcs) - 1;
         ret        = vector_at(deinit_funcs, end);
         vector_erase(deinit_funcs, end);
     }
-    spin_unlock(&deinit_lock);
+    rvvm_spin_unlock(&deinit_lock);
     return ret;
 }
 
