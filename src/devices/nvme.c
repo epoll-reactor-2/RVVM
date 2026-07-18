@@ -7,14 +7,22 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#include "nvme.h"
+/*
+ * TODO: Threaded task workers
+ * TODO: Snapshots
+ */
 
-#include "atomics.h"
-#include "bit_ops.h"
-#include "mem_ops.h"
-#include "rvtimer.h"
-#include "threading.h"
-#include "utils.h"
+#include <rvvm/rvvm_blk.h>
+#include <rvvm/rvvm_board.h>
+#include <rvvm/rvvm_pci.h>
+#include <rvvm/rvvm_region.h>
+#include <rvvm/rvvm_snapshot.h>
+
+#include <util/atomics.h>
+#include <util/bit_ops.h>
+#include <util/mem_ops.h>
+#include <util/threading.h>
+#include <util/utils.h>
 
 PUSH_OPTIMIZATION_SIZE
 
@@ -328,7 +336,9 @@ PUSH_OPTIMIZATION_SIZE
 #define NVME_LBA_SIZE            (1ULL << NVME_LBA_SHIFT)
 #define NVME_LBA_MASK            (NVME_LBA_SIZE - 1ULL)
 
-typedef struct align_cacheline {
+typedef struct nvme_device nvme_dev_t;
+
+typedef struct {
     // Queue address (Low/High)
     uint32_t addr_l;
     uint32_t addr_h;
@@ -345,9 +355,9 @@ typedef struct align_cacheline {
     uint32_t data;
 } nvme_queue_t;
 
-typedef struct {
+struct nvme_device {
     // NVMe PCI function handle
-    pci_func_t* pci_func;
+    rvvm_pci_func_t* func;
 
     // NVMe backing block device
     rvvm_blk_dev_t* blk;
@@ -371,7 +381,7 @@ typedef struct {
 
     // Serial number
     char serial[12];
-} nvme_dev_t;
+};
 
 typedef struct {
     rvvm_addr_t prp1;
@@ -382,7 +392,7 @@ typedef struct {
 
 typedef struct {
     // Submission queue entry
-    const uint8_t* sqe;
+    uint8_t* sqe;
 
     // PRP parser context
     nvme_prp_ctx_t prp;
@@ -455,7 +465,7 @@ static void nvme_queue_raise_irq(nvme_dev_t* nvme, nvme_queue_t* queue)
     if (likely(irq_reg & NVME_CQ_FLAGS_IEN)) {
         uint32_t irq_vec = irq_reg >> 16;
         if (!(atomic_load_uint32_relax(&nvme->irq_mask) & bit_set32(irq_vec))) {
-            pci_raise_irq(nvme->pci_func, irq_vec);
+            rvvm_pci_raise_irq(nvme->func, irq_vec);
         }
     }
 }
@@ -463,7 +473,7 @@ static void nvme_queue_raise_irq(nvme_dev_t* nvme, nvme_queue_t* queue)
 static void nvme_queue_lower_irq(nvme_dev_t* nvme, nvme_queue_t* queue)
 {
     uint32_t irq_vec = atomic_load_uint32_relax(&queue->data) >> 16;
-    pci_lower_irq(nvme->pci_func, irq_vec);
+    rvvm_pci_lower_irq(nvme->func, irq_vec);
 }
 
 static void nvme_queue_reset(nvme_queue_t* queue)
@@ -499,7 +509,7 @@ static void nvme_reset(nvme_dev_t* nvme)
 {
     // Wait for IO workers to halt
     while (atomic_load_uint32(&nvme->threads)) {
-        sleep_ms(1);
+        rvvm_sched_yield();
     }
     // Reset queues
     for (size_t qid = 0; qid < STATIC_ARRAY_SIZE(nvme->sq); ++qid) {
@@ -525,7 +535,7 @@ static void nvme_complete_cmd_cs(nvme_dev_t* nvme, nvme_cmd_t* cmd, uint32_t sta
     if (likely(queue)) {
         uint32_t    tail = nvme_queue_enqueue(queue);
         rvvm_addr_t addr = nvme_queue_addr(queue) + (tail << NVME_CQE_SIZE_SHIFT);
-        uint8_t*    cqe  = pci_get_dma_ptr(nvme->pci_func, addr, NVME_CQE_SIZE);
+        uint8_t*    cqe  = rvvm_pci_get_dma(nvme->func, addr, NVME_CQE_SIZE);
         if (likely(cqe)) {
             uint32_t cmd_id = read_uint16_le(cmd->sqe + NVME_SQE_CID);
             uint32_t phase  = (~read_uint32_le(cqe + NVME_CQE_CID_PB_SF)) & NVME_CQE_PB_MASK;
@@ -533,6 +543,7 @@ static void nvme_complete_cmd_cs(nvme_dev_t* nvme, nvme_cmd_t* cmd, uint32_t sta
             write_uint32_le(cqe + NVME_CQE_CS, cs);
             write_uint32_le(cqe + NVME_CQE_SQHD_SQID, cmd->sqhd_sqid);
             atomic_store_uint32_le(cqe + NVME_CQE_CID_PB_SF, cid_ps);
+            rvvm_pci_end_dma(nvme->func, cqe);
             nvme_queue_raise_irq(nvme, queue);
         }
     }
@@ -588,7 +599,7 @@ static size_t nvme_parse_prp_region(nvme_dev_t* nvme, nvme_cmd_t* cmd)
     while (nvme_prp_avail(cmd) > len) {
         if (!dma) {
             // Obtain DMA mapping of the PRP list
-            dma = pci_get_dma_ptr(nvme->pci_func, prp2 & ~NVME_PAGE_MASK, NVME_PAGE_SIZE);
+            dma = rvvm_pci_get_dma(nvme->func, prp2 & ~NVME_PAGE_MASK, NVME_PAGE_SIZE);
             if (!dma) {
                 // PRP list DMA error
                 rvvm_debug("NVMe PRP list DMA error at %#llx", (long long)prp2);
@@ -598,7 +609,8 @@ static size_t nvme_parse_prp_region(nvme_dev_t* nvme, nvme_cmd_t* cmd)
         if (!((prp2 + 8) & NVME_PAGE_MASK) && nvme_prp_avail(cmd) > len + NVME_PAGE_SIZE) {
             // Fetch next PRP list in the chain
             prp2 = read_uint64_le(dma + NVME_PAGE_SIZE - 8) & ~NVME_PAGE_MASK;
-            dma  = NULL;
+            rvvm_pci_end_dma(nvme->func, dma);
+            dma = NULL;
         } else {
             // Fetch next PRP list entry
             rvvm_addr_t page = read_uint64_le(dma + (prp2 & NVME_PAGE_MASK));
@@ -613,6 +625,7 @@ static size_t nvme_parse_prp_region(nvme_dev_t* nvme, nvme_cmd_t* cmd)
             len += NVME_PAGE_SIZE;
         }
     }
+    rvvm_pci_end_dma(nvme->func, dma);
 
     return EVAL_MIN(len, nvme_prp_avail(cmd));
 }
@@ -622,7 +635,7 @@ static void* nvme_get_prp_region(nvme_dev_t* nvme, nvme_cmd_t* cmd, size_t* size
     rvvm_addr_t reg_addr = cmd->prp.prp1;
     size_t      reg_size = nvme_parse_prp_region(nvme, cmd);
     if (reg_size) {
-        void* region  = pci_get_dma_ptr(nvme->pci_func, reg_addr, reg_size);
+        void* region  = rvvm_pci_get_dma(nvme->func, reg_addr, reg_size);
         cmd->prp.cur += reg_size;
         if (region) {
             *size = reg_size;
@@ -653,6 +666,7 @@ static void nvme_copy_to_prp(nvme_dev_t* nvme, nvme_cmd_t* cmd, const void* data
         if (reg_size) {
             memset(region, 0, reg_size);
         }
+        rvvm_pci_end_dma(nvme->func, region);
     }
 }
 
@@ -900,6 +914,7 @@ static void nvme_io_cmd(nvme_dev_t* nvme, nvme_cmd_t* cmd)
                     } else {
                         tmp = rvvm_blk_read(nvme->blk, buffer, size, pos);
                     }
+                    rvvm_pci_end_dma(nvme->func, buffer);
                 }
                 if (tmp != size) {
                     nvme_complete_cmd(nvme, cmd, NVME_SC_DATA_ERR);
@@ -928,6 +943,7 @@ static void nvme_io_cmd(nvme_dev_t* nvme, nvme_cmd_t* cmd)
                             uint64_t trim_pos = read_uint64_le(buffer + i + 8) << NVME_LBA_SHIFT;
                             rvvm_blk_trim(nvme->blk, trim_pos, trim_lba << NVME_LBA_SHIFT);
                         }
+                        rvvm_pci_end_dma(nvme->func, buffer);
                     }
                 }
             }
@@ -944,7 +960,7 @@ static void nvme_run_cmd(nvme_dev_t* nvme, size_t sq_id, uint32_t sq_head)
 {
     nvme_queue_t* sq       = &nvme->sq[sq_id];
     rvvm_addr_t   sqe_addr = nvme_queue_addr(sq) + (sq_head << NVME_SQE_SIZE_SHIFT);
-    uint8_t*      sqe      = pci_get_dma_ptr(nvme->pci_func, sqe_addr, NVME_SQE_SIZE);
+    uint8_t*      sqe      = rvvm_pci_get_dma(nvme->func, sqe_addr, NVME_SQE_SIZE);
 
     if (likely(sqe)) {
         nvme_cmd_t cmd = {
@@ -957,6 +973,7 @@ static void nvme_run_cmd(nvme_dev_t* nvme, size_t sq_id, uint32_t sq_head)
         } else {
             nvme_admin_cmd(nvme, &cmd);
         }
+        rvvm_pci_end_dma(nvme->func, cmd.sqe);
     }
 }
 
@@ -1009,13 +1026,13 @@ static void nvme_doorbell(nvme_dev_t* nvme, uint32_t doorbell, uint16_t val)
     }
 }
 
-static bool nvme_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void nvme_pci_read(rvvm_reg_dev_t* dev, void* data, size_t size, size_t off)
 {
-    nvme_dev_t* nvme = dev->data;
+    nvme_dev_t* nvme = rvvm_region_data(dev);
     uint32_t    val  = 0;
     UNUSED(size);
 
-    switch (offset) {
+    switch (off) {
         case NVME_REG_CAP1:
             val = NVME_CAP1_MQES | NVME_CAP1_CQR | NVME_CAP1_TO;
             break;
@@ -1064,22 +1081,21 @@ static bool nvme_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8
     }
 
     write_uint32_le(data, val);
-    return true;
 }
 
-static bool nvme_pci_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void nvme_pci_write(rvvm_reg_dev_t* dev, const void* data, size_t size, size_t off)
 {
-    nvme_dev_t* nvme = dev->data;
+    nvme_dev_t* nvme = rvvm_region_data(dev);
     uint32_t    val  = read_uint32_le(data);
     UNUSED(size);
 
-    if (likely(offset >= 0x1000)) {
+    if (likely(off >= 0x1000)) {
         // Doorbell write
-        nvme_doorbell(nvme, (offset - 0x1000) >> 2, val);
-        return true;
+        nvme_doorbell(nvme, (off - 0x1000) >> 2, val);
+        return;
     }
 
-    switch (offset) {
+    switch (off) {
         case NVME_REG_INTMS:
             atomic_or_uint32(&nvme->irq_mask, val);
             nvme_check_masked_irqs(nvme, val);
@@ -1112,24 +1128,26 @@ static bool nvme_pci_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint
             atomic_store_uint32_relax(&nvme->cq[NVME_QUEUE_ADMIN].addr_h, val);
             break;
     }
-
-    return true;
 }
 
-static void nvme_remove(rvvm_mmio_dev_t* dev)
+static void nvme_cleanup(rvvm_reg_dev_t* dev)
 {
-    nvme_dev_t* nvme = dev->data;
+    nvme_dev_t* nvme = rvvm_region_data(dev);
     nvme_reset(nvme);
     rvvm_blk_close(nvme->blk);
     free(nvme);
 }
 
-static rvvm_mmio_type_t nvme_type = {
-    .name   = "nvme",
-    .remove = nvme_remove,
+static rvvm_reg_type_t nvme_type = {
+    .name     = "nvme",
+    .read     = nvme_pci_read,
+    .write    = nvme_pci_write,
+    .cleanup  = nvme_cleanup,
+    .min_size = 4,
+    .max_size = 4,
 };
 
-pci_dev_t* nvme_init_blk(pci_bus_t* pci_bus, rvvm_blk_dev_t* blk)
+RVVM_PUBLIC rvvm_pci_func_t* rvvm_nvme_init(rvvm_machine_t* machine, rvvm_blk_dev_t* blk, rvvm_pci_addr_t addr)
 {
     nvme_dev_t* nvme = safe_new_obj(nvme_dev_t);
 
@@ -1139,43 +1157,28 @@ pci_dev_t* nvme_init_blk(pci_bus_t* pci_bus, rvvm_blk_dev_t* blk)
     nvme->blk = blk;
     rvvm_randomserial(nvme->serial, sizeof(nvme->serial));
 
-    pci_func_desc_t nvme_desc = {
+    rvvm_reg_desc_t nvme_mmio = {
+        .size = 0x4000,
+        .data = nvme,
+        .type = &nvme_type,
+        .attr = RVVM_REG_ATTR_BAR64,
+    };
+    rvvm_pci_func_desc_t nvme_desc = {
         .vendor_id  = 0x1F31, // Nextorage
         .device_id  = 0x4512, // Nextorage NE1N NVMe SSD
         .class_code = 0x0108, // Mass Storage, Non-Volatile memory controller
-        .prog_if    = 0x02,   // NVMe
-        .irq_pin    = PCI_IRQ_PIN_INTA,
-        .bar[0] = {
-            .size        = 0x4000,
-            .data        = nvme,
-            .type        = &nvme_type,
-            .read        = nvme_pci_read,
-            .write       = nvme_pci_write,
-            .min_op_size = 4,
-            .max_op_size = 4,
-        },
+        .prog_iface = 0x02,   // NVMe
+        .irq_pin    = RVVM_PCI_PIN_INTA,
+        .irq_vecs   = NVME_IO_QUEUES,
+        .bar[0]     = &nvme_mmio,
     };
 
-    pci_dev_t* pci_dev = pci_attach_func(pci_bus, &nvme_desc);
-    if (pci_dev) {
+    rvvm_pci_func_t* func = rvvm_pci_func_init(machine, &nvme_desc, addr);
+    if (func) {
         // Successfully plugged in
-        nvme->pci_func = pci_get_device_func(pci_dev, 0);
+        nvme->func = func;
     }
-    return pci_dev;
-}
-
-pci_dev_t* nvme_init(pci_bus_t* pci_bus, const char* image, bool rw)
-{
-    rvvm_blk_dev_t* blk = rvvm_blk_open(image, NULL, rw ? RVVM_BLK_RW : RVVM_BLK_READ);
-    if (blk) {
-        return nvme_init_blk(pci_bus, blk);
-    }
-    return NULL;
-}
-
-pci_dev_t* nvme_init_auto(rvvm_machine_t* machine, const char* image, bool rw)
-{
-    return nvme_init(rvvm_get_pci_bus(machine), image, rw);
+    return func;
 }
 
 POP_OPTIMIZATION_SIZE
