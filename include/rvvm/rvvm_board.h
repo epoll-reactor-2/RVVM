@@ -10,6 +10,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #ifndef _RVVM_BOARD_DEVICES_H
 #define _RVVM_BOARD_DEVICES_H
 
+#include "rvvm/rvvm_base.h"
+#include "rvvm/rvvm_fb.h"
 #include <rvvm/rvvm_blk.h>
 
 RVVM_EXTERN_C_BEGIN

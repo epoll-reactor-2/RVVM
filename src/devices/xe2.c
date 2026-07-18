@@ -7,13 +7,14 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#include "xe2.h"
+#include <rvvm/rvvm_board.h>
+#include <rvvm/rvvm_pci.h>
 #include "atomics.h"
 #include "compiler.h"
-#include "devices/pci-bus.h"
 #include "mem_ops.h"
 #include "rvvm/rvvm_base.h"
 #include "rvvm/rvvm_fb.h"
+#include "rvvm/rvvm_region.h"
 #include "spinlock.h"
 #include "utils.h"
 #include "vma_ops.h"
@@ -1087,7 +1088,7 @@ typedef struct {
 } xe2_power_control_t;
 
 typedef struct {
-    pci_func_t *pci_func;
+    rvvm_pci_func_t *pci_func;
     spinlock_t  lock;
     uint32_t    forcewake_gsc;
     uint32_t    forcewake_gt_mtl;
@@ -1316,9 +1317,9 @@ static inline uint8_t *xe2_dmc_shadow(xe2_dev_t *xe2, size_t offset)
     return NULL;
 }
 
-static void xe2_remove(rvvm_mmio_dev_t *dev)
+static void xe2_remove(rvvm_reg_dev_t *dev)
 {
-    xe2_dev_t *xe2 = dev->data;
+    xe2_dev_t *xe2 = rvvm_region_data(dev);
     if (xe2->fbdev)
         rvvm_fbdev_dec_ref(xe2->fbdev);
     vma_free(xe2->ggtt_pte_valid, XE2_GGTT_PAGES * sizeof(bool));
@@ -1328,7 +1329,7 @@ static void xe2_remove(rvvm_mmio_dev_t *dev)
     free(xe2);
 }
 
-static void xe2_remove_vram(rvvm_mmio_dev_t *dev)
+static void xe2_remove_vram(rvvm_reg_dev_t *dev)
 {
     UNUSED(dev);
 }
@@ -1372,7 +1373,7 @@ static const uint8_t *xe2_scanout_page(xe2_dev_t *xe2, uint64_t ggtt, size_t *av
         return xe2->vram + addr;
     }
     // System memory, reachable through the guest's DMA window
-    return pci_get_dma_ptr(xe2->pci_func, addr, *avail);
+    return rvvm_pci_get_dma(xe2->pci_func, addr, *avail);
 }
 
 // Present pipe-A plane 1 onto the host window. The driver programs a linear
@@ -1446,9 +1447,9 @@ static void xe2_scanout(xe2_dev_t *xe2)
 // every pipe with vblank enabled, advance the frame counter and raise its
 // vblank interrupt; raise flip-done too when that source is enabled, which
 // completes any armed page-flip. If any pipe becomes live, fire the MSI.
-static void xe2_update(rvvm_mmio_dev_t *dev)
+static void xe2_update(rvvm_reg_dev_t *dev)
 {
-    xe2_dev_t *xe2 = dev->data;
+    xe2_dev_t *xe2 = rvvm_region_data(dev);
     spin_lock(&xe2->lock);
 
     // Refresh the on-screen image from the guest's scanout buffer.
@@ -1474,7 +1475,7 @@ static void xe2_update(rvvm_mmio_dev_t *dev)
     }
 
     if (raise)
-        pci_send_irq(xe2->pci_func, 0);
+        rvvm_pci_send_irq(xe2->pci_func, 0);
 
     spin_unlock(&xe2->lock);
 
@@ -1484,15 +1485,9 @@ static void xe2_update(rvvm_mmio_dev_t *dev)
         rvvm_fbdev_update(xe2->fbdev);
 }
 
-static rvvm_mmio_type_t xe2_type = {
+static rvvm_reg_type_t xe2_type_vram = {
     .name = "xe2",
-    .remove = xe2_remove,
-    .update = xe2_update,
-};
-
-static rvvm_mmio_type_t xe2_type_vram = {
-    .name = "xe2",
-    .remove = xe2_remove_vram,
+    .cleanup = xe2_remove_vram,
 };
 
 static inline void xe2_ggtt_write_pte(xe2_dev_t *xe2, uint64_t index, uint64_t pte)
@@ -1555,7 +1550,7 @@ static uint32_t xe2_dma_read32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
             return 0;
         return read_uint32_le(xe2->vram + dma.addr + off);
     } else {
-        uint32_t *ptr = pci_get_dma_ptr(xe2->pci_func, dma.addr + off, 4);
+        uint32_t *ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr + off, 4);
         return ptr ? *ptr : 0;
     }
 }
@@ -1570,7 +1565,7 @@ static void xe2_dma_write32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint
         write_uint32_le(xe2->vram + dma.addr + off, msg);
         rvvm_info("%s: write_uint32_le[0x%lx]: 0x%x done", __FUNCTION__, dma.addr + off, msg);
     } else {
-        uint32_t *ptr = pci_get_dma_ptr(xe2->pci_func, dma.addr + off, 4);
+        uint32_t *ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr + off, 4);
         if (likely(ptr)) {
             *ptr = msg;
         }
@@ -1770,7 +1765,7 @@ static void xe2_guc_g2h_push(xe2_dev_t *xe2, uint32_t fence, const uint32_t *hxg
     // reports a pending GuC source. Latch it and raise vector 0; without this
     // every blocking CT request (e.g. GuC opt-in) times out.
     xe2->guc.irq_pending = true;
-    pci_send_irq(xe2->pci_func, 0);
+    rvvm_pci_send_irq(xe2->pci_func, 0);
 }
 
 // Reply to a transport request with a single-dword success response.
@@ -2024,7 +2019,7 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
     // The engine reports on its own MSI-X vector, which the driver recorded in
     // the context; the GuC owns vector 0, so raising 0 here would be ignored.
     uint32_t msix_vec = xe2_lrc_ctx_reg(xe2, XE2_CTX_CS_INT_VEC_DATA) & 0xFFFF;
-    pci_send_irq(xe2->pci_func, msix_vec);
+    rvvm_pci_send_irq(xe2->pci_func, msix_vec);
 }
 
 // Record (or look up) a submission context by its PPHWSP address. A freshly
@@ -2545,7 +2540,6 @@ static inline void xe2_cx0_msgbus_transaction(xe2_cx0_lane_t *lane, uint32_t cmd
 
 static inline bool xe2_skip_mmio_range(size_t offset)
 {
-    return 1;
     bool skip = 0;
     skip |= offset >= 0x050000 && offset <= 0x05FFFF;
     skip |= offset >= 0x090000 && offset <= 0x09FFFF;
@@ -2569,11 +2563,11 @@ static inline bool xe2_skip_mmio_range(size_t offset)
     return skip;
 }
 
-static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
+static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t offset)
 {
     UNUSED(size);
 
-    xe2_dev_t *xe2 = dev->data;
+    xe2_dev_t *xe2 = rvvm_region_data(dev);
     spin_lock(&xe2->lock);
 
     if (!xe2_skip_mmio_range(offset))
@@ -3271,7 +3265,6 @@ static bool xe2_mmio_read(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8
     }
 
     spin_unlock(&xe2->lock);
-    return true;
 }
 
 static inline bool xe2_ggtt_mmio_range(size_t offset)
@@ -3282,20 +3275,20 @@ static inline bool xe2_ggtt_mmio_range(size_t offset)
     return offset >= begin && offset <= end;
 }
 
-static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint8_t size)
+static void xe2_mmio_write(rvvm_reg_dev_t *dev, const void *data, size_t size, size_t offset)
 {
     UNUSED(size);
 
-    xe2_dev_t *xe2 = dev->data;
+    xe2_dev_t *xe2 = rvvm_region_data(dev);
     spin_lock(&xe2->lock);
 
     if (!xe2_skip_mmio_range(offset))
-        rvvm_info("PCI write: offset=%lx, data=%x, size = %u", offset, read_uint32_le(data), size);
+        rvvm_info("PCI write: offset=%lx, data=%x, size = %zu", offset, read_uint32_le(data), size);
 
     if (xe2_ggtt_mmio_range(offset)) {
         xe2_ggtt_mmio_write(xe2, offset, read_uint32_le(data));
         spin_unlock(&xe2->lock);
-        return true;
+        return;
     }
 
     switch (offset) {
@@ -3621,10 +3614,19 @@ static bool xe2_mmio_write(rvvm_mmio_dev_t *dev, void *data, size_t offset, uint
     }
 
     spin_unlock(&xe2->lock);
-    return true;
 }
 
-PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus, rvvm_fbdev_t *fbdev)
+static rvvm_reg_type_t xe2_type = {
+    .name     = "xe2",
+    .read     = xe2_mmio_read,
+    .write    = xe2_mmio_write,
+    .poll     = xe2_update,
+    .cleanup  = xe2_remove,
+    .min_size = 4,
+    .max_size = 4,
+};
+
+RVVM_PUBLIC rvvm_pci_func_t* rvvm_xe2_init(rvvm_machine_t *machine, rvvm_fbdev_t *fbdev, rvvm_pci_addr_t addr)
 {
     xe2_dev_t *xe2 = safe_new_obj(xe2_dev_t);
     xe2->aux[0].edid_written = 0;
@@ -3637,43 +3639,35 @@ PUBLIC pci_dev_t *xe2_init(pci_bus_t *pci_bus, rvvm_fbdev_t *fbdev)
     xe2->ggtt_lo_addrs = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint32_t), VMA_RDWR);
     xe2->ggtt_pte_valid = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(bool), VMA_RDWR);
 
-    pci_func_desc_t xe2_desc = {
+    rvvm_reg_desc_t xe2_mmio_desc = {
+        .size           = 0x1000000,
+        .data           = xe2,
+        .type           = &xe2_type
+    };
+    rvvm_reg_desc_t xe2_vram_desc = {
+        .size           = XE2_VRAM_SIZE,
+        .type           = &xe2_type_vram,
+        .mmap           = xe2->vram
+    };
+
+    rvvm_pci_func_desc_t xe2_desc = {
         .vendor_id  = XE2_VENDOR_ID_INTEL,
         .device_id  = XE2_DEVICE_ID_ARC_B570_GRAPHICS,
         .class_code = XE2_CLASS_CODE,
-        .prog_if    = 0,
-        .irq_pin    = PCI_IRQ_PIN_INTA,
+        .prog_iface = 0,
+        .irq_pin    = RVVM_PCI_PIN_INTA,
         // MMIO + GTT
-        .bar[0]     = {
-            .size           = 0x1000000,
-            .min_op_size    = 1,
-            .max_op_size    = 4,
-            .read           = xe2_mmio_read,
-            .write          = xe2_mmio_write,
-            .data           = xe2,
-            .type           = &xe2_type
-        },
+        .bar[0]     = &xe2_mmio_desc,
         // VRAM
-        .bar[2]         = {
-            .size           = XE2_VRAM_SIZE,
-            .min_op_size    = 1,
-            .max_op_size    = 4,
-            .data           = xe2,
-            .type           = &xe2_type_vram,
-            .mapping        = xe2->vram
-        }
+        .bar[2]     = &xe2_vram_desc
     };
 
-    pci_dev_t *pci_dev = pci_attach_func(pci_bus, &xe2_desc);
-    if (pci_dev)
-        xe2->pci_func = pci_get_device_func(pci_dev, 0);
-
-    return pci_dev;
-}
-
-PUBLIC pci_dev_t *xe2_init_auto(rvvm_machine_t *machine, rvvm_fbdev_t *fbdev)
-{
-    return xe2_init(rvvm_get_pci_bus(machine), fbdev);
+    rvvm_pci_func_t* func = rvvm_pci_func_init(machine, &xe2_desc, addr);
+    if (func) {
+        // Successfully plugged in
+        xe2->pci_func = func;
+    }
+    return func;
 }
 
 // Эти портреты безлики, он написал их
