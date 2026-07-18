@@ -43,12 +43,14 @@ RVVM_EXTERN_C_BEGIN
 #define RVVM_PCI_ADDR_ANY 0xFFFFFFFFUL
 
 /**
- * Auto-allocated hot-pluggable bus address
+ * Auto-allocated bus address suitable for hot-plug
  */
 #define RVVM_PCI_ADDR_HOT 0xFFFFFFFEUL
 
 /**
  * PCI function description
+ *
+ * Copied by value by rvvm_pci_func_init()
  */
 typedef struct {
     /**
@@ -72,29 +74,34 @@ typedef struct {
     uint16_t subsys_dev;
 
     /**
-     * Class code
+     * Class code, Subclass
      */
-    uint8_t class_code;
-
-    /**
-     * Subclass
-     */
-    uint8_t subclass;
+    uint16_t class_code;
 
     /**
      * Programming interface
      */
-    uint8_t prog_if;
+    uint8_t prog_iface;
 
     /**
      * Revision
      */
-    uint8_t rev;
+    uint8_t revision;
 
     /**
-     * INTx interrupt pin
+     * INTx interrupt pin (RVVM_PCI_PIN_*)
      */
-    uint8_t pin;
+    uint8_t irq_pin;
+
+    /**
+     * Number of interrupt vectors
+     */
+    uint8_t irq_vecs;
+
+    /**
+     * Attributes
+     */
+    uint8_t attr;
 
     /**
      * BAR region descriptions (Nullable)
@@ -107,14 +114,14 @@ typedef struct {
     const rvvm_reg_desc_t* rom;
 
     /**
-     * Additional legacy PCI capabilities (Nullable)
-     * This capability starts at 0xC0 in legacy PCI configuration space
+     * Head of additional PCI capability list (Nullable)
+     * This list starts at 0xC0 in PCI configuration space
      */
     const rvvm_reg_desc_t* cap;
 
     /**
-     * Additional PCI Express capabilities (Nullable)
-     * This capability starts at 0x100 in PCI Express configuration space
+     * Head of additional PCIe extended capability list (Nullable)
+     * This list starts at 0x100 in PCI Express configuration space
      */
     const rvvm_reg_desc_t* ecap;
 
@@ -123,15 +130,12 @@ typedef struct {
 /**
  * Attach PCI function to machine at specific bus address
  *
- * The machine owns PCI devices and their handles
+ * Function unconditionally transfers ownership
  *
- * If this call fails, device cleanup is invoked, same as when
- * machine is freed or device is hot-removed
- *
- * \param machine Machine handle
- * \param desc    PCI function description, fully copied internally
- * \param addr    PCI bus address or RVVM_PCI_ADDR_ANY
- * \return        PCI function handle or NULL
+ * \param machine Machine handle (Nullable, invokes cleanup)
+ * \param desc    PCI function description
+ * \param addr    PCI bus address
+ * \return        PCI function handle (NULL on failure)
  *
  * Multi-function devices may be constructed manually via this
  *
@@ -144,9 +148,9 @@ RVVM_PUBLIC rvvm_pci_func_t* rvvm_pci_func_init(rvvm_machine_t*             mach
 /**
  * Remove PCI function from machine
  *
- * This should only be used for device hot-removal, device cleanup is automatic
+ * This should only be used for device hot-removal, cleanup is automatic
  *
- * \param func PCI function handle
+ * \param func PCI function handle (Nullable)
  * \note       Must not be called after rvvm_machine_free() on owning machine,
  *             nor from device's own callbacks or internal threads
  *
@@ -157,9 +161,9 @@ RVVM_PUBLIC void rvvm_pci_func_remove(rvvm_pci_func_t* func);
 /**
  * Get PCI function handle from bus address
  *
- * \param machine Machine handle
+ * \param machine Machine handle (Nullable)
  * \param addr    PCI bus address
- * \return        PCI function handle or NULL
+ * \return        PCI function handle (NULL on failure)
  *
  * This function is thread-safe
  */
@@ -168,21 +172,22 @@ RVVM_PUBLIC rvvm_pci_func_t* rvvm_pci_func_from_addr(rvvm_machine_t* machine, rv
 /**
  * Get bus address of a PCI function
  *
- * \param func PCI function handle
- * \return     PCI function bus address
+ * \param func PCI function handle (Nullable)
+ * \return     PCI function bus address (RVVM_PCI_ADDR_ANY on failure)
  *
  * This function is thread-safe
  */
-RVVM_PUBLIC rvvm_pci_addr_t rvvm_pci_func_get_addr(rvvm_pci_func_t* func);
+RVVM_PUBLIC rvvm_pci_addr_t rvvm_pci_addr_from_func(rvvm_pci_func_t* func);
 
 /**
  * Set interrupt level of a PCI function
  *
- * \param func PCI function handle which set the IRQ
+ * \param func PCI function handle that sets the IRQ (Nullable)
  * \param vec  Interrupt vector index provided by the device
  * \param lvl  Interrupt line level
  *
- * The interrupt is delivered via INTx/MSI/MSI-X based on configuration space
+ * The interrupt is delivered via INTx, MSI, or MSI-X according to
+ * the current PCI configuration set for this function by the guest
  *
  * This function is thread-safe
  */
@@ -191,7 +196,7 @@ RVVM_PUBLIC void rvvm_pci_set_irq(rvvm_pci_func_t* func, uint32_t vec, bool lvl)
 /**
  * Raise interrupt vector of a PCI function
  *
- * \param func PCI function handle which raised the IRQ
+ * \param func PCI function handle that raises the IRQ (Nullable)
  * \param vec  Interrupt vector index provided by the device
  *
  * This function is thread-safe
@@ -204,7 +209,7 @@ static inline void rvvm_pci_raise_irq(rvvm_pci_func_t* func, uint32_t vec)
 /**
  * Lower interrupt vector of a PCI function
  *
- * \param func PCI function handle which lowered the IRQ
+ * \param func PCI function handle that lowers the IRQ (Nullable)
  * \param vec  Interrupt vector index provided by the device
  *
  * This function is thread-safe
@@ -217,10 +222,11 @@ static inline void rvvm_pci_lower_irq(rvvm_pci_func_t* func, uint32_t vec)
 /**
  * Send interrupt edge (pulse) from a PCI function
  *
- * \param func PCI function handle which sent the IRQ
+ * \param func PCI function handle that sends the IRQ (Nullable)
  * \param vec  Interrupt vector index provided by the device
  *
- * Should be used for VFIO or other devices which can't report lowered interrupt
+ * Should only be used for devices which cannot explicitly report
+ * interrupt vector deassertion (for example VFIO devices)
  *
  * This function is thread-safe
  */
@@ -231,24 +237,26 @@ static inline void rvvm_pci_send_irq(rvvm_pci_func_t* func, uint32_t vec)
 }
 
 /**
- * Perform direct memory access to the PCI host
+ * Obtain a direct mapping into guest physical memory
  *
  * If RVVM_PCI_DMA_PART is set, returned mapping may be smaller than requested, which will
  * be reflected in *size, otherwise this function may fall back to IOMMU bounce buffer
  *
- * The RVVM_PCI_DMA_RD / RVVM_PCI_DMA_WR specify cache invalidation policy,
+ * The RVVM_PCI_DMA_RD / RVVM_PCI_DMA_WR specify cache synchronization semantics,
  * as well as optimize redundant IOMMU bounce buffer copies
  *
- * For write-only mappings, it is expected the caller fully fills the mapping with data
+ * For write-only mappings, the caller is expected to fully populate the mapping
  *
- * The region which backs the DMA mapping will become locked from removal,
- * and the DMA core internally maintains reference counting on DMA mappings
+ * The region backing the DMA mapping will become locked from removal,
+ * the DMA core internally maintains reference counting on DMA mappings
  *
- * \param func PCI function handle which performs DMA access
- * \param addr Physical memory address
- * \param size Memory region size, returns actual obtained size
+ * The returned mapping remains valid until rvvm_pci_end_dma() is called on it
+ *
+ * \param func PCI function handle which performs DMA access (Nullable)
+ * \param addr Requested mapping physical address
+ * \param size Requested mapping size, returns actual obtained size
  * \param attr DMA operation attributes (read/write/partial)
- * \return     Pointer to DMA memory or NULL
+ * \return     Pointer to DMA region (NULL on failure)
  * \note       DMA access must be ended via rvvm_pci_end_dma()
  *
  * This function is thread-safe
@@ -256,12 +264,12 @@ static inline void rvvm_pci_send_irq(rvvm_pci_func_t* func, uint32_t vec)
 RVVM_PUBLIC void* rvvm_pci_get_dma_ex(rvvm_pci_func_t* func, rvvm_addr_t addr, size_t* size, uint32_t attr);
 
 /**
- * Perform direct memory access to the PCI host (Read/Write, possibly partial)
+ * Obtain a direct mapping into guest physical memory (Read/Write, possibly partial)
  *
- * \param func PCI function handle which performs DMA access
- * \param addr Physical memory address
- * \param size Memory region size, returns actual obtained size
- * \return     Pointer to DMA memory or NULL
+ * \param func PCI function handle which performs DMA access (Nullable)
+ * \param addr Requested mapping physical address
+ * \param size Requested mapping size, returns actual obtained size
+ * \return     Pointer to DMA region (NULL on failure)
  * \note       DMA access must be ended via rvvm_pci_end_dma()
  *
  * This function is thread-safe
@@ -272,12 +280,14 @@ static inline void* rvvm_pci_get_dma_part(rvvm_pci_func_t* func, rvvm_addr_t add
 }
 
 /**
- * Perform direct memory access to the PCI host (Read/Write)
+ * Obtain a direct mapping into guest physical memory (Read/Write, never partial)
  *
- * \param func PCI function handle which performs DMA access
- * \param addr Physical memory address
- * \param size Memory region size
- * \return     Pointer to DMA memory or NULL
+ * The entire requested region is mapped or NULL is returned
+ *
+ * \param func PCI function handle which performs DMA access (Nullable)
+ * \param addr Requested mapping physical address
+ * \param size Requested mapping size
+ * \return     Pointer to DMA region (NULL on failure)
  * \note       DMA access must be ended via rvvm_pci_end_dma()
  *
  * This function is thread-safe
@@ -288,13 +298,13 @@ static inline void* rvvm_pci_get_dma(rvvm_pci_func_t* func, rvvm_addr_t addr, si
 }
 
 /**
- * End direct memory access started by rvvm_pci_get_dma()
+ * End direct memory access started by rvvm_pci_get_dma*()
  *
- * Must be called for every successful rvvm_pci_get_dma()
+ * Must be called for every successful rvvm_pci_get_dma*()
  * after you're no longer using the obtained mapping
  *
- * \param func PCI function handle which performs DMA access
- * \param ptr  Pointer to DMA memory obtained via rvvm_pci_get_dma()
+ * \param func PCI function handle which performs DMA access (Nullable)
+ * \param ptr  Pointer to DMA memory obtained via rvvm_pci_get_dma*() (Nullable)
  *
  * This function is thread-safe
  */
