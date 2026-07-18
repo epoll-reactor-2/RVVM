@@ -12,9 +12,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_region.h>
 #include <rvvm/rvvm_snapshot.h>
 
-#include "mem_ops.h"
-#include "rvtimer.h"
-#include "utils.h"
+#include <util/mem_ops.h>
+#include <util/rvtimer.h>
+#include <util/utils.h>
 
 PUSH_OPTIMIZATION_SIZE
 
