@@ -799,13 +799,26 @@ glmark2-es2-drm
 #define XE2_CTX_RING_TAIL                                 0x7
 #define XE2_CTX_RING_START                                0x9
 #define XE2_CTX_RING_CTL                                  0xB
+#define XE2_CTX_RING_TIMESTAMP                            0x23
+#define XE2_CTX_RING_TIMESTAMP_UDW                        0x25
 #define XE2_CTX_RING_PDP0_UDW                             0x31
 #define XE2_CTX_RING_PDP0_LDW                             0x33
 #define XE2_CTX_INT_STATUS_REPORT_PTR                     0x57
 #define XE2_CTX_INT_SRC_REPORT_PTR                        0x59
 #define XE2_CTX_CS_INT_VEC_DATA                           0x5B
 
-// Up to four engine contexts (rcs0/bcs0/ccs0/...) may be registered at once.
+// Memory-based interrupts (memirq). The engine's source-report and
+// status-report GGTT pointers are baked into its LRC register state (the driver
+// never sends them over self-cfg). The render engine sits at irq_offset 0, and
+// its user-interrupt is byte 0 of the status vector; each cause is a byte 0xFF.
+#define XE2_MEMIRQ_RENDER_SRC_BYTE                        0
+#define XE2_MEMIRQ_RENDER_STATUS_BYTE                     0
+#define XE2_MEMIRQ_BYTE_SET                               0xFF
+#define XE2_LRC_SEQNO_PPHWSP_OFFSET                       512
+#define XE2_LRC_START_SEQNO_PPHWSP_OFFSET                 520
+#define XE2_LRC_CTX_JOB_TIMESTAMP_OFFSET                  528
+
+// Up to eight engine contexts (rcs0/bcs0/ccs0/...) may be registered at once.
 #define XE2_MAX_CONTEXTS                                  8
 
 // Ring command stream decode. Type lives in bits 31:29 (MI = 0, GFXPIPE = 3);
@@ -836,15 +849,6 @@ glmark2-es2-drm
 #define XE2_PIPE_CONTROL_GLOBAL_GTT                       xe2_reg_bit( 24)
 
 #define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)
-
-// Memory-based interrupts (memirq). The engine's source-report and
-// status-report GGTT pointers are baked into its LRC register state (the driver
-// never sends them over self-cfg). The render engine sits at irq_offset 0, and
-// its user-interrupt is byte 0 of the status vector; each cause is a byte 0xFF.
-#define XE2_MEMIRQ_RENDER_SRC_BYTE                        0
-#define XE2_MEMIRQ_RENDER_STATUS_BYTE                     0
-#define XE2_MEMIRQ_BYTE_SET                               0xFF
-#define XE2_LRC_SEQNO_OFFSET                              0
 
 // memirq page geometry. The source-report page sits 0x400 into the shared BO;
 // each status vector is 16 bytes. The GuC's own interrupt sits at bit 25
@@ -926,6 +930,8 @@ glmark2-es2-drm
 #define XE2_REG_HW_ENGINE_RING_HEAD(base)                 (base + 0x34)
 #define XE2_REG_HW_ENGINE_RING_START(base)                (base + 0x38)
 #define XE2_REG_HW_ENGINE_RING_CTL(base)                  (base + 0x3C)
+#define XE2_REG_HW_ENGINE_RING_TIMESTAMP(base)            (base + 0x358)
+#define XE2_REG_HW_ENGINE_RING_CTX_TIMESTAMP(base)        (base + 0x3A8)
 
 #define XE2_VRAM_SIZE                                     0x10000000 // 256 MiB
 
@@ -1118,9 +1124,6 @@ typedef struct {
     xe2_dma_addr_t hwlrca_addr;
     xe2_dma_addr_t pphwsp_addr;
 
-    // Monotonic render-engine completion seqno, published at the LRC status page.
-    uint32_t    ctx_seqno;
-
     // Registered submission contexts. A doorbell on the shared host-interrupt
     // register carries both CT messages and ring-work submissions; rather than
     // guess which doorbell is a submission, we track each context's last-
@@ -1129,6 +1132,8 @@ typedef struct {
         xe2_dma_addr_t pphwsp;        // translated PPHWSP (context page) address
         uint32_t       last_tail;     // ring tail already completed
         bool           valid;
+        // Monotonic render-engine completion seqno, published at the LRC status page.
+        uint32_t       seqno;
     } ctx[XE2_MAX_CONTEXTS];
 
     struct {
@@ -1529,7 +1534,7 @@ static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
     // rvvm_info("PTE: flag (RW)?       %lu", pte & (1 << 1));
     // rvvm_info("PTE: flag (present)?  %lu", pte & (1 << 0));
 
-    if (!(pte & 1)) {
+    if (unlikely(!(pte & 1))) {
         rvvm_warn("PTE 0x%lx is invalid!", pte);
         return (xe2_dma_addr_t) {
             .addr = 0,
@@ -1980,7 +1985,12 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
 // user interrupt via the memory-based interrupt pages whose GGTT locations the
 // driver baked into the LRC register state, so it wakes, reads the seqno and
 // signals the job fence.
-static void xe2_signal_render_completion(xe2_dev_t *xe2)
+//
+// Problem with seqno/timestamp. Driver doesn't notice seqno change and fails
+// to submit a task when running OpenGL benchmark in DRM mode. Seqno is per-context
+// number. If such procedure fails, driver goes and invalidates GuC with
+// XE2_GUC_ACTION_TLB_INVALIDATION.
+static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
 {
     if (xe2->pphwsp_addr.addr == 0) {
         return;
@@ -2002,6 +2012,14 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2)
         xe2_dma_addr_t sts = xe2_ggtt_translate(xe2, sts_ggtt);
         xe2_dma_write32(xe2, sts, XE2_MEMIRQ_RENDER_STATUS_BYTE, XE2_MEMIRQ_BYTE_SET);
     }
+
+    uint32_t job_seqno = xe2->ctx[context_idx].seqno;
+
+    xe2_dma_write32(xe2, xe2->pphwsp_addr, XE2_LRC_SEQNO_PPHWSP_OFFSET, job_seqno);
+    xe2_dma_write32(xe2, xe2->pphwsp_addr, XE2_LRC_START_SEQNO_PPHWSP_OFFSET, job_seqno);
+    xe2_dma_write32(xe2, xe2->pphwsp_addr, XE2_LRC_CTX_JOB_TIMESTAMP_OFFSET, job_seqno);
+
+    xe2->ctx[context_idx].seqno = job_seqno + 1;
 
     // The engine reports on its own MSI-X vector, which the driver recorded in
     // the context; the GuC owns vector 0, so raising 0 here would be ignored.
@@ -2056,7 +2074,7 @@ static void xe2_complete_advanced_contexts(xe2_dev_t *xe2)
             continue;
         }
         rvvm_info("%s: Context %zu (PPHWSP: 0x%lx) needs completion", __FUNCTION__, i, xe2->pphwsp_addr.addr);
-        xe2_signal_render_completion(xe2);
+        xe2_signal_render_completion(xe2, i);
         xe2->ctx[i].last_tail = tail;
     }
 }
