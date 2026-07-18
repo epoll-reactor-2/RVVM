@@ -338,7 +338,7 @@ static int rvvm_cli_main(int argc, char** argv)
     }
 
     if (!rvvm_has_arg("nogui") && !rvvm_has_arg("res")) {
-        if (!rvvm_has_arg("nogpu") && !rvvm_has_arg("bochs_display")) {
+        if (rvvm_has_arg("xe2_test")) {
             // The Battlemage GPU drives the display: open a window sized to the
             // panel's native mode and hand its fbdev to the device to scan out.
             rvvm_fb_t     hint = {
