@@ -7,24 +7,18 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#ifndef LEKKIT_MEM_OPS_H
-#define LEKKIT_MEM_OPS_H
+#ifndef RVVM_UTIL_MEM_OPS_H
+#define RVVM_UTIL_MEM_OPS_H
 
-#include <stdint.h>
+#include <util/compiler.h>
+
 #include <string.h>
 
-#include "compiler.h"
-
 /*
- * Simple memory operations (write, read integers) for internal usage,
- * and load/store instructions.
+ * Little-endian operations with any alignment
  */
 
-/*
- * Handle misaligned operaions properly, to prevent
- * crashes on old ARM CPUs, etc
- */
-
+// Read little-endian u64, possibly misaligned
 static forceinline uint64_t read_uint64_le_m(const void* addr)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -44,6 +38,7 @@ static forceinline uint64_t read_uint64_le_m(const void* addr)
 #endif
 }
 
+// Write little-endian u64, possibly misaligned
 static forceinline void write_uint64_le_m(void* addr, uint64_t val)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -62,6 +57,7 @@ static forceinline void write_uint64_le_m(void* addr, uint64_t val)
 #endif
 }
 
+// Read little-endian u32, possibly misaligned
 static forceinline uint32_t read_uint32_le_m(const void* addr)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -77,6 +73,7 @@ static forceinline uint32_t read_uint32_le_m(const void* addr)
 #endif
 }
 
+// Write little-endian u32, possibly misaligned
 static forceinline void write_uint32_le_m(void* addr, uint32_t val)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -91,6 +88,7 @@ static forceinline void write_uint32_le_m(void* addr, uint32_t val)
 #endif
 }
 
+// Read little-endian u16, possibly misaligned
 static forceinline uint16_t read_uint16_le_m(const void* addr)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -103,6 +101,7 @@ static forceinline uint16_t read_uint16_le_m(const void* addr)
 #endif
 }
 
+// Write little-endian u16, possibly misaligned
 static forceinline void write_uint16_le_m(void* addr, uint16_t val)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -116,9 +115,10 @@ static forceinline void write_uint16_le_m(void* addr, uint16_t val)
 }
 
 /*
- * Big-endian operations
+ * Big-endian operations with any alignment
  */
 
+// Read big-endian u64, possibly misaligned
 static forceinline uint64_t read_uint64_be_m(const void* addr)
 {
     const uint8_t* arr = (const uint8_t*)addr;
@@ -132,6 +132,7 @@ static forceinline uint64_t read_uint64_be_m(const void* addr)
          | (((uint64_t)arr[0]) << 56);
 }
 
+// Write big-endian u64, possibly misaligned
 static forceinline void write_uint64_be_m(void* addr, uint64_t val)
 {
     uint8_t* arr = (uint8_t*)addr;
@@ -146,6 +147,7 @@ static forceinline void write_uint64_be_m(void* addr, uint64_t val)
     arr[0] = (val >> 56) & 0xFF;
 }
 
+// Read big-endian u32, possibly misaligned
 static forceinline uint32_t read_uint32_be_m(const void* addr)
 {
     const uint8_t* arr = (const uint8_t*)addr;
@@ -155,6 +157,7 @@ static forceinline uint32_t read_uint32_be_m(const void* addr)
          | (((uint32_t)arr[0]) << 24);
 }
 
+// Write big-endian u32, possibly misaligned
 static forceinline void write_uint32_be_m(void* addr, uint32_t val)
 {
     uint8_t* arr = (uint8_t*)addr;
@@ -165,12 +168,14 @@ static forceinline void write_uint32_be_m(void* addr, uint32_t val)
     arr[0] = (val >> 24) & 0xFF;
 }
 
+// Read big-endian u16, possibly misaligned
 static forceinline uint16_t read_uint16_be_m(const void* addr)
 {
     const uint8_t* arr = (const uint8_t*)addr;
     return ((uint16_t)arr[1]) | (((uint16_t)arr[0]) << 8);
 }
 
+// Write big-endian u16, possibly misaligned
 static forceinline void write_uint16_be_m(void* addr, uint16_t val)
 {
     uint8_t* arr = (uint8_t*)addr;
@@ -184,6 +189,7 @@ static forceinline void write_uint16_be_m(void* addr, uint16_t val)
  * Falls back to byte-bang operations on big-endian systems
  */
 
+// Read little-endian u64, must be aligned
 TSAN_SUPPRESS static forceinline uint64_t read_uint64_le(const void* addr)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -193,6 +199,7 @@ TSAN_SUPPRESS static forceinline uint64_t read_uint64_le(const void* addr)
 #endif
 }
 
+// Write little-endian u64, must be aligned
 TSAN_SUPPRESS static forceinline void write_uint64_le(void* addr, uint64_t val)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -202,6 +209,7 @@ TSAN_SUPPRESS static forceinline void write_uint64_le(void* addr, uint64_t val)
 #endif
 }
 
+// Read little-endian u32, must be aligned
 TSAN_SUPPRESS static forceinline uint32_t read_uint32_le(const void* addr)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -211,6 +219,7 @@ TSAN_SUPPRESS static forceinline uint32_t read_uint32_le(const void* addr)
 #endif
 }
 
+// Write little-endian u32, must be aligned
 TSAN_SUPPRESS static forceinline void write_uint32_le(void* addr, uint32_t val)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -220,6 +229,7 @@ TSAN_SUPPRESS static forceinline void write_uint32_le(void* addr, uint32_t val)
 #endif
 }
 
+// Read little-endian u16, must be aligned
 TSAN_SUPPRESS static forceinline uint16_t read_uint16_le(const void* addr)
 {
 #if defined(HOST_LITTLE_ENDIAN)
@@ -229,6 +239,7 @@ TSAN_SUPPRESS static forceinline uint16_t read_uint16_le(const void* addr)
 #endif
 }
 
+// Write little-endian u16, must be aligned
 TSAN_SUPPRESS static forceinline void write_uint16_le(void* addr, uint16_t val)
 {
 #if defined(HOST_LITTLE_ENDIAN)
