@@ -7,10 +7,26 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
+/*
+ * WIP
+ */
+
+#ifdef USE_XHCI
+
+#include <rvvm/rvvm_board.h>
+#include <rvvm/rvvm_pci.h>
+#include <rvvm/rvvm_region.h>
+#include <rvvm/rvvm_snapshot.h>
+
+#include <util/atomics.h>
+#include <util/bit_ops.h>
+#include <util/mem_ops.h>
+#include <util/utils.h>
+
 #include "usb-xhci.h"
-#include "utils.h"
-#include "mem_ops.h"
-#include "bit_ops.h"
+#include "compiler.h"
+
+PUSH_OPTIMIZATION_SIZE
 
 /*
  * Register regions
@@ -275,7 +291,7 @@ typedef struct {
 } xhci_interrupter_t;
 
 typedef struct {
-    pci_func_t* pci_func;
+    rvvm_pci_func_t* func;
 
     // Operational registers
     uint32_t usbcmd;
@@ -295,7 +311,7 @@ static inline void xhci_interrupt(xhci_bus_t* xhci, uint32_t irq_vec)
     atomic_or_uint32(&xhci->usbsts, XHCI_USBSTS_EINT);
     if (likely(atomic_load_uint32_relax(&xhci->usbcmd) & XHCI_USBCMD_INTE)) {
         // TODO: What interrupt vector should be used here?
-        pci_send_irq(xhci->pci_func, irq_vec);
+        rvvm_pci_send_irq(xhci->func, irq_vec);
     }
 }
 
@@ -336,10 +352,11 @@ static void xhci_report_event(xhci_bus_t* xhci, const xhci_event_trb_t* event)
                     crste_next = crste + 1;
                 }
 
-                const uint8_t* crs_ptr = pci_get_dma_ptr(xhci->pci_func, erstba + (crste << 4), 0x10);
+                uint8_t* crs_ptr = rvvm_pci_get_dma(xhci->func, erstba + (crste << 4), 0x10);
                 if (likely(crs_ptr)) {
                     crsba = read_uint64_le(crs_ptr) & (~0x3FULL);
                     crssz = read_uint16_le(crs_ptr + 0x8);
+                    rvvm_pci_end_dma(xhci->func, crs_ptr);
                     atomic_store_uint32_relax(&intr->crsba, crsba);
                     atomic_store_uint32_relax(&intr->crsba_h, crsba >> 32);
                     atomic_store_uint32_relax(&intr->crssz, crssz);
@@ -360,12 +377,13 @@ static void xhci_report_event(xhci_bus_t* xhci, const xhci_event_trb_t* event)
         } while (!atomic_cas_uint32(&intr->crse, crse, crse_next));
 
         // Submit TRB
-        uint8_t* dma = pci_get_dma_ptr(xhci->pci_func, crsba + (crse << 4), XHCI_TRB_SIZE);
+        uint8_t* dma = rvvm_pci_get_dma(xhci->func, crsba + (crse << 4), XHCI_TRB_SIZE);
         if (likely(dma)) {
             rvvm_warn("xhci event submitted at %x", (uint32_t)(crsba + (crse << 4)));
             write_uint64_le(dma + XHCI_TRB_PTR, event->ptr);
             write_uint32_le(dma + XHCI_TRB_STS, event->sts);
             atomic_store_uint32_le(dma + XHCI_TRB_CTR, event->ctr);
+            rvvm_pci_end_dma(xhci->func, dma);
 
             atomic_or_uint32(&intr->erdp, XHCI_ERDP_EHB);
             if (atomic_or_uint32(&intr->iman, XHCI_IMAN_IP) & XHCI_IMAN_IE) {
@@ -413,11 +431,13 @@ static void xhci_doorbell_write(xhci_bus_t* xhci, size_t id, uint32_t val)
         rvvm_addr_t cr_addr = xhci_cmd_ring_addr(xhci);
         rvvm_addr_t start = cr_addr;
         do {
-            uint8_t* dma = pci_get_dma_ptr(xhci->pci_func, cr_addr, XHCI_TRB_SIZE);
+            uint8_t* dma = rvvm_pci_get_dma(xhci->func, cr_addr, XHCI_TRB_SIZE);
             if (dma) {
                 uint64_t ptr = read_uint64_le(dma);
                 uint32_t sts = read_uint32_le(dma + 0x8);
                 uint32_t ctr = read_uint32_le(dma + 0xC);
+                rvvm_pci_end_dma(xhci->func, dma);
+
                 rvvm_warn("crcr: %x, ctr: %x", crcr, ctr);
                 if (!!(crcr & XHCI_CRCR_RCS) != !!(ctr & XHCI_TRB_CTR_C)) {
                     // Cycle bit mismatch, stop the ring
@@ -507,16 +527,16 @@ static void xhci_interrupter_write(xhci_bus_t* xhci, size_t id, size_t offset, u
     }
 }
 
-static bool xhci_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void xhci_pci_read(rvvm_reg_dev_t* dev, void* data, size_t size, size_t off)
 {
-    xhci_bus_t* xhci = dev->data;
+    xhci_bus_t* xhci = rvvm_region_data(dev);
     uint32_t val = 0;
     UNUSED(size);
 
 
-    if ((offset - XHCI_RUNTIME_BASE) < XHCI_RUNTIME_SIZE) {
+    if ((off - XHCI_RUNTIME_BASE) < XHCI_RUNTIME_SIZE) {
         // Runtime registers
-        size_t runtime_off = (offset - XHCI_RUNTIME_BASE);
+        size_t runtime_off = (off - XHCI_RUNTIME_BASE);
         if (runtime_off < 0x20) {
             // TODO: Microframe index at XHCI_RUNTIME_BASE
             val = 0;
@@ -525,20 +545,20 @@ static bool xhci_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8
             val = xhci_interrupter_read(xhci, (runtime_off - 0x20) >> 5, runtime_off & 0x1C);
         }
 
-    } else if ((offset - XHCI_PORT_REGS_BASE) < XHCI_PORT_REGS_SIZE) {
+    } else if ((off - XHCI_PORT_REGS_BASE) < XHCI_PORT_REGS_SIZE) {
         // Port registers
-        size_t port_id = (offset - XHCI_PORT_REGS_BASE) >> 4;
-        size_t port_off = (offset & 0xC);
+        size_t port_id = (off - XHCI_PORT_REGS_BASE) >> 4;
+        size_t port_off = (off & 0xC);
         val = xhci_port_reg_read(xhci, port_id, port_off);
 
-    } else if (offset >= XHCI_EXT_CAPS_BASE) {
+    } else if (off >= XHCI_EXT_CAPS_BASE) {
         // Extended capabilities
-        size_t entry = (offset - XHCI_EXT_CAPS_BASE) >> 2;
+        size_t entry = (off - XHCI_EXT_CAPS_BASE) >> 2;
         if (entry < STATIC_ARRAY_SIZE(xhci_ext_caps)) {
             val = xhci_ext_caps[entry];
         }
 
-    } else switch (offset) {
+    } else switch (off) {
         // Capability registers
         case XHCI_REG_CAPLENGTH_HCIVERSION:
             val = XHCI_CAPLEN_HCIVERSION;
@@ -596,40 +616,38 @@ static bool xhci_pci_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8
             break;
 
         default:
-            rvvm_warn("xhci read  %08x from %04x", val, (uint32_t)offset);
+            rvvm_warn("xhci read  %08x from %04x", val, (uint32_t)off);
             break;
     }
 
     write_uint32_le(data, val);
-
-    return true;
 }
 
-static bool xhci_pci_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void xhci_pci_write(rvvm_reg_dev_t* dev, const void* data, size_t size, size_t off)
 {
-    xhci_bus_t* xhci = dev->data;
+    xhci_bus_t* xhci = rvvm_region_data(dev);
     uint32_t val = read_uint32_le(data);
     UNUSED(size);
 
-    if ((offset - XHCI_DOORBELL_BASE) < XHCI_DOORBELL_SIZE) {
+    if ((off - XHCI_DOORBELL_BASE) < XHCI_DOORBELL_SIZE) {
         // Doorbell registers
-        xhci_doorbell_write(xhci, (offset - XHCI_DOORBELL_BASE) >> 2, val);
+        xhci_doorbell_write(xhci, (off - XHCI_DOORBELL_BASE) >> 2, val);
 
-    } else if ((offset - XHCI_RUNTIME_BASE) < XHCI_RUNTIME_SIZE) {
+    } else if ((off - XHCI_RUNTIME_BASE) < XHCI_RUNTIME_SIZE) {
         // Runtime registers
-        size_t runtime_off = (offset - XHCI_RUNTIME_BASE);
+        size_t runtime_off = (off - XHCI_RUNTIME_BASE);
         if (runtime_off >= 0x20) {
             // Interrupter write
             xhci_interrupter_write(xhci, (runtime_off - 0x20) >> 5, runtime_off & 0x1C, val);
         }
 
-    } else if ((offset - XHCI_PORT_REGS_BASE) < XHCI_PORT_REGS_SIZE) {
+    } else if ((off - XHCI_PORT_REGS_BASE) < XHCI_PORT_REGS_SIZE) {
         // Port registers
-        size_t port_id = (offset - XHCI_PORT_REGS_BASE) >> 4;
-        size_t port_off = (offset & 0xC);
+        size_t port_id = (off - XHCI_PORT_REGS_BASE) >> 4;
+        size_t port_off = (off & 0xC);
         xhci_port_reg_write(xhci, port_id, port_off, val);
 
-    } else switch (offset) {
+    } else switch (off) {
         // Operational registers
         case XHCI_REG_USBCMD:
             if (val & XHCI_USBCMD_HCRST) {
@@ -671,40 +689,46 @@ static bool xhci_pci_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint
             break;
 
         default:
-            rvvm_warn("xhci write %08x to   %04x", val, (uint32_t)offset);
+            rvvm_warn("xhci write %08x to   %04x", val, (uint32_t)off);
             break;
     }
-    return true;
 }
 
-static const rvvm_mmio_type_t xhci_type = {
-    .name = "xhci",
+static const rvvm_reg_type_t xhci_type = {
+    .name     = "xhci",
+    .read     = xhci_pci_read,
+    .write    = xhci_pci_write,
+    .min_size = 4,
+    .max_size = 4,
 };
 
-PUBLIC pci_dev_t* usb_xhci_init(pci_bus_t* pci_bus)
+rvvm_pci_func_t* rvvm_usb_xhci_init(rvvm_machine_t* machine, rvvm_pci_addr_t addr)
 {
     xhci_bus_t* xhci = safe_new_obj(xhci_bus_t);
-    pci_func_desc_t xhci_desc = {
-        .vendor_id = 0x100b,  // National Semiconductor Corporation
-        .device_id = 0x0012,  // USB Controller
+
+    rvvm_reg_desc_t xhci_bar = {
+        .size = XHCI_BAR_SIZE,
+        .data = xhci,
+        .type = &xhci_type,
+        .attr = RVVM_REG_ATTR_BAR64,
+    };
+    rvvm_pci_func_desc_t xhci_desc = {
+        .vendor_id  = 0x100b, // National Semiconductor Corporation
+        .device_id  = 0x0012, // USB Controller
         .class_code = 0x0C03, // Serial bus controller, USB controller
-        .prog_if = 0x30,      // XHCI
-        .irq_pin = PCI_IRQ_PIN_INTA,
-        .bar[0] = {
-            .size = XHCI_BAR_SIZE,
-            .min_op_size = 4,
-            .max_op_size = 4,
-            .read = xhci_pci_read,
-            .write = xhci_pci_write,
-            .data = xhci,
-            .type = &xhci_type,
-        },
+        .prog_iface = 0x30,   // XHCI
+        .irq_pin = RVVM_PCI_PIN_INTA,
+        .bar[0] = &xhci_bar,
     };
 
-    pci_dev_t* pci_dev = pci_attach_func(pci_bus, &xhci_desc);
-    if (pci_dev) {
+    rvvm_pci_func_t* func = rvvm_pci_func_init(machine, &xhci_desc, addr);
+    if (func) {
         // Successfully plugged in
-        xhci->pci_func = pci_get_device_func(pci_dev, 0);
+        xhci->func = func;
     }
-    return pci_dev;
+    return func;
 }
+
+POP_OPTIMIZATION_SIZE
+
+#endif
