@@ -13,7 +13,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <rvvm/rvvm.h>
 
-#include "mem_ops.h"
+#include <util/mem_ops.h>
 
 PUSH_OPTIMIZATION_SIZE
 
