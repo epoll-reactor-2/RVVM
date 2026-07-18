@@ -7,10 +7,10 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#include "feature_test.h" // IWYU pragma: keep
+#include <util/feature_test.h>
 
-#include "atomics.h" // IWYU pragma: keep
-#include "utils.h"   // IWYU pragma: keep
+#include <util/atomics.h>
+#include <util/utils.h>
 
 #if !defined(USE_THREAD_EMU)                                                                                           \
     && (defined(ATOMIC_EMU32_IMPL) || defined(ATOMIC_EMU64_IMPL) || defined(ATOMIC_EMU128_IMPL))

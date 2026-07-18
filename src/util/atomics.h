@@ -7,8 +7,8 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#ifndef LEKKIT_ATOMICS_H
-#define LEKKIT_ATOMICS_H
+#ifndef RVVM_UTIL_ATOMICS_H
+#define RVVM_UTIL_ATOMICS_H
 
 /*
  * Cheat sheet on C11 atomics and common CPU memory models (LekKit, 2025):
@@ -89,16 +89,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
  * in a way that should be globally ordered. This is rarely the case.
  */
 
-#include "compiler.h"
+#include <util/compiler.h>
 
 #if !defined(HOST_LITTLE_ENDIAN)
 // Use portable endian conversions for explicit little endian atomics
-#include "mem_ops.h"
+#include <util/mem_ops.h>
 #endif
-
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
 
 #undef ATOMIC_RELAXED
 #undef ATOMIC_CONSUME
