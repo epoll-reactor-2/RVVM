@@ -8,6 +8,11 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
+/*
+ * TODO: Replace <cpu/riscv_hart.h> with <rvvm/rvvm_cpu.h>
+ * TODO: Handle machine = NULL and CPU hotplug!
+ */
+
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_fdt.h>
 #include <rvvm/rvvm_irq.h>
@@ -19,10 +24,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/mem_ops.h>
 
 #include <cpu/riscv_hart.h>
-
-/*
- * TODO: Handle machine = NULL and CPU hotplug!
- */
 
 PUSH_OPTIMIZATION_SIZE
 
