@@ -7,6 +7,10 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
+/*
+ * TODO: Replace <cpu/riscv_hart.h> with <rvvm/rvvm_cpu.h>
+ */
+
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_fdt.h>
 #include <rvvm/rvvm_region.h>
@@ -15,7 +19,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <cpu/riscv_hart.h>
 
-#include "riscv-aclint.h" // TODO: Remove with rvvm_board
+PUSH_OPTIMIZATION_SIZE
 
 static void aclint_mswi_read(rvvm_reg_dev_t* dev, void* data, size_t size, size_t off)
 {
@@ -94,7 +98,7 @@ static const rvvm_reg_type_t mtimer_type = {
     .max_size = 8,
 };
 
-PUBLIC bool rvvm_riscv_clint_init(rvvm_machine_t* machine, rvvm_addr_t addr)
+RVVM_PUBLIC bool rvvm_riscv_clint_init(rvvm_machine_t* machine, rvvm_addr_t addr)
 {
     rvvm_reg_desc_t mswi_desc = {
         .addr = addr,
@@ -144,3 +148,5 @@ PUBLIC bool rvvm_riscv_clint_init(rvvm_machine_t* machine, rvvm_addr_t addr)
 
     return true;
 }
+
+POP_OPTIMIZATION_SIZE
