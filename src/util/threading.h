@@ -7,8 +7,8 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#ifndef LEKKIT_THREADING_H
-#define LEKKIT_THREADING_H
+#ifndef RVVM_UTIL_THREADING_H
+#define RVVM_UTIL_THREADING_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -16,12 +16,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 /*
  * Threads
  *
- * Note: Detaching a thread is unsafe in unloadable libraries.
- * Note: Use rvvm_interrupt_syscall() to interrupt a syscall
- *       currently blocking the thread, if possible.
+ * NOTE: Detaching a thread is unsafe in unloadable libraries
  */
 
-typedef struct rvvm_thread_intrnl rvvm_thread_t;
+typedef struct rvvm_thread_ctx rvvm_thread_t;
 
 typedef void* (*rvvm_thread_func_t)(void*);
 
@@ -29,7 +27,6 @@ rvvm_thread_t* rvvm_thread_create_ex(rvvm_thread_func_t func, void* arg, uint32_
 rvvm_thread_t* rvvm_thread_create(rvvm_thread_func_t func, void* arg);
 void           rvvm_thread_join(rvvm_thread_t* thread);
 void           rvvm_thread_detach(rvvm_thread_t* thread);
-void           rvvm_interrupt_syscall(rvvm_thread_t* thread);
 
 /*
  * Yielding, CPU relax hints

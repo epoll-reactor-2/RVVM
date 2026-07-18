@@ -8,15 +8,14 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 // Expose clock_gettime(), pthread_condattr_setclock(), pthread_cond_timedwait_relative_np(), syscall()
-#include "feature_test.h" // IWYU pragma: keep
+#include <util/feature_test.h>
 
-#include "atomics.h"
-#include "threading.h"
-#include "utils.h"
-
-#include "dlib.h"     // IWYU pragma: keep
-#include "rvtimer.h"  // IWYU pragma: keep
-#include "spinlock.h" // IWYU pragma: keep
+#include <util/atomics.h>
+#include <util/dlib.h>
+#include <util/locking.h>
+#include <util/rvtimer.h>
+#include <util/threading.h>
+#include <util/utils.h>
 
 PUSH_OPTIMIZATION_SIZE
 
@@ -155,7 +154,7 @@ static int (*ulock_wake)(uint32_t op, void* ptr, uint64_t unused)           = NU
  * Threads
  */
 
-struct rvvm_thread_intrnl {
+struct rvvm_thread_ctx {
 #if defined(WIN32_THREADS_IMPL)
     HANDLE handle;
 #elif defined(POSIX_THREADS_IMPL)
@@ -621,7 +620,7 @@ typedef struct {
 #elif defined(SDL_THREADS_IMPL)
     SDL_mutex* mutex;
 #else
-    spinlock_t lock;
+    rvvm_lock_t lock;
 #endif
 } futex_emu_queue_t;
 
@@ -660,7 +659,7 @@ static inline void futex_emu_lock(futex_emu_queue_t* queue)
 #elif defined(SDL_THREADS_IMPL)
     SDL_LockMutex(queue->mutex);
 #else
-    spin_lock_busy_loop(&queue->lock);
+    rvvm_spin_lock(&queue->lock);
 #endif
 }
 
@@ -673,7 +672,7 @@ static inline void futex_emu_unlock(futex_emu_queue_t* queue)
 #elif defined(SDL_THREADS_IMPL)
     SDL_UnlockMutex(queue->mutex);
 #else
-    spin_unlock_busy_loop(&queue->lock);
+    rvvm_spin_unlock(&queue->lock);
 #endif
 }
 
@@ -924,9 +923,9 @@ static uint32_t futex_native_wait(void* ptr, uint32_t val, uint64_t ns)
 #elif defined(WASM_FUTEX_IMPL)
     switch (__builtin_wasm_memory_atomic_wait32(ptr, val, ns)) {
         case 0:
-            return THREAD_FUTEX_WAKEUP;
+            return RVVM_FUTEX_WAKEUP;
         case 1:
-            return THREAD_FUTEX_MISMATCH;
+            return RVVM_FUTEX_MISMATCH;
     }
 #endif
     UNUSED(ptr && val && ns);
@@ -1002,7 +1001,7 @@ uint32_t rvvm_futex_wait(void* ptr, uint32_t val, uint64_t timeout_ns)
     if (likely(ptr && timeout_ns)) {
 #if defined(USE_THREAD_EMU)
         if (atomic_load_uint32(ptr) != val) {
-            return THREAD_FUTEX_MISMATCH;
+            return RVVM_FUTEX_MISMATCH;
         }
         sleep_ns(timeout_ns);
 #elif defined(NATIVE_FUTEX_IMPL)
@@ -1107,29 +1106,115 @@ uint32_t rvvm_event_waiters(rvvm_event_t* event)
 }
 
 /*
- * Tasklets
+ * Threaded tasks
  */
 
+#define TASK_WORKERS   16
+
+#define TASK_TRIGGERED 0x80000000UL
+#define TASK_MULTISHOT 0x40000000UL
+#define TASK_RECYCLED  0x20000000UL
+#define TASK_SHUTDOWN  0x10000000UL
+#define TASK_STEP_MASK 0x0FFFFFFFUL
+#define TASK_STEP      0x00000001UL
+
 struct rvvm_task_intrnl {
+    // Threaded task callback
     rvvm_task_cb_intrnl_t cb;
-
+    // Threaded task private data
     void* data;
-
-    void* next;
+#if defined(USE_WIP_TASKLETS)
+    // Double-linked list of tasks
+    rvvm_task_t* next;
+    rvvm_task_t* prev;
+    // Current task state
+    uint32_t flag;
+#endif
 };
+
+#if defined(USE_WIP_TASKLETS)
+
+static rvvm_thread_t* task_workers[TASK_WORKERS] = ZERO_INIT;
+
+static rvvm_event_t task_event = ZERO_INIT;
+static rvvm_lock_t  task_lock  = ZERO_INIT;
+static rvvm_task_t* task_list  = NULL;
+
+static uint32_t rvvm_task_traverse(void)
+{
+    rvvm_task_t* task = atomic_load_pointer(&task_list);
+    while (task) {
+        uint32_t flag = atomic_load_uint32_relax(&task->flag);
+        while (flag & TASK_TRIGGERED) {
+            if ((flag & TASK_STEP_MASK) && !(flag & TASK_MULTISHOT)) {
+                break;
+            }
+            if (!atomic_cas_uint32(&task->flag, flag, (flag & ~TASK_TRIGGERED) + TASK_STEP)) {
+                break;
+            }
+            task->cb(task->data);
+            flag = atomic_sub_uint32(&task->flag, TASK_STEP) - TASK_STEP;
+            if (flag == TASK_RECYCLED || flag == TASK_SHUTDOWN) {
+                rvvm_futex_wake(&task->flag, 1);
+                return flag;
+            }
+        }
+
+        // Advance to next task
+        task = atomic_load_pointer(&task->next);
+    }
+    return 0;
+}
+
+static void* rvvm_task_worker(void* arg)
+{
+    while (true) {
+        uint32_t flag = rvvm_task_traverse();
+        if (!flag) {
+            rvvm_event_wait(&task_event, RVVM_EVENT_INFINITE);
+        } else if (flag == TASK_SHUTDOWN) {
+            break;
+        }
+    }
+    return arg;
+}
+
+#endif
 
 rvvm_task_t* rvvm_task_init(rvvm_task_cb_intrnl_t cb, void* data)
 {
     rvvm_task_t* task = safe_new_obj(rvvm_task_t);
     task->cb          = cb;
     task->data        = data;
+#if defined(USE_WIP_TASKLETS)
+    rvvm_scoped_lock (&task_lock) {
+        rvvm_task_t* list = atomic_load_pointer(&task_list);
+        if (!list) {
+            for (size_t i = 0; i < STATIC_ARRAY_SIZE(task_workers); ++i) {
+                task_workers[i] = rvvm_thread_create(rvvm_task_worker, NULL);
+            }
+        } else {
+            task->next = list;
+            list->prev = task;
+        }
+        atomic_store_pointer(&task_list, task);
+    }
+#endif
     return task;
 }
 
 void rvvm_task_wake(rvvm_task_t* task)
 {
     if (likely(task)) {
-#if defined(USE_THREAD_EMU) || 1
+#if defined(USE_WIP_TASKLETS)
+        uint32_t flag = atomic_load_uint32_relax(&task->flag);
+        if (!(flag & TASK_TRIGGERED)) {
+            flag = atomic_or_uint32(&task->flag, TASK_TRIGGERED);
+        }
+        if (!(flag & TASK_TRIGGERED) || (flag & TASK_MULTISHOT)) {
+            rvvm_event_wake(&task_event);
+        }
+#else
         task->cb(task->data);
 #endif
     }
@@ -1137,12 +1222,16 @@ void rvvm_task_wake(rvvm_task_t* task)
 
 void rvvm_task_free(rvvm_task_t* task)
 {
-    safe_free(task);
+    if (likely(task)) {
+        safe_free(task);
+    }
 }
 
 /*
  * Threadpool
  */
+
+typedef void* (*rvvm_thread_func_va_t)(void**);
 
 #if defined(USE_THREAD_EMU)
 
@@ -1169,7 +1258,7 @@ typedef struct {
     uint32_t           seq;
     uint32_t           flags;
     rvvm_thread_func_t func;
-    void*              arg[THREAD_MAX_VA_ARGS];
+    void*              arg[8];
 } task_item_t;
 
 typedef struct {
@@ -1178,11 +1267,11 @@ typedef struct {
     uint32_t    tail;
 } work_queue_t;
 
-static uint32_t      pool_run;
-static uint32_t      pool_shut;
-static work_queue_t  pool_wq;
-static cond_var_t*   pool_cond;
-static thread_ctx_t* pool_threads[WORKER_THREADS];
+static uint32_t       pool_run;
+static uint32_t       pool_shut;
+static work_queue_t   pool_wq;
+static rvvm_event_t   pool_event;
+static rvvm_thread_t* pool_threads[WORKER_THREADS];
 
 static void workqueue_init(work_queue_t* wq)
 {
@@ -1223,7 +1312,7 @@ static bool workqueue_try_perform(work_queue_t* wq)
             tail = atomic_load_uint32_ex(&wq->tail, ATOMIC_RELAXED);
         }
 
-        thread_sched_yield();
+        rvvm_sched_yield();
     }
 }
 
@@ -1255,7 +1344,7 @@ static bool workqueue_submit(work_queue_t* wq, rvvm_thread_func_t func, void** a
             head = atomic_load_uint32_ex(&wq->head, ATOMIC_RELAXED);
         }
 
-        thread_sched_yield();
+        rvvm_sched_yield();
     }
     return false;
 }
@@ -1265,15 +1354,13 @@ static void thread_workers_terminate(void)
     atomic_store_uint32(&pool_run, 0);
     // Wake & shut down all threads properly
     while (atomic_load_uint32(&pool_shut) != WORKER_THREADS) {
-        condvar_wake(pool_cond);
-        thread_sched_yield();
+        rvvm_event_wake(&pool_event);
+        rvvm_sched_yield();
     }
     for (size_t i = 0; i < WORKER_THREADS; ++i) {
-        thread_join(pool_threads[i]);
+        rvvm_thread_join(pool_threads[i]);
         pool_threads[i] = NULL;
     }
-    condvar_free(pool_cond);
-    pool_cond = NULL;
 }
 
 static void* threadpool_worker(void* ptr)
@@ -1281,7 +1368,7 @@ static void* threadpool_worker(void* ptr)
     while (atomic_load_uint32_ex(&pool_run, ATOMIC_RELAXED)) {
         while (workqueue_try_perform(&pool_wq)) {
         }
-        condvar_wait(pool_cond, CONDVAR_INFINITE);
+        rvvm_event_wait(&pool_event, RVVM_EVENT_INFINITE);
     }
     atomic_add_uint32(&pool_shut, 1);
     return ptr;
@@ -1292,9 +1379,8 @@ static void threadpool_init(void)
     atomic_store_uint32(&pool_shut, 0);
     atomic_store_uint32(&pool_run, 1);
     workqueue_init(&pool_wq);
-    pool_cond = condvar_create();
     for (size_t i = 0; i < WORKER_THREADS; ++i) {
-        pool_threads[i] = thread_create(threadpool_worker, NULL);
+        pool_threads[i] = rvvm_thread_create(threadpool_worker, NULL);
     }
     call_at_deinit(thread_workers_terminate);
 }
@@ -1304,7 +1390,7 @@ static bool thread_queue_task(rvvm_thread_func_t func, void** arg, unsigned arg_
     DO_ONCE(threadpool_init());
 
     if (workqueue_submit(&pool_wq, func, arg, arg_count, va)) {
-        condvar_wake(pool_cond);
+        rvvm_event_wake(&pool_event);
         return true;
     }
 
@@ -1323,7 +1409,7 @@ void thread_create_task(rvvm_thread_func_t func, void* arg)
 
 void thread_create_task_va(rvvm_thread_func_va_t func, void** args, unsigned arg_count)
 {
-    if (arg_count == 0 || arg_count > THREAD_MAX_VA_ARGS) {
+    if (arg_count == 0 || arg_count > 8) {
         rvvm_warn("Invalid arg count in thread_create_task_va()!");
         return;
     }
