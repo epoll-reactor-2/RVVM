@@ -7,11 +7,15 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
+/*
+ * TODO: Remove this header in favor of <rvvm/rvvm_board.h>
+ * TODO: Replace "sound_subsystem_t" with <rvvm/rvvm_pcm.h> or <rvvm/rvvm_char.h>
+ */
+
 #ifndef SOUND_HDA_H
 #define SOUND_HDA_H
 
-#include "rvvmlib.h"
-#include "pci-bus.h"
+#include <rvvm/rvvm_board.h>
 
 typedef struct sound_subsystem_t sound_subsystem_t;
 
@@ -86,9 +90,6 @@ typedef void (*sound_hda_backend_abort_fn)(void *user_data);
 // Internal use
 bool alsa_sound_init(sound_subsystem_t *sound);
 
-PUBLIC pci_dev_t* sound_hda_init(pci_bus_t* pci_bus);
-PUBLIC pci_dev_t* sound_hda_init_auto(rvvm_machine_t* machine);
-
 /*
  * Extended init variants that let the caller plug in a custom host-side
  * audio sink. Pass NULL for `write_fn` to fall back to the compile-time
@@ -102,13 +103,15 @@ PUBLIC pci_dev_t* sound_hda_init_auto(rvvm_machine_t* machine);
  * invoked during device removal to unblock any in-flight write so the
  * stream worker can exit promptly. Pass NULL if `write_fn` never blocks.
  */
-PUBLIC pci_dev_t* sound_hda_init_ex(pci_bus_t* pci_bus,
-                                    sound_hda_backend_write_fn write_fn,
-                                    sound_hda_backend_abort_fn abort_fn,
-                                    void* user_data);
-PUBLIC pci_dev_t* sound_hda_init_auto_ex(rvvm_machine_t* machine,
-                                         sound_hda_backend_write_fn write_fn,
-                                         sound_hda_backend_abort_fn abort_fn,
-                                         void* user_data);
+RVVM_PUBLIC rvvm_pci_func_t* sound_hda_init_ex(rvvm_machine_t* pci_bus,
+                                               sound_hda_backend_write_fn write_fn,
+                                               sound_hda_backend_abort_fn abort_fn,
+                                               void* user_data,
+                                               rvvm_pci_addr_t addr);
+
+static inline rvvm_pci_func_t* sound_hda_init(rvvm_machine_t* machine)
+{
+    return sound_hda_init_ex(machine, NULL, NULL, NULL, -1);
+}
 
 #endif

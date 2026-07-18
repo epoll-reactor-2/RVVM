@@ -7,14 +7,27 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
+/*
+ * TODO: Refactor and format this chungus in separate commit
+ * TODO: Replace "sound_subsystem_t" with <rvvm/rvvm_pcm.h> or <rvvm/rvvm_char.h>
+ * TODO: Level-triggered interrupts
+ * TODO: Reduce amount of locking
+ * TODO: Snapshots
+ */
+
+#include <rvvm/rvvm_board.h>
+#include <rvvm/rvvm_pci.h>
+#include <rvvm/rvvm_region.h>
+#include <rvvm/rvvm_snapshot.h>
+
+#include <util/atomics.h>
+#include <util/mem_ops.h>
+#include <util/rvtimer.h>
+#include <util/locking.h>
+#include <util/threading.h>
+#include <util/utils.h>
+
 #include "sound-hda.h"
-#include "atomics.h"
-#include "compiler.h"
-#include "mem_ops.h"
-#include "rvtimer.h"
-#include "threading.h"
-#include "spinlock.h"
-#include "utils.h"
 
 PUSH_OPTIMIZATION_SIZE
 
@@ -541,8 +554,10 @@ typedef struct {
 } sound_hda_stream_t;
 
 struct sound_hda_dev_s {
-    pci_func_t* pci_func;
-    spinlock_t  lock;
+    rvvm_pci_func_t* func;
+
+    rvvm_lock_t  lock;
+
     uint32_t    gctl;
     uint16_t    wakeen;        // §3.3.8  — preserved across CRST
     uint16_t    statests;      // §3.3.9  — codec presence; bit 0 = our codec
@@ -1005,9 +1020,10 @@ static void gr_ics_write(sound_hda_dev_t *hda, uint32_t v)
         // Response was written into RIRB at hda->rirb_wp. Read it back
         // for IRR. (rirb_lo+rirb_wp*8 holds the response dword.)
         if (hda->rirb_lo) {
-            uint32_t *resp = pci_get_dma_ptr(hda->pci_func,
+            uint32_t *resp = rvvm_pci_get_dma(hda->func,
                 (rvvm_addr_t)hda->rirb_lo + hda->rirb_wp * 8, 4);
             if (resp) hda->irr = *resp;
+            rvvm_pci_end_dma(hda->func, resp);
         }
         hda->ics = (hda->ics & ~0x1u) | 0x2u;   // clear ICB, set IRV
     }
@@ -1135,11 +1151,11 @@ static bool gr_dispatch_write(sound_hda_dev_t *hda, size_t offset,
     return true;
 }
 
-static void sound_hda_remove(rvvm_mmio_dev_t* dev)
+static void sound_hda_cleanup(rvvm_reg_dev_t* dev)
 {
     // Unbounded join on every worker: hang-on-teardown is recoverable;
-    // returning while a worker still uses hda->pci_func is UAF.
-    sound_hda_dev_t *hda = dev->data;
+    // returning while a worker still uses hda->func is UAF.
+    sound_hda_dev_t *hda = rvvm_region_data(dev);
     if (hda == NULL) return;
 
     for (size_t i = 0; i < HDA_STREAMS_TOTAL; ++i) {
@@ -1166,12 +1182,8 @@ static void sound_hda_remove(rvvm_mmio_dev_t* dev)
                               " after 5 s; backend may be blocking"));
         }
     }
+    free(hda);
 }
-
-static rvvm_mmio_type_t sound_hda_type = {
-    .name = "intel_hda",
-    .remove = sound_hda_remove,
-};
 
 // INTSTS (§3.3.15): bits 0..29 per-stream SIS, bit 30 CIS, bit 31 GIS.
 // SIS bit number = descriptor index (§3.3.14).
@@ -1207,23 +1219,21 @@ static sound_hda_stream_t *hda_resolve_stream(sound_hda_dev_t *hda,
     return &hda->streams[idx];
 }
 
-static bool sound_hda_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void sound_hda_mmio_read(rvvm_reg_dev_t* dev, void* data, size_t size, size_t off)
 {
-    sound_hda_dev_t *hda = dev->data;
-    spin_lock(&hda->lock);
+    sound_hda_dev_t *hda = rvvm_region_data(dev);
+    rvvm_lock(&hda->lock);
 
     // Try the global controller register table first; on miss, try the
     // stream descriptor block (HDA spec §3.3.34: shared 0x20-byte layout
     // for input/output/bidir streams).
-    bool ok = gr_dispatch_read(hda, offset, data, size);
-    if (!ok) {
+    if (!gr_dispatch_read(hda, off, data, size)) {
         uint16_t sub_off;
-        sound_hda_stream_t *s = hda_resolve_stream(hda, offset, &sub_off);
-        if (s != NULL) ok = sd_dispatch_read(hda, s, sub_off, data, size);
+        sound_hda_stream_t *s = hda_resolve_stream(hda, off, &sub_off);
+        if (s != NULL) sd_dispatch_read(hda, s, sub_off, data, size);
     }
 
-    spin_unlock(&hda->lock);
-    return ok;
+    rvvm_unlock(&hda->lock);
 }
 
 static void sound_hda_write_rirb(sound_hda_dev_t *hda, uint32_t cad, uint32_t response)
@@ -1232,8 +1242,8 @@ static void sound_hda_write_rirb(sound_hda_dev_t *hda, uint32_t cad, uint32_t re
     hda->rirb_wp %= hda->rirb_size;
 
     // §3.3.27 / §4.4.2.1: 8-byte entries (response dword + response_ex dword).
-    uint32_t *rirb = pci_get_dma_ptr(
-        hda->pci_func,
+    uint32_t *rirb = rvvm_pci_get_dma(
+        hda->func,
         (rvvm_addr_t)hda->rirb_lo + hda->rirb_wp * 8,
         8
     );
@@ -1242,7 +1252,8 @@ static void sound_hda_write_rirb(sound_hda_dev_t *hda, uint32_t cad, uint32_t re
     rirb[0] = response;
     rirb[1] = cad;       // response_ex (codec address in bits 3:0)
     // pci_send_irq just queues into the IRQ controller; safe under hda->lock.
-    pci_send_irq(hda->pci_func, 0);
+    rvvm_pci_end_dma(hda->func, rirb);
+    rvvm_pci_send_irq(hda->func, 0);
 }
 
 // NID = 0
@@ -1825,7 +1836,7 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
     uint32_t total = stream->bdl_lvi + 1;
     // §3.6.3: 16-byte BDL entries (addr8 + len4 + flags4).
     uint64_t bdl_bytes = (uint64_t)total * 16;
-    uint64_t *dma = pci_get_dma_ptr(hda->pci_func, stream->bdl_lo, bdl_bytes);
+    uint64_t *dma = rvvm_pci_get_dma(hda->func, stream->bdl_lo, bdl_bytes);
 
     // If the guest set up the stream control register without a valid BDL
     // (bdl_lo == 0 or invalid), pci_get_dma_ptr returns NULL. Bail out
@@ -1853,14 +1864,14 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
                            " — spec §3.6.3", i);
                 if (!atomic_load_uint32_relax(&stream->running)) return;
                 if (ioc) {
-                    spin_lock(&hda->lock);
+                    rvvm_lock(&hda->lock);
                     stream->status |= 0x04;
                     uint8_t  ioce = stream->ioce;
                     uint32_t ic   = hda->intr_ctrl;
-                    spin_unlock(&hda->lock);
+                    rvvm_unlock(&hda->lock);
                     if (ioce && (ic & (1u << 31))
                              && (ic & (1u << stream->intsts_bit))) {
-                        pci_send_irq(hda->pci_func, 0);
+                        rvvm_pci_send_irq(hda->func, 0);
                     }
                 }
                 continue;
@@ -1881,7 +1892,7 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
             // (they don't need to know channel count) and the pacing
             // math below stays 1:1 with the bytes they see.
             if (hda->subsystem.write != NULL) {
-                void *pcm = pci_get_dma_ptr(hda->pci_func, addr, len);
+                void *pcm = rvvm_pci_get_dma(hda->func, addr, len);
                 if (pcm == NULL) {
                     // Bad guest BDL entry (zero addr, unmapped region, or
                     // zero len). Don't feed NULL to the backend — ALSA's
@@ -1942,6 +1953,7 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
                     // that care can parse stream->fmt from the caller.
                     hda->subsystem.write(&hda->subsystem, pcm, len);
                 }
+                rvvm_pci_end_dma(hda->func, pcm);
             } else {
                 UNUSED(addr);
             }
@@ -1989,20 +2001,22 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
                 // §3.3.38: latch BCIS unconditionally (RW1C-cleared by
                 // guest); IRQ gate is separate. Lock guards against the
                 // MMIO-side RW1C clear racing the latch.
-                spin_lock(&hda->lock);
+                rvvm_lock(&hda->lock);
                 stream->status |= 0x04;
                 uint8_t  ioce = stream->ioce;
                 uint32_t ic   = hda->intr_ctrl;
-                spin_unlock(&hda->lock);
+                rvvm_unlock(&hda->lock);
                 // §3.3.14 / §3.3.36: PCI IRQ requires IOCE & SIE & GIE.
                 bool gie = (ic & (1u << 31)) != 0;
                 bool sie = (ic & (1u << stream->intsts_bit)) != 0;
                 if (ioce && gie && sie) {
-                    pci_send_irq(hda->pci_func, 0);
+                    rvvm_pci_send_irq(hda->func, 0);
                 }
             }
         }
     }
+    // TODO: Refactor, THIS FUNCTION IS SO LONG
+    rvvm_pci_end_dma(hda->func, dma);
 }
 
 // Input-direction drain. Mirror of sound_hda_stream_drain: same BDL
@@ -2036,7 +2050,7 @@ static void sound_hda_stream_drain_input(sound_hda_stream_t *stream)
 
     uint32_t total = stream->bdl_lvi + 1;
     uint64_t bdl_bytes = (uint64_t)total * 16;
-    uint64_t *dma = pci_get_dma_ptr(hda->pci_func, stream->bdl_lo, bdl_bytes);
+    uint64_t *dma = rvvm_pci_get_dma(hda->func, stream->bdl_lo, bdl_bytes);
     if (dma == NULL) {
         atomic_store_uint32_relax(&stream->running, 0);
         return;
@@ -2054,14 +2068,14 @@ static void sound_hda_stream_drain_input(sound_hda_stream_t *stream)
                            " (input) — spec §3.6.3", i);
                 if (!atomic_load_uint32_relax(&stream->running)) return;
                 if (ioc) {
-                    spin_lock(&hda->lock);
+                    rvvm_lock(&hda->lock);
                     stream->status |= 0x04;
                     uint8_t  ioce = stream->ioce;
                     uint32_t ic   = hda->intr_ctrl;
-                    spin_unlock(&hda->lock);
+                    rvvm_unlock(&hda->lock);
                     if (ioce && (ic & (1u << 31))
                              && (ic & (1u << stream->intsts_bit))) {
-                        pci_send_irq(hda->pci_func, 0);
+                        rvvm_pci_send_irq(hda->func, 0);
                     }
                 }
                 continue;
@@ -2071,7 +2085,7 @@ static void sound_hda_stream_drain_input(sound_hda_stream_t *stream)
             // backend; pad the remainder (or the whole thing if no
             // backend) with silence so the guest sees a steady
             // sample-rate stream regardless of host-side gaps.
-            void *dst = pci_get_dma_ptr(hda->pci_func, addr, len);
+            void *dst = rvvm_pci_get_dma(hda->func, addr, len);
             if (dst != NULL) {
                 size_t got = 0;
                 if (hda->subsystem.read != NULL) {
@@ -2081,6 +2095,7 @@ static void sound_hda_stream_drain_input(sound_hda_stream_t *stream)
                 if (got < len) {
                     memset((uint8_t*)dst + got, 0, (size_t)len - got);
                 }
+                rvvm_pci_end_dma(hda->func, dst);
             }
 
             // Same shutdown check as the output path — a backend abort
@@ -2117,19 +2132,21 @@ static void sound_hda_stream_drain_input(sound_hda_stream_t *stream)
             // committed to memory). For us, that's after the memset/
             // memcpy above, so latch it here.
             if (ioc) {
-                spin_lock(&hda->lock);
+                rvvm_lock(&hda->lock);
                 stream->status |= 0x04;
                 uint8_t  ioce = stream->ioce;
                 uint32_t ic   = hda->intr_ctrl;
-                spin_unlock(&hda->lock);
+                rvvm_unlock(&hda->lock);
                 bool gie = (ic & (1u << 31)) != 0;
                 bool sie = (ic & (1u << stream->intsts_bit)) != 0;
                 if (ioce && gie && sie) {
-                    pci_send_irq(hda->pci_func, 0);
+                    rvvm_pci_send_irq(hda->func, 0);
                 }
             }
         }
     }
+    // TODO: Refactor
+    rvvm_pci_end_dma(hda->func, dma);
 }
 
 // Beep generator worker (HDA spec §7.2.3.8 / §7.3.3.31). Runs whenever
@@ -2366,30 +2383,38 @@ static void sound_hda_corb_wp_write(sound_hda_dev_t *hda, uint32_t v)
     hda->corb_wp = v & 0xFFu;
     if (hda->corb_size == 0) return;
     uint32_t entries = hda->corb_size / 4;
-    uint32_t *corb = pci_get_dma_ptr(hda->pci_func, hda->corb_lo,
+    uint32_t *corb = rvvm_pci_get_dma(hda->func, hda->corb_lo,
                                      (size_t)entries * 4);
     if (corb == NULL) return;
     while (hda->corb_rp != hda->corb_wp) {
         hda->corb_rp = (hda->corb_rp + 1) % entries;
         sound_hda_codec_cmd(hda, corb[hda->corb_rp]);
     }
+    rvvm_pci_end_dma(hda->func, corb);
 }
 
-static bool sound_hda_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
+static void sound_hda_mmio_write(rvvm_reg_dev_t* dev, const void* data, size_t size, size_t off)
 {
-    sound_hda_dev_t *hda = dev->data;
-    spin_lock(&hda->lock);
+    sound_hda_dev_t *hda = rvvm_region_data(dev);
+    rvvm_lock(&hda->lock);
 
-    bool ok = gr_dispatch_write(hda, offset, data, size);
-    if (!ok) {
+    if (!gr_dispatch_write(hda, off, data, size)) {
         uint16_t sub_off;
-        sound_hda_stream_t *s = hda_resolve_stream(hda, offset, &sub_off);
-        if (s != NULL) ok = sd_dispatch_write(hda, s, sub_off, data, size);
+        sound_hda_stream_t *s = hda_resolve_stream(hda, off, &sub_off);
+        if (s != NULL) sd_dispatch_write(hda, s, sub_off, data, size);
     }
 
-    spin_unlock(&hda->lock);
-    return ok;
+    rvvm_unlock(&hda->lock);
 }
+
+static rvvm_reg_type_t sound_hda_type = {
+    .name = "sound-hda",
+    .read = sound_hda_mmio_read,
+    .write = sound_hda_mmio_write,
+    .cleanup = sound_hda_cleanup,
+    .min_size = 1,
+    .max_size = 4,
+};
 
 /*
  * Bridge struct stored in sound_subsystem_t.sound_data when a caller-supplied
@@ -2420,10 +2445,11 @@ static void sound_hda_backend_bridge_abort(sound_subsystem_t *sub)
     }
 }
 
-PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
-                                    sound_hda_backend_write_fn write_fn,
-                                    sound_hda_backend_abort_fn abort_fn,
-                                    void *user_data)
+RVVM_PUBLIC rvvm_pci_func_t* sound_hda_init_ex(rvvm_machine_t* machine,
+                                               sound_hda_backend_write_fn write_fn,
+                                               sound_hda_backend_abort_fn abort_fn,
+                                               void* user_data,
+                                               rvvm_pci_addr_t addr)
 {
     sound_hda_dev_t *sound_hda = safe_new_obj(sound_hda_dev_t);
 
@@ -2473,26 +2499,19 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
         s->gain_q15   = 0;
     }
 
-    pci_func_desc_t sound_hda_desc = {
+    rvvm_reg_desc_t sound_hda_bar = {
+        .size = 0x4000,
+        .data = sound_hda,
+        .type = &sound_hda_type,
+        .attr = RVVM_REG_ATTR_BAR64,
+    };
+    rvvm_pci_func_desc_t sound_hda_desc = {
         .vendor_id  = SOUND_VENDOR_ID_CMEDIA,
         .device_id  = SOUND_DEVICE_ID_CMEDIA,
         .class_code = SOUND_CLASS_CODE_CMEDIA,
-        .prog_if    = 0x00,
-        .irq_pin    = PCI_IRQ_PIN_INTA,
-        .bar[0] = {
-            .size        = 0x4000,
-            .min_op_size = 1,
-            .max_op_size = 4,
-            .read        = sound_hda_mmio_read,
-            .write       = sound_hda_mmio_write,
-            .data        = sound_hda,
-            .type        = &sound_hda_type
-        },
+        .irq_pin    = RVVM_PCI_PIN_INTA,
+        .bar[0]     = &sound_hda_bar,
     };
-
-    pci_dev_t *pci_dev = pci_attach_func(pci_bus, &sound_hda_desc);
-    if (pci_dev)
-        sound_hda->pci_func = pci_get_device_func(pci_dev, 0);
 
     // Backend selection priority:
     //   1. Caller-supplied write_fn (via sound_hda_init_ex) — skip the
@@ -2521,25 +2540,11 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
 #endif
     }
 
-    return pci_dev;
-}
+    rvvm_pci_func_t* func = rvvm_pci_func_init(machine, &sound_hda_desc, addr);
+    if (func)
+        sound_hda->func = func;
 
-PUBLIC pci_dev_t *sound_hda_init_auto_ex(rvvm_machine_t *machine,
-                                         sound_hda_backend_write_fn write_fn,
-                                         sound_hda_backend_abort_fn abort_fn,
-                                         void *user_data)
-{
-    return sound_hda_init_ex(rvvm_get_pci_bus(machine), write_fn, abort_fn, user_data);
-}
-
-PUBLIC pci_dev_t *sound_hda_init(pci_bus_t *pci_bus)
-{
-    return sound_hda_init_ex(pci_bus, NULL, NULL, NULL);
-}
-
-PUBLIC pci_dev_t *sound_hda_init_auto(rvvm_machine_t *machine)
-{
-    return sound_hda_init(rvvm_get_pci_bus(machine));
+    return func;
 }
 
 POP_OPTIMIZATION_SIZE
