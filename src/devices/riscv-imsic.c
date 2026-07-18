@@ -7,12 +7,22 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-#include <util/mem_ops.h>
+/*
+ * TODO: Use <rvvm/rvvm_region.h>
+ * TODO: Replace <cpu/riscv_hart.h> with <rvvm/rvvm_cpu.h>
+ */
+
+#include <rvvm/rvvm_board.h>
+#include <rvvm/rvvm_fdt.h>
+
+#include <rvvm/rvvm.h>
+
 #include <util/bit_ops.h>
+#include <util/mem_ops.h>
 
 #include <cpu/riscv_hart.h>
 
-#include "riscv-imsic.h" // TODO: Remove with rvvm_board
+PUSH_OPTIMIZATION_SIZE
 
 #define IMSIC_REG_SETEIPNUM_LE 0x00
 #define IMSIC_REG_SETEIPNUM_BE 0x04
@@ -23,8 +33,8 @@ typedef struct {
 
 static bool imsic_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    imsic_ctx_t* imsic = dev->data;
-    size_t hartid = offset >> 12;
+    imsic_ctx_t* imsic  = dev->data;
+    size_t       hartid = offset >> 12;
     UNUSED(size);
 
     if (hartid < vector_size(dev->machine->harts)) {
@@ -48,14 +58,14 @@ static rvvm_mmio_type_t imsic_dev_type = {
     .name = "riscv_imsic",
 };
 
-PUBLIC void riscv_imsic_init(rvvm_machine_t* machine, rvvm_addr_t addr, bool smode)
+static bool riscv_imsic_init(rvvm_machine_t* machine, rvvm_addr_t addr, bool smode)
 {
     if (rvvm_machine_running(machine)) {
         rvvm_error("Can't enable AIA on already running machine!");
-        return;
+        return false;
     }
 
-    vector_foreach(machine->harts, i) {
+    vector_foreach (machine->harts, i) {
         riscv_hart_aia_init(vector_at(machine->harts, i));
     }
 
@@ -64,59 +74,64 @@ PUBLIC void riscv_imsic_init(rvvm_machine_t* machine, rvvm_addr_t addr, bool smo
     imsic_ctx_t* imsic = safe_new_obj(imsic_ctx_t);
 
     rvvm_mmio_dev_t imsic_mmio = {
-        .addr = addr,
-        .size = vector_size(machine->harts) << 12,
-        .data = imsic,
+        .addr        = addr,
+        .size        = vector_size(machine->harts) << 12,
+        .data        = imsic,
         .min_op_size = 4,
         .max_op_size = 4,
-        .read = rvvm_mmio_none,
-        .write = imsic_mmio_write,
-        .type = &imsic_dev_type,
+        .read        = rvvm_mmio_none,
+        .write       = imsic_mmio_write,
+        .type        = &imsic_dev_type,
     };
 
     imsic->smode = smode;
 
     if (!rvvm_attach_msi_target(machine, &imsic_mmio)) {
         rvvm_error("Failed to attach RISC-V IMSIC!");
-        return;
+        return false;
     }
 
-#ifdef USE_FDT
-    struct fdt_node* imsic_fdt = fdt_node_create_reg(smode ? "imsics_s" : "imsics_m", imsic_mmio.addr);
-    struct fdt_node* cpus = fdt_node_find(rvvm_get_fdt_root(machine), "cpus");
-    vector_t(uint32_t) irq_ext = {0};
+    rvvm_fdt_node_t* soc = rvvm_get_fdt_soc(machine);
+    if (soc) {
+        rvvm_fdt_node_t*   fdt     = rvvm_fdt_init_reg(smode ? "imsics_s" : "imsics_m", imsic_mmio.addr);
+        rvvm_fdt_node_t*   cpus    = rvvm_fdt_find(rvvm_get_fdt_root(machine), "cpus");
+        vector_t(uint32_t) irq_ext = {0};
 
-    fdt_node_add_prop_reg(imsic_fdt, "reg", imsic_mmio.addr, imsic_mmio.size);
-    fdt_node_add_prop_str(imsic_fdt, "compatible", "riscv,imsics");
-    fdt_node_add_prop(imsic_fdt, "interrupt-controller", NULL, 0);
-    fdt_node_add_prop_u32(imsic_fdt, "#interrupt-cells", 0);
-    fdt_node_add_prop(imsic_fdt, "msi-controller", NULL, 0);
-    fdt_node_add_prop_u32(imsic_fdt, "#msi-cells", 0);
-    fdt_node_add_prop_u32(imsic_fdt, "riscv,num-ids", RVVM_AIA_IRQ_LIMIT - 1);
+        rvvm_fdt_prop_set_reg(fdt, "reg", imsic_mmio.addr, imsic_mmio.size);
+        rvvm_fdt_prop_set_str(fdt, "compatible", "riscv,imsics");
+        rvvm_fdt_prop_set_flag(fdt, "interrupt-controller");
+        rvvm_fdt_prop_set_u32(fdt, "#interrupt-cells", 0);
+        rvvm_fdt_prop_set_flag(fdt, "msi-controller");
+        rvvm_fdt_prop_set_u32(fdt, "#msi-cells", 0);
+        rvvm_fdt_prop_set_u32(fdt, "riscv,num-ids", RVVM_AIA_IRQ_LIMIT - 1);
 
-    vector_foreach(machine->harts, i) {
-        struct fdt_node* cpu = fdt_node_find_reg(cpus, "cpu", i);
-        struct fdt_node* cpu_irq = fdt_node_find(cpu, "interrupt-controller");
+        vector_foreach (machine->harts, i) {
+            rvvm_fdt_node_t* cpu     = rvvm_fdt_find_reg(cpus, "cpu", i);
+            rvvm_fdt_node_t* cpu_irq = rvvm_fdt_find(cpu, "interrupt-controller");
 
-        if (cpu_irq) {
-            vector_push_back(irq_ext, fdt_node_get_phandle(cpu_irq));
-            vector_push_back(irq_ext, smode ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL);
-        } else {
-            rvvm_warn("Missing CPU IRQ nodes in FDT!");
+            if (cpu_irq) {
+                vector_push_back(irq_ext, rvvm_fdt_phandle(cpu_irq));
+                vector_push_back(irq_ext, smode ? RISCV_INTERRUPT_SEXTERNAL : RISCV_INTERRUPT_MEXTERNAL);
+            } else {
+                rvvm_warn("Missing CPU IRQ nodes in FDT!");
+            }
         }
+
+        rvvm_fdt_prop_set_cells(fdt, "interrupts-extended", vector_buffer(irq_ext), vector_size(irq_ext));
+        rvvm_fdt_attach(soc, fdt);
+        vector_free(irq_ext);
     }
-
-    fdt_node_add_prop_cells(imsic_fdt, "interrupts-extended", vector_buffer(irq_ext), vector_size(irq_ext));
-    fdt_node_add_child(rvvm_get_fdt_soc(machine), imsic_fdt);
-    vector_free(irq_ext);
-#endif
+    return true;
 }
 
-PUBLIC void riscv_imsic_init_auto(rvvm_machine_t* machine)
+RVVM_PUBLIC bool rvvm_riscv_imsic_init(rvvm_machine_t* machine, /**/
+                                       rvvm_addr_t     maddr,   /**/
+                                       rvvm_addr_t     saddr)
 {
-    size_t imsic_size = vector_size(machine->harts) << 12;
-    rvvm_addr_t m_addr = rvvm_mmio_zone_auto(machine, IMSIC_M_ADDR_DEFAULT, imsic_size);
-    rvvm_addr_t s_addr = rvvm_mmio_zone_auto(machine, IMSIC_S_ADDR_DEFAULT, imsic_size);
-    riscv_imsic_init(machine, m_addr, false);
-    riscv_imsic_init(machine, s_addr, true);
+    size_t      imsic_size = vector_size(machine->harts) << 12;
+    rvvm_addr_t m_addr     = rvvm_mmio_zone_auto(machine, maddr, imsic_size);
+    rvvm_addr_t s_addr     = rvvm_mmio_zone_auto(machine, saddr, imsic_size);
+    return riscv_imsic_init(machine, m_addr, false) && riscv_imsic_init(machine, s_addr, true);
 }
+
+POP_OPTIMIZATION_SIZE
