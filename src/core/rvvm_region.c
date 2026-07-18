@@ -52,8 +52,8 @@ static void rvvm_region_legacy_remove(rvvm_mmio_dev_t* mmio)
     if (dev->desc.type && dev->desc.type->cleanup) {
         dev->desc.type->cleanup(dev);
     }
-    safe_free(dev);
-    safe_free(type);
+    free(dev);
+    free(type);
 }
 
 static void rvvm_region_legacy_update(rvvm_mmio_dev_t* mmio)
@@ -79,7 +79,8 @@ RVVM_PUBLIC rvvm_reg_dev_t* rvvm_region_init(rvvm_machine_t* machine, const rvvm
     dev->machine = machine;
     dev->desc    = *desc;
 
-    if (machine && !(desc->attr & RVVM_REG_ATTR_PIO)) {
+    // TODO Port IO handling
+    if (machine) {
         rvvm_mmio_type_t* mmio_type = safe_new_obj(rvvm_mmio_type_t);
 
         rvvm_mmio_dev_t mmio_desc = {
@@ -113,11 +114,12 @@ RVVM_PUBLIC rvvm_reg_dev_t* rvvm_region_init(rvvm_machine_t* machine, const rvvm
         }
     } else if (dev->desc.type && dev->desc.type->cleanup) {
         dev->desc.type->cleanup(dev);
+        free(dev);
     }
     return NULL;
 }
 
-RVVM_PUBLIC void rvvm_region_free(rvvm_reg_dev_t* dev)
+RVVM_PUBLIC void rvvm_region_remove(rvvm_reg_dev_t* dev)
 {
     if (dev) {
         rvvm_remove_mmio(dev->mmio);
