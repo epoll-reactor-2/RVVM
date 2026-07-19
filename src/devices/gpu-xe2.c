@@ -1349,7 +1349,9 @@ static inline bool xe2_display_pending(xe2_dev_t *xe2)
 // Resolve one GGTT page to a readable host pointer, without the verbose logging
 // of xe2_ggtt_translate (this runs per-page, every frame). Returns the number of
 // bytes readable from the returned pointer before the next page in *avail.
-static const uint8_t *xe2_scanout_page(xe2_dev_t *xe2, uint64_t ggtt, size_t *avail)
+//
+// \return Obtained DMA pointer, that must be freed with `rvvm_pci_end_dma()` when no longer needed.
+static uint8_t *xe2_scanout_page_dma(xe2_dev_t *xe2, uint64_t ggtt, size_t *avail)
 {
     uint64_t page = ggtt >> 12;
     uint64_t off  = ggtt & 0xFFF;
@@ -1425,15 +1427,16 @@ static void xe2_scanout(xe2_dev_t *xe2)
     uint64_t surf   = xe2->display.plane_surf & ~0xFFFULL;
     size_t   copied = 0;
     while (copied < needed) {
-        size_t         avail = 0;
-        const uint8_t *src   = xe2_scanout_page(xe2, surf + copied, &avail);
-        size_t         chunk = (avail < needed - copied) ? avail : needed - copied;
-        if (src) {
-            memcpy(dst + copied, src, chunk);
+        size_t   avail = 0;
+        uint8_t *dma   = xe2_scanout_page_dma(xe2, surf + copied, &avail);
+        size_t   chunk = (avail < needed - copied) ? avail : needed - copied;
+        if (dma) {
+            memcpy(dst + copied, dma, chunk);
         } else {
             memset(dst + copied, 0, chunk);
         }
         copied += chunk;
+        rvvm_pci_end_dma(xe2->pci_func, dma);
     }
 
     rvvm_fb_t fb = {
@@ -1547,7 +1550,9 @@ static uint32_t xe2_dma_read32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
         return read_uint32_le(xe2->vram + dma.addr + off);
     } else {
         uint32_t *ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr + off, 4);
-        return ptr ? *ptr : 0;
+        uint32_t  val = ptr ? *ptr : 0;
+        rvvm_pci_end_dma(xe2->pci_func, ptr);
+        return val;
     }
 }
 
@@ -1564,6 +1569,7 @@ static void xe2_dma_write32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint
         if (likely(ptr)) {
             *ptr = msg;
         }
+        rvvm_pci_end_dma(xe2->pci_func, ptr);
     }
 }
 
