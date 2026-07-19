@@ -1305,10 +1305,10 @@ static uint32_t xe2_spi_read32(xe2_dev_t *xe2)
 // offset lies outside both windows. Used so DMC loader writes read back.
 static inline uint8_t *xe2_dmc_shadow(xe2_dev_t *xe2, size_t offset)
 {
-    if (offset >= 0x5F000 && offset + 4 <= 0x60000 && offset < sizeof(xe2->dmc_mmio_5f)) {
+    if (offset >= 0x5F000 && offset + 4 <= 0x60000 && offset < sizeof(xe2->dmc_mmio_5f) + 0x5F000) {
         return &xe2->dmc_mmio_5f[offset - 0x5F000];
     }
-    if (offset >= 0x8F000 && offset + 4 <= 0x90000 && offset < sizeof(xe2->dmc_mmio_8f)) {
+    if (offset >= 0x8F000 && offset + 4 <= 0x90000 && offset < sizeof(xe2->dmc_mmio_8f) + 0x8F000) {
         return &xe2->dmc_mmio_8f[offset - 0x8F000];
     }
     return NULL;
