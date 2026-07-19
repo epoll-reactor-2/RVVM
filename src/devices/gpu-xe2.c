@@ -9,16 +9,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_pci.h>
-#include "atomics.h"
-#include "compiler.h"
+#include <rvvm/rvvm_fb.h>
 #include "mem_ops.h"
-#include "rvvm/rvvm_base.h"
-#include "rvvm/rvvm_fb.h"
-#include "rvvm/rvvm_region.h"
 #include "spinlock.h"
 #include "utils.h"
+#include "bit_ops.h"
 #include "vma_ops.h"
-#include <stdint.h>
 #include <inttypes.h>
 
 // Current status: Basic DRM programs and weston works with following
@@ -60,8 +56,8 @@ glmark2-es2-drm
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
-#define xe2_reg_field_get(mask, val)    (((val) & (mask)) >> __builtin_ctzll(mask))
-#define xe2_reg_field_prep(mask, val)   (((val) << __builtin_ctzll(mask)) & (mask))
+#define xe2_reg_field_get(mask, val)    (((val) & (mask)) >> bit_ctz64(mask))
+#define xe2_reg_field_prep(mask, val)   (((val) << bit_ctz64(mask)) & (mask))
 
 #define XE2_VENDOR_ID_INTEL                                 0x8086
 #define XE2_DEVICE_ID_ARC_B570_GRAPHICS                     0xE20C
@@ -978,7 +974,7 @@ glmark2-es2-drm
 #define DPCD_TRAINING_PATTERN_3                           3
 #define DPCD_TRAINING_PATTERN_4                           7
 #define DPCD_TRAINING_PATTERN_MASK                        0x3
-#define DPCD_TRAINING_PATTERN_MASK_1_4                    0xf
+#define DPCD_TRAINING_PATTERN_MASK_1_4                    0xF
 
 #define DPCD_REG_TRAINING_LANE0_SET                       0x103
 #define DPCD_REG_TRAINING_LANE1_SET                       0x104
@@ -1400,7 +1396,7 @@ static void xe2_scanout(xe2_dev_t *xe2)
 
     // Pixel format from PLANE_CTL[27:24]; the order bit selects RGB vs BGR.
     rvvm_rgb_t format;
-    switch ((ctl >> 24) & 0xf) {
+    switch ((ctl >> 24) & 0xF) {
         case 14: format = RVVM_RGB_RGB565; break;      // RGB_565
         case 2:  format = RVVM_RGB_XRGB2101010; break; // XRGB_2101010
         case 4:                                        // XRGB_8888
@@ -1416,7 +1412,7 @@ static void xe2_scanout(xe2_dev_t *xe2)
     if (!dst || needed > vram_size)
         return;
 
-    uint64_t surf   = xe2->display.plane_surf & ~0xfffULL;
+    uint64_t surf   = xe2->display.plane_surf & ~0xFFFULL;
     size_t   copied = 0;
     while (copied < needed) {
         size_t         avail = 0;
@@ -1513,7 +1509,7 @@ static inline void xe2_ggtt_mmio_write(xe2_dev_t *xe2, uint32_t offset, uint32_t
 static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
 {
     uint64_t idx = ggtt >> 12;
-    uint64_t off = ggtt & 0xfff;
+    uint64_t off = ggtt & 0xFFF;
     uint64_t pte = xe2->ggtt_pte[idx];
 
     // rvvm_info("PTE: ggtt addr:       0x%lx", ggtt);
@@ -1593,26 +1589,18 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
 
     uint64_t value = (uint64_t) actions[2]
                    | (uint64_t) actions[3] << 32;
-    xe2_dma_addr_t dma_addr = xe2_guc_klv_address_key(key)
-        ? xe2_ggtt_translate(xe2, value)
-        : (xe2_dma_addr_t) {0};
-
-    if (xe2_guc_klv_address_key(key) && !dma_addr.addr) {
-        rvvm_warn("GGTT returned NULL: (dma_addr: 0x%"PRIu64", addr: 0x%"PRIu64")", dma_addr.addr, value);
-        return response;
-    }
 
     switch (key) {
         case XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
-            xe2->guc.memirq_status_addr = dma_addr;
+            xe2->guc.memirq_status_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
-            xe2->guc.memirq_source_addr = dma_addr;
+            xe2->guc.memirq_source_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
-            xe2->guc.ctb_h2g_addr = dma_addr;
+            xe2->guc.ctb_h2g_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY:
@@ -1624,15 +1612,15 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
             break;
 
         case XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
-            xe2->guc.ctb_h2g_descriptor_addr = dma_addr;
+            xe2->guc.ctb_h2g_descriptor_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
-            xe2->guc.ctb_g2h_addr = dma_addr;
+            xe2->guc.ctb_g2h_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
-            xe2->guc.ctb_g2h_descriptor_addr = dma_addr;
+            xe2->guc.ctb_g2h_descriptor_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         default:
@@ -1834,12 +1822,12 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
 
     UNUSED(ppgtt);
 
-    if (ring_ggtt == 0 || head == tail) {
+    if (unlikely(ring_ggtt == 0 || head == tail)) {
         return false;
     }
 
     xe2_dma_addr_t ring = xe2_ggtt_translate(xe2, ring_ggtt);
-    if (ring.addr == 0) {
+    if (unlikely(ring.addr == 0)) {
         return false;
     }
 
@@ -1973,7 +1961,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
 // XE2_GUC_ACTION_TLB_INVALIDATION.
 static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
 {
-    if (xe2->pphwsp_addr.addr == 0) {
+    if (unlikely(xe2->pphwsp_addr.addr == 0)) {
         return;
     }
 
@@ -2181,18 +2169,16 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
                 break;
             }
-            case XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES: { // 0x100B
+            case XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES:
                 for (uint32_t i = 0; i < num_dwords; ++i) {
                     rvvm_info("GuC update context policies dword[%u]: 0x%x", i, msg[i]);
                 }
                 break;
-            }
-            case XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST: {
+            case XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST:
                 // Bring up GuC-PC: publish the running SLPC state and frequency
                 // caps into the shared BO so the driver's start handshake clears.
                 xe2_slpc_request(xe2, msg);
                 break;
-            }
             case XE2_GUC_ACTION_AUTHENTICATE_HUC:
                 // The GuC verifies the HuC firmware image; report success so the
                 // driver's HUC_KERNEL_LOAD_INFO poll sees the firmware verified.
@@ -2391,7 +2377,7 @@ static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
     uint32_t size    = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
     // Linux manipulates with AUX transfer size taking header (1 byte)
     // into the account. Finally, GPU returns size equal len(payload) + 2(headers).
-    uint32_t payload_size   = size - 1;
+    uint32_t payload_size = size - 1;
 
     xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, 0xF);
     xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, size);
@@ -2917,14 +2903,12 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
             write_uint32_le(data, xe2->guc.actions_g2h[3]);
             break;
 
-        case XE2_REG_GUC_PMTIMESTAMP_LO: {
+        case XE2_REG_GUC_PMTIMESTAMP_LO:
             write_uint32_le(data, 1779018398);
             break;
-        }
-        case XE2_REG_GUC_PMTIMESTAMP_HI: {
+        case XE2_REG_GUC_PMTIMESTAMP_HI:
             write_uint32_le(data, 0);
             break;
-        }
 
         case XE2_REG_GUC_WOPCM_SIZE: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_WOPCM_SIZE_MASK, xe2->wopcm_size)
@@ -2943,14 +2927,11 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
             // START_DMA (bit 0) reads back 0 once the DMA completes.
             write_uint32_le(data, 0);
             break;
-        case 0x8800: {
-            write_uint32_le(data, 0x1000);
-            break;
-        }
 
         case XE2_REG_STEER_SEMAPHORE:
             write_uint32_le(data, xe2->steer_semaphore);
             break;
+
         // DPB seems to be unused.
         case XE2_REG_DPA_AUX_CH_CTL: {
             xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_RECEIVE_ERROR_MASK, 1);
@@ -3086,6 +3067,7 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
 
         case XE2_REG_HW_ENGINE_RING_CTL(XE2_HW_ENGINE_RENDER_RING_BASE):
             rvvm_info("Read ring ctl: HW engine renderer");
+            write_uint32_le(data, 0);
             break;
 
         // Top-level display interrupt control. Report enable bit (if set by
@@ -3480,7 +3462,7 @@ static void xe2_mmio_write(rvvm_reg_dev_t *dev, const void *data, size_t size, s
             break;
 
         case XE2_REG_GUC_DMA_ADDR_1_LO:
-            xe2->dma_1  = (rvvm_addr_t) read_uint32_le(data);
+            xe2->dma_1 = (rvvm_addr_t) read_uint32_le(data);
             break;
         case XE2_REG_GUC_DMA_ADDR_1_HI: {
             uint32_t cmd = read_uint32_le(data);
