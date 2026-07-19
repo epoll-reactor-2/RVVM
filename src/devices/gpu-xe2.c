@@ -832,6 +832,8 @@ glmark2-es2-drm
 #define XE2_MI_OP_BATCH_BUFFER_END                        0x0a
 #define XE2_MI_OP_STORE_DATA_IMM                          0x20
 #define XE2_MI_OP_STORE_REG_MEM                           0x24
+#define XE2_MI_SRM_USE_GGTT                               xe2_reg_bit(22)
+#define XE2_MI_SRM_ADD_CS_OFFSET                          xe2_reg_bit(19)
 #define XE2_MI_OP_FLUSH_DW                                0x26
 #define XE2_MI_OP_BATCH_BUFFER_START                      0x31
 #define XE2_MI_OP_BATCH_BUFFER_START_PPGTT                xe2_reg_bit( 8)
@@ -1778,6 +1780,110 @@ static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
     xe2_dma_write32(xe2, dst, 0, value);
 }
 
+// intel-gfx-prm-osrc-dg1-vol02a-commandreference-instructions.pdf:MI_STORE_REGISTER_MEM
+static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, uint32_t h, uint32_t it, uint32_t ring_dw, bool *user_int)
+{
+    rvvm_info("MI opcode: 0x%x", XE2_MI_OPCODE(h));
+    switch (XE2_MI_OPCODE(h)) {
+        case XE2_MI_OP_NOOP:
+        case XE2_MI_OP_ARB_CHECK:
+        case XE2_MI_OP_ARB_ON_OFF:
+        case XE2_MI_OP_BATCH_BUFFER_END:
+            return 1;
+        case XE2_MI_OP_STORE_REG_MEM:
+            // Store from register to the memory. Does this mean, that we need to
+            // implement register storage for the hardware engine?
+            if (h & XE2_MI_SRM_USE_GGTT) {
+                uint32_t reg  = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
+                uint32_t mem  = xe2_dma_read32(xe2, ring, ((it + 2) % ring_dw) * 4);
+                uint32_t lo   = xe2_dma_read32(xe2, ring, ((it + 3) % ring_dw) * 4);
+                uint32_t hi   = xe2_dma_read32(xe2, ring, ((it + 3) % ring_dw) * 4);
+                uint64_t addr = (uint64_t) lo | ((uint64_t) hi << 32);
+
+                reg  = xe2_reg_field_get(xe2_reg_genmask  (22, 2), reg);
+                addr = xe2_reg_field_get(xe2_reg_genmask64(63, 2), addr);
+
+                rvvm_info("MI store data imm: reg=0x%x, mem=0x%x, addr=0x%lx", reg, mem, addr);
+            }
+            return 4;
+        case XE2_MI_OP_USER_INTERRUPT:
+            *user_int = true;
+            return 1;
+        case XE2_MI_OP_STORE_DATA_IMM:
+            if (h & XE2_MI_SDI_GGTT) {
+                uint32_t a = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
+                uint32_t v = xe2_dma_read32(xe2, ring, ((it + 3) % ring_dw) * 4);
+                xe2_ring_store(xe2, a, v);
+            }
+            return (h & 0x3FF) + 2;
+        case XE2_MI_OP_FLUSH_DW:
+            if (h & XE2_MI_FLUSH_DW_OP_STOREDW) {
+                uint32_t a = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
+                uint32_t v = xe2_dma_read32(xe2, ring, ((it + 3) % ring_dw) * 4);
+                if (a & XE2_MI_FLUSH_DW_USE_GTT) {
+                    xe2_ring_store(xe2, a & ~0x7U, v);
+                }
+            }
+            return (h & 0x3F) + 2;
+        case XE2_MI_OP_BATCH_BUFFER_START: {
+            // Key command to start receiving batch buffers from the guest.
+            // Guest there only publishes batch address. We only should do something
+            // with that on MI_USER_INTERRUPT.
+            //
+            // Note that this uses PPGTT instead of normal GGTT. This means
+            // page table lookup should be implemented to interpret 39-bit
+            // addressing.
+            //
+            // Typical PPGTT address:
+            // 0x4000300000
+            // 0100000000000000001100010001010111010000
+            // |      |       |       |       |       |
+            // 39     32      24     16       8       0
+            //
+            // Tiled resources VA translation table L3 pointer table says:
+            // For physical memory option, address bits [47:39] has to be programmed to "0" as it is defined the
+            // limit of physical memory allocation.
+            uint32_t lo = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
+            uint32_t hi = xe2_dma_read32(xe2, ring, ((it + 2) % ring_dw) * 4);
+            rvvm_addr_t bo = (uint64_t) lo
+                           | (uint64_t) hi << 32;
+            if (h & XE2_MI_OP_BATCH_BUFFER_START_PPGTT) {
+                rvvm_info("MI batch buffer start (PPGTT): BO - 0x%"PRIu64, bo);
+            } else {
+                rvvm_info("MI batch buffer start (GGTT): BO - 0x%"PRIu64, bo);
+                xe2_dma_addr_t dma = xe2_ggtt_translate(xe2, bo);
+                for (size_t __i = 0; __i < 4; ++__i) {
+                    uint32_t cmd = xe2_dma_read32(xe2, dma, __i * sizeof(uint32_t));
+                    rvvm_info("Read GGTT cmd: 0x%x", cmd);
+                }
+            }
+            return 3;
+        }
+        default:
+            return (h & 0xFF) + 2;
+    }
+}
+
+static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, uint32_t h, uint32_t it, uint32_t ring_dw)
+{
+    // We need to verify GFX commands encoding and set proper length
+    // depending on it. Length is crucial because on incorrect value we
+    // will advance the command buffer with corrupted offset and whole
+    // following command processing will explode.
+    rvvm_info("GFX opcode: 0x%x", XE2_GFXPIPE_OPCODE(h));
+    if ((h >> 24) == XE2_PIPE_CONTROL_SIG) {
+        uint32_t flags = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
+        if ((flags & XE2_PIPE_CONTROL_QW_WRITE)
+            && (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
+            uint32_t a = xe2_dma_read32(xe2, ring, ((it + 2) % ring_dw) * 4);
+            uint32_t v = xe2_dma_read32(xe2, ring, ((it + 4) % ring_dw) * 4);
+            xe2_ring_store(xe2, a, v);
+        }
+    }
+
+    return (h & 0xFF) + 2;
+}
+
 // Walk the LRC ring between HEAD and TAIL and execute the post-sync seqno
 // stores the job appended (MI_STORE_DATA_IMM / MI_FLUSH_DW / PIPE_CONTROL with a
 // GGTT write). We do not run the batch itself; only its completion postamble has
@@ -1837,97 +1943,17 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
         // will go over the buffer in the next iteration.
         uint32_t len = 1;
 
-        rvvm_info("General opcode: 0x%x, instruction type: 0x%x", h, XE2_INSTR_TYPE(h));
+        rvvm_info("Dequeued opcode: 0x%x, instruction type: 0x%x", h, XE2_INSTR_TYPE(h));
 
-        if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_MI) {
-            rvvm_info("MI opcode: 0x%x", XE2_MI_OPCODE(h));
-            switch (XE2_MI_OPCODE(h)) {
-                case XE2_MI_OP_NOOP:
-                case XE2_MI_OP_ARB_CHECK:
-                case XE2_MI_OP_ARB_ON_OFF:
-                case XE2_MI_OP_BATCH_BUFFER_END:
-                    len = 1;
-                    break;
-                case XE2_MI_OP_USER_INTERRUPT:
-                    len = 1;
-                    user_int = true;
-                    break;
-                case XE2_MI_OP_STORE_DATA_IMM:
-                    len = (h & 0x3FF) + 2;
-                    if (h & XE2_MI_SDI_GGTT) {
-                        uint32_t a = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
-                        uint32_t v = xe2_dma_read32(xe2, ring, ((i + 3) % ring_dw) * 4);
-                        xe2_ring_store(xe2, a, v);
-                    }
-                    break;
-                case XE2_MI_OP_FLUSH_DW:
-                    len = (h & 0x3f) + 2;
-                    rvvm_info("MI flush dw len: %u", len);
-                    if (h & XE2_MI_FLUSH_DW_OP_STOREDW) {
-                        uint32_t a = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
-                        uint32_t v = xe2_dma_read32(xe2, ring, ((i + 3) % ring_dw) * 4);
-                        if (a & XE2_MI_FLUSH_DW_USE_GTT) {
-                            xe2_ring_store(xe2, a & ~0x7U, v);
-                        }
-                    }
-                    break;
-                // Key command to start receiving batch buffers from the guest.
-                // Guest there only publishes batch address. We only should do something
-                // with that on MI_USER_INTERRUPT.
-                //
-                // Note that this uses PPGTT instead of normal GGTT. This means
-                // page table lookup should be implemented to interpret 39-bit
-                // addressing.
-                //
-                // Typical PPGTT address:
-                // 0x4000300000
-                // 0100000000000000001100010001010111010000
-                // |      |       |       |       |       |
-                // 39     32      24     16       8       0
-                //
-                // Tiled resources VA translation table L3 pointer table says:
-                // For physical memory option, address bits [47:39] has to be programmed to "0" as it is defined the
-                // limit of physical memory allocation.
-                case XE2_MI_OP_BATCH_BUFFER_START: {
-                    uint32_t lo = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
-                    uint32_t hi = xe2_dma_read32(xe2, ring, ((i + 2) % ring_dw) * 4);
-                    rvvm_addr_t bo = (uint64_t) lo
-                                   | (uint64_t) hi << 32;
-                    if (h & XE2_MI_OP_BATCH_BUFFER_START_PPGTT) {
-                        rvvm_info("MI batch buffer start (PPGTT): BO - 0x%"PRIu64, bo);
-                    } else {
-                        rvvm_info("MI batch buffer start (GGTT): BO - 0x%"PRIu64, bo);
-                        xe2_dma_addr_t dma = xe2_ggtt_translate(xe2, bo);
-                        for (size_t __i = 0; __i < 4; ++__i) {
-                            uint32_t cmd = xe2_dma_read32(xe2, dma, __i * sizeof(uint32_t));
-                            rvvm_info("Read GGTT cmd: 0x%x", cmd);
-                        }
-                    }
-                    len = 3;
-                    break;
-                }
-                default:
-                    len = (h & 0xFF) + 2;
-                    break;
-            }
-        } else if (XE2_INSTR_TYPE(h) == XE2_INSTR_TYPE_GFXPIPE) {
-            // We need to verify GFX commands encoding and set proper length
-            // depending on it. Length is crucial because on incorrect value we
-            // will advance the command buffer with corrupted offset and whole
-            // following command processing will explode.
-            rvvm_info("GFX opcode: 0x%x", XE2_GFXPIPE_OPCODE(h));
-            if ((h >> 24) == XE2_PIPE_CONTROL_SIG) {
-                len = (h & 0xFF) + 2;
-                uint32_t flags = xe2_dma_read32(xe2, ring, ((i + 1) % ring_dw) * 4);
-                if ((flags & XE2_PIPE_CONTROL_QW_WRITE)
-                    && (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
-                    uint32_t a = xe2_dma_read32(xe2, ring, ((i + 2) % ring_dw) * 4);
-                    uint32_t v = xe2_dma_read32(xe2, ring, ((i + 4) % ring_dw) * 4);
-                    xe2_ring_store(xe2, a, v);
-                }
-            }
-        } else {
-            len = (h & 0xFF) + 2;
+        switch (XE2_INSTR_TYPE(h)) {
+            case XE2_INSTR_TYPE_MI:
+                len = xe2_ring_mi_cmd(xe2, ring, h, i, ring_dw, &user_int);
+                break;
+            case XE2_INSTR_TYPE_GFXPIPE:
+                len = xe2_ring_gfxpipe_cmd(xe2, ring, h, i, ring_dw);
+                break;
+            default:
+                break;
         }
 
         i = (i + len) % ring_dw;
@@ -1948,6 +1974,23 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
 // to submit a task when running OpenGL benchmark in DRM mode. Seqno is per-context
 // number. If such procedure fails, driver goes and invalidates GuC with
 // XE2_GUC_ACTION_TLB_INVALIDATION.
+//
+// I see following scheme:
+// - Driver setups buffer as follows:
+//   - dword 0: MI_STORE_REGISTER_MEM
+//   - dword 1: Engine 0 address
+//   - dword 2: Engine 0 ID
+//   - dword 3: 0
+//
+//   - dword 0: MI_STORE_DATA_IMM
+//   - dword 1: Engine timestamp
+//   - dword 2: 0
+//   - dword 3: 1 (Context active marker)
+//
+// We must needs discern by what manner timestamp and seqno do pass one unto
+// the other. The driver doth commit the timestamp by means of a fashioned
+// batch of MI commands and/or LRC DMA, and thereafter doth read it back
+// through the selfsame DMA.
 static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
 {
     if (unlikely(xe2->pphwsp_addr.addr == 0)) {
