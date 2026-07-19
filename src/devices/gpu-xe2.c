@@ -9,16 +9,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_pci.h>
-#include "atomics.h"
-#include "compiler.h"
+#include <rvvm/rvvm_fb.h>
 #include "mem_ops.h"
-#include "rvvm/rvvm_base.h"
-#include "rvvm/rvvm_fb.h"
-#include "rvvm/rvvm_region.h"
 #include "spinlock.h"
 #include "utils.h"
+#include "bit_ops.h"
 #include "vma_ops.h"
-#include <stdint.h>
 #include <inttypes.h>
 
 // Current status: Basic DRM programs and weston works with following
@@ -60,8 +56,8 @@ glmark2-es2-drm
 #define xe2_reg_genmask(h, l)           (((~0U)   << (l)) & (~0U   >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)         (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
 #define xe2_reg_bit(x)                  xe2_reg_genmask((x), (x))
-#define xe2_reg_field_get(mask, val)    (((val) & (mask)) >> __builtin_ctzll(mask))
-#define xe2_reg_field_prep(mask, val)   (((val) << __builtin_ctzll(mask)) & (mask))
+#define xe2_reg_field_get(mask, val)    (((val) & (mask)) >> bit_ctz64(mask))
+#define xe2_reg_field_prep(mask, val)   (((val) << bit_ctz64(mask)) & (mask))
 
 #define XE2_VENDOR_ID_INTEL                                 0x8086
 #define XE2_DEVICE_ID_ARC_B570_GRAPHICS                     0xE20C
@@ -978,7 +974,7 @@ glmark2-es2-drm
 #define DPCD_TRAINING_PATTERN_3                           3
 #define DPCD_TRAINING_PATTERN_4                           7
 #define DPCD_TRAINING_PATTERN_MASK                        0x3
-#define DPCD_TRAINING_PATTERN_MASK_1_4                    0xf
+#define DPCD_TRAINING_PATTERN_MASK_1_4                    0xF
 
 #define DPCD_REG_TRAINING_LANE0_SET                       0x103
 #define DPCD_REG_TRAINING_LANE1_SET                       0x104
@@ -1305,10 +1301,10 @@ static uint32_t xe2_spi_read32(xe2_dev_t *xe2)
 // offset lies outside both windows. Used so DMC loader writes read back.
 static inline uint8_t *xe2_dmc_shadow(xe2_dev_t *xe2, size_t offset)
 {
-    if (offset >= 0x5F000 && offset + 4 <= 0x60000 && offset < sizeof(xe2->dmc_mmio_5f)) {
+    if (offset >= 0x5F000 && offset < sizeof(xe2->dmc_mmio_5f) + 0x5F000) {
         return &xe2->dmc_mmio_5f[offset - 0x5F000];
     }
-    if (offset >= 0x8F000 && offset + 4 <= 0x90000 && offset < sizeof(xe2->dmc_mmio_8f)) {
+    if (offset >= 0x8F000 && offset < sizeof(xe2->dmc_mmio_8f) + 0x8F000) {
         return &xe2->dmc_mmio_8f[offset - 0x8F000];
     }
     return NULL;
@@ -1317,8 +1313,9 @@ static inline uint8_t *xe2_dmc_shadow(xe2_dev_t *xe2, size_t offset)
 static void xe2_remove(rvvm_reg_dev_t *dev)
 {
     xe2_dev_t *xe2 = rvvm_region_data(dev);
-    if (xe2->fbdev)
+    if (xe2->fbdev) {
         rvvm_fbdev_dec_ref(xe2->fbdev);
+    }
     vma_free(xe2->ggtt_pte_valid, XE2_GGTT_PAGES * sizeof(bool));
     vma_free(xe2->ggtt_lo_addrs, XE2_GGTT_PAGES * sizeof(uint32_t));
     vma_free(xe2->ggtt_pte, XE2_GGTT_PAGES * sizeof(uint64_t));
@@ -1342,8 +1339,9 @@ static inline uint32_t xe2_display_pipe_live(xe2_dev_t *xe2, uint32_t pipe)
 static inline bool xe2_display_pending(xe2_dev_t *xe2)
 {
     for (uint32_t pipe = 0; pipe < XE2_PIPE_COUNT; pipe++) {
-        if (xe2_display_pipe_live(xe2, pipe))
+        if (xe2_display_pipe_live(xe2, pipe)) {
             return true;
+        }
     }
     return false;
 }
@@ -1351,22 +1349,27 @@ static inline bool xe2_display_pending(xe2_dev_t *xe2)
 // Resolve one GGTT page to a readable host pointer, without the verbose logging
 // of xe2_ggtt_translate (this runs per-page, every frame). Returns the number of
 // bytes readable from the returned pointer before the next page in *avail.
-static const uint8_t *xe2_scanout_page(xe2_dev_t *xe2, uint64_t ggtt, size_t *avail)
+//
+// \return Obtained DMA pointer, that must be freed with `rvvm_pci_end_dma()` when no longer needed.
+static uint8_t *xe2_scanout_page_dma(xe2_dev_t *xe2, uint64_t ggtt, size_t *avail)
 {
     uint64_t page = ggtt >> 12;
-    uint64_t off  = ggtt & 0xfff;
+    uint64_t off  = ggtt & 0xFFF;
     *avail = 0x1000 - off;
-    if (page >= XE2_GGTT_PAGES)
+    if (page >= XE2_GGTT_PAGES) {
         return NULL;
+    }
 
     uint64_t pte = xe2->ggtt_pte[page];
-    if (!(pte & 1)) // Not present
+    if (!(pte & 1)) { // Not present
         return NULL;
+    }
 
     uint64_t addr = (pte & 0x0000FFFFFFFFF000ULL) + off;
     if (pte & 2) { // Local (VRAM) memory
-        if (addr + *avail > XE2_VRAM_SIZE)
+        if (unlikely(addr + *avail > XE2_VRAM_SIZE)) {
             return NULL;
+        }
         return xe2->vram + addr;
     }
     // System memory, reachable through the guest's DMA window
@@ -1379,28 +1382,32 @@ static const uint8_t *xe2_scanout_page(xe2_dev_t *xe2, uint64_t ggtt, size_t *av
 // then point the scanout at it. No-op when headless or the plane is disabled.
 static void xe2_scanout(xe2_dev_t *xe2)
 {
-    if (!xe2->fbdev)
+    if (!xe2->fbdev) {
         return;
+    }
 
     uint32_t ctl = xe2->display.plane_ctl;
-    if (unlikely(!(ctl & XE2_REG_PLANE_CTL_X_ENABLE_MASK)))
+    if (unlikely(!(ctl & XE2_REG_PLANE_CTL_X_ENABLE_MASK))) {
         return;
+    }
 
     // Only linear surfaces are blitted directly; tiled layouts (bits 12:10 != 0)
     // would need detiling, which fbcon never uses, so skip them.
-    if (unlikely(xe2_reg_field_get(XE2_REG_PLANE_CTL_X_TILED_MASK, ctl)))
+    if (unlikely(xe2_reg_field_get(XE2_REG_PLANE_CTL_X_TILED_MASK, ctl))) {
         return;
+    }
 
     uint32_t width  =  (xe2->display.plane_size & 0x1FFF) + 1;
     uint32_t height = ((xe2->display.plane_size >> 16) & 0x1FFF) + 1;
     uint32_t stride =  (xe2->display.plane_stride & 0x3FF) * 64;
 
-    if (unlikely(!width || !height || !stride))
+    if (unlikely(!width || !height || !stride)) {
         return;
+    }
 
     // Pixel format from PLANE_CTL[27:24]; the order bit selects RGB vs BGR.
     rvvm_rgb_t format;
-    switch ((ctl >> 24) & 0xf) {
+    switch ((ctl >> 24) & 0xF) {
         case 14: format = RVVM_RGB_RGB565; break;      // RGB_565
         case 2:  format = RVVM_RGB_XRGB2101010; break; // XRGB_2101010
         case 4:                                        // XRGB_8888
@@ -1413,21 +1420,23 @@ static void xe2_scanout(xe2_dev_t *xe2)
     size_t   vram_size = 0;
     uint8_t *dst       = rvvm_fbdev_get_vram(xe2->fbdev, &vram_size);
     size_t   needed    = (size_t) stride * height;
-    if (!dst || needed > vram_size)
+    if (!dst || needed > vram_size) {
         return;
+    }
 
-    uint64_t surf   = xe2->display.plane_surf & ~0xfffULL;
+    uint64_t surf   = xe2->display.plane_surf & ~0xFFFULL;
     size_t   copied = 0;
     while (copied < needed) {
-        size_t         avail = 0;
-        const uint8_t *src   = xe2_scanout_page(xe2, surf + copied, &avail);
-        size_t         chunk = (avail < needed - copied) ? avail : needed - copied;
-        if (src) {
-            memcpy(dst + copied, src, chunk);
+        size_t   avail = 0;
+        uint8_t *dma   = xe2_scanout_page_dma(xe2, surf + copied, &avail);
+        size_t   chunk = (avail < needed - copied) ? avail : needed - copied;
+        if (dma) {
+            memcpy(dst + copied, dma, chunk);
         } else {
             memset(dst + copied, 0, chunk);
         }
         copied += chunk;
+        rvvm_pci_end_dma(xe2->pci_func, dma);
     }
 
     rvvm_fb_t fb = {
@@ -1463,33 +1472,25 @@ static void xe2_update(rvvm_reg_dev_t *dev)
             xe2->display.frmcount[pipe]++;
             xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_VBLANK_MASK;
         }
-
-        if (flip_done_en)
+        if (flip_done_en) {
             xe2->display.iir[pipe] |= XE2_REG_DE_PIPE_FLIP_DONE_MASK;
-
-        if (xe2_display_pipe_live(xe2, pipe))
+        }
+        if (xe2_display_pipe_live(xe2, pipe)) {
             raise = true;
+        }
     }
 
-    if (raise)
+    if (raise) {
         rvvm_pci_send_irq(xe2->pci_func, 0);
+    }
 
     spin_unlock(&xe2->lock);
 
     // Push the refreshed scanout to the host window (draws & polls input).
     // Done outside the device lock so the GUI redraw can't stall MMIO.
-    if (xe2->fbdev)
+    if (xe2->fbdev) {
         rvvm_fbdev_update(xe2->fbdev);
-}
-
-static rvvm_reg_type_t xe2_type_vram = {
-    .name = "xe2",
-    .cleanup = xe2_remove_vram,
-};
-
-static inline void xe2_ggtt_write_pte(xe2_dev_t *xe2, uint64_t index, uint64_t pte)
-{
-    xe2->ggtt_pte[index] = pte;
+    }
 }
 
 static inline void xe2_ggtt_mmio_write(xe2_dev_t *xe2, uint32_t offset, uint32_t value)
@@ -1506,14 +1507,14 @@ static inline void xe2_ggtt_mmio_write(xe2_dev_t *xe2, uint32_t offset, uint32_t
     if (xe2->ggtt_pte_valid[idx]) {
         uint64_t pte = ((uint64_t) value << 32) | (uint64_t) xe2->ggtt_lo_addrs[idx];
         // rvvm_info("Write PTE[0x%lx]: 0x%lx", idx, pte);
-        xe2_ggtt_write_pte(xe2, idx, pte);
+        xe2->ggtt_pte[idx] = pte;
     }
 }
 
 static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
 {
     uint64_t idx = ggtt >> 12;
-    uint64_t off = ggtt & 0xfff;
+    uint64_t off = ggtt & 0xFFF;
     uint64_t pte = xe2->ggtt_pte[idx];
 
     // rvvm_info("PTE: ggtt addr:       0x%lx", ggtt);
@@ -1543,12 +1544,15 @@ static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
 static uint32_t xe2_dma_read32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
 {
     if (dma.type == XE2_MEM_LMEM) {
-        if (dma.addr + off + 4 > XE2_VRAM_SIZE)
+        if (unlikely(dma.addr + off + 4 > XE2_VRAM_SIZE)) {
             return 0;
+        }
         return read_uint32_le(xe2->vram + dma.addr + off);
     } else {
         uint32_t *ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr + off, 4);
-        return ptr ? *ptr : 0;
+        uint32_t  val = ptr ? *ptr : 0;
+        rvvm_pci_end_dma(xe2->pci_func, ptr);
+        return val;
     }
 }
 
@@ -1565,21 +1569,7 @@ static void xe2_dma_write32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint
         if (likely(ptr)) {
             *ptr = msg;
         }
-    }
-}
-
-static inline bool xe2_guc_klv_address_key(uint32_t key)
-{
-    switch (key) {
-        case XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
-        case XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
-        case XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
-        case XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
-        case XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
-        case XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
-            return 1;
-        default:
-            return 0;
+        rvvm_pci_end_dma(xe2->pci_func, ptr);
     }
 }
 
@@ -1593,26 +1583,18 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
 
     uint64_t value = (uint64_t) actions[2]
                    | (uint64_t) actions[3] << 32;
-    xe2_dma_addr_t dma_addr = xe2_guc_klv_address_key(key)
-        ? xe2_ggtt_translate(xe2, value)
-        : (xe2_dma_addr_t) {0};
-
-    if (xe2_guc_klv_address_key(key) && !dma_addr.addr) {
-        rvvm_warn("GGTT returned NULL: (dma_addr: 0x%"PRIu64", addr: 0x%"PRIu64")", dma_addr.addr, value);
-        return response;
-    }
 
     switch (key) {
         case XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
-            xe2->guc.memirq_status_addr = dma_addr;
+            xe2->guc.memirq_status_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_MEMIRQ_SOURCE_ADDR_KEY:
-            xe2->guc.memirq_source_addr = dma_addr;
+            xe2->guc.memirq_source_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_H2G_CTB_ADDR_KEY:
-            xe2->guc.ctb_h2g_addr = dma_addr;
+            xe2->guc.ctb_h2g_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_H2G_CTB_SIZE_KEY:
@@ -1624,15 +1606,15 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
             break;
 
         case XE2_GUC_KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR_KEY:
-            xe2->guc.ctb_h2g_descriptor_addr = dma_addr;
+            xe2->guc.ctb_h2g_descriptor_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_G2H_CTB_ADDR_KEY:
-            xe2->guc.ctb_g2h_addr = dma_addr;
+            xe2->guc.ctb_g2h_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         case XE2_GUC_KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR_KEY:
-            xe2->guc.ctb_g2h_descriptor_addr = dma_addr;
+            xe2->guc.ctb_g2h_descriptor_addr = xe2_ggtt_translate(xe2, value);
             break;
 
         default:
@@ -1654,7 +1636,7 @@ static uint32_t xe2_guc_emit_hwconfig(xe2_dev_t *xe2, uint64_t ggtt_addr)
 
     if (ggtt_addr != 0) {
         xe2_dma_addr_t dst = xe2_ggtt_translate(xe2, ggtt_addr);
-        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        for (size_t i = 0; i < STATIC_ARRAY_SIZE(table); i++) {
             xe2_dma_write32(xe2, dst, i * 4, table[i]);
         }
     }
@@ -1705,8 +1687,6 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
                  | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_DATA_MASK, arg);
 
     g2h[0] = cmd;
-
-    rvvm_info(" ");
 }
 
 // Read/write one dword in a CTB ring; head/tail are dword indices that wrap
@@ -1834,12 +1814,12 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
 
     UNUSED(ppgtt);
 
-    if (ring_ggtt == 0 || head == tail) {
+    if (unlikely(ring_ggtt == 0 || head == tail)) {
         return false;
     }
 
     xe2_dma_addr_t ring = xe2_ggtt_translate(xe2, ring_ggtt);
-    if (ring.addr == 0) {
+    if (unlikely(ring.addr == 0)) {
         return false;
     }
 
@@ -1950,9 +1930,6 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
             len = (h & 0xFF) + 2;
         }
 
-        if (len == 0) {
-            len = 1;
-        }
         i = (i + len) % ring_dw;
     }
 
@@ -1973,7 +1950,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2)
 // XE2_GUC_ACTION_TLB_INVALIDATION.
 static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
 {
-    if (xe2->pphwsp_addr.addr == 0) {
+    if (unlikely(xe2->pphwsp_addr.addr == 0)) {
         return;
     }
 
@@ -2181,18 +2158,16 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
                 break;
             }
-            case XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES: { // 0x100B
+            case XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES:
                 for (uint32_t i = 0; i < num_dwords; ++i) {
                     rvvm_info("GuC update context policies dword[%u]: 0x%x", i, msg[i]);
                 }
                 break;
-            }
-            case XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST: {
+            case XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST:
                 // Bring up GuC-PC: publish the running SLPC state and frequency
                 // caps into the shared BO so the driver's start handshake clears.
                 xe2_slpc_request(xe2, msg);
                 break;
-            }
             case XE2_GUC_ACTION_AUTHENTICATE_HUC:
                 // The GuC verifies the HuC firmware image; report success so the
                 // driver's HUC_KERNEL_LOAD_INFO poll sees the firmware verified.
@@ -2391,7 +2366,7 @@ static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
     uint32_t size    = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
     // Linux manipulates with AUX transfer size taking header (1 byte)
     // into the account. Finally, GPU returns size equal len(payload) + 2(headers).
-    uint32_t payload_size   = size - 1;
+    uint32_t payload_size = size - 1;
 
     xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, 0xF);
     xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, size);
@@ -2518,8 +2493,9 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
     xe2_dev_t *xe2 = rvvm_region_data(dev);
     spin_lock(&xe2->lock);
 
-    if (!xe2_skip_mmio_range(offset))
+    if (!xe2_skip_mmio_range(offset)) {
         rvvm_info("PCI read: offset=%zx, data=%x", offset, read_uint32_le(data));
+    }
 
     switch (offset) {
         case XE2_REG_GT_GMD_ID: {
@@ -2751,10 +2727,11 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
         // the powerdown-update bits read back cleared (treated as consumed).
         case XE2_REG_XELPDP_PORT_BUF_CTL2: {
             uint32_t cmd = xe2->port_buf_ctl2 & ~XE2_REG_XELPDP_PORT_BUF_CTL2_POWERDOWN_UPDATE_MASK;
-            if (xe2->port_buf_ctl2 & XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PIPE_RESET_MASK)
+            if (xe2->port_buf_ctl2 & XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PIPE_RESET_MASK) {
                 cmd |= XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PHY_STATUS_MASK;
-            else
+            } else {
                 cmd &= ~XE2_REG_XELPDP_PORT_BUF_CTL2_LANE_PHY_STATUS_MASK;
+            }
             write_uint32_le(data, cmd);
             break;
         }
@@ -2775,8 +2752,9 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
             break;
         case XE2_REG_TRANSCONF_A: {
             uint32_t cmd = xe2->transconf;
-            if (cmd & XE2_REG_TRANSCONF_ENABLE_MASK)
+            if (cmd & XE2_REG_TRANSCONF_ENABLE_MASK) {
                 cmd |= XE2_REG_TRANSCONF_STATE_MASK;
+            }
             write_uint32_le(data, cmd);
             break;
         }
@@ -2917,14 +2895,12 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
             write_uint32_le(data, xe2->guc.actions_g2h[3]);
             break;
 
-        case XE2_REG_GUC_PMTIMESTAMP_LO: {
+        case XE2_REG_GUC_PMTIMESTAMP_LO:
             write_uint32_le(data, 1779018398);
             break;
-        }
-        case XE2_REG_GUC_PMTIMESTAMP_HI: {
+        case XE2_REG_GUC_PMTIMESTAMP_HI:
             write_uint32_le(data, 0);
             break;
-        }
 
         case XE2_REG_GUC_WOPCM_SIZE: {
             uint32_t cmd = xe2_reg_field_prep(XE2_REG_GUC_WOPCM_SIZE_MASK, xe2->wopcm_size)
@@ -2943,14 +2919,11 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
             // START_DMA (bit 0) reads back 0 once the DMA completes.
             write_uint32_le(data, 0);
             break;
-        case 0x8800: {
-            write_uint32_le(data, 0x1000);
-            break;
-        }
 
         case XE2_REG_STEER_SEMAPHORE:
             write_uint32_le(data, xe2->steer_semaphore);
             break;
+
         // DPB seems to be unused.
         case XE2_REG_DPA_AUX_CH_CTL: {
             xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_RECEIVE_ERROR_MASK, 1);
@@ -3086,6 +3059,7 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
 
         case XE2_REG_HW_ENGINE_RING_CTL(XE2_HW_ENGINE_RENDER_RING_BASE):
             rvvm_info("Read ring ctl: HW engine renderer");
+            write_uint32_le(data, 0);
             break;
 
         // Top-level display interrupt control. Report enable bit (if set by
@@ -3093,8 +3067,9 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
         case XE2_REG_GEN11_DISPLAY_INT_CTL: {
             uint32_t cmd = xe2->display.int_ctl & XE2_REG_GEN11_DISPLAY_INT_CTL_ENABLE_MASK;
             for (uint32_t pipe = 0; pipe < XE2_PIPE_COUNT; pipe++) {
-                if (xe2_display_pipe_live(xe2, pipe))
+                if (xe2_display_pipe_live(xe2, pipe)) {
                     cmd |= XE2_REG_GEN11_DISPLAY_INT_CTL_PIPE_MASK(pipe);
+                }
             }
             write_uint32_le(data, cmd);
             break;
@@ -3143,12 +3118,15 @@ static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t o
             break;
         case XE2_REG_GFX_MSTR_IRQ: {
             uint32_t cmd = 0;
-            if (xe2->guc.irq_pending || xe2_display_pending(xe2))
+            if (xe2->guc.irq_pending || xe2_display_pending(xe2)) {
                 cmd |= XE2_IRQ_MASTER_BIT;
-            if (xe2->guc.irq_pending)
+            }
+            if (xe2->guc.irq_pending) {
                 cmd |= XE2_IRQ_GT_DW0_BIT;
-            if (xe2_display_pending(xe2))
+            }
+            if (xe2_display_pending(xe2)) {
                 cmd |= XE2_IRQ_DISPLAY_BIT;
+            }
             write_uint32_le(data, cmd);
             break;
         }
@@ -3230,8 +3208,9 @@ static void xe2_mmio_write(rvvm_reg_dev_t *dev, const void *data, size_t size, s
     xe2_dev_t *xe2 = rvvm_region_data(dev);
     spin_lock(&xe2->lock);
 
-    if (!xe2_skip_mmio_range(offset))
+    if (!xe2_skip_mmio_range(offset)) {
         rvvm_info("PCI write: offset=%zx, data=%x, size = %zu", offset, read_uint32_le(data), size);
+    }
 
     if (xe2_ggtt_mmio_range(offset)) {
         xe2_ggtt_mmio_write(xe2, offset, read_uint32_le(data));
@@ -3356,15 +3335,16 @@ static void xe2_mmio_write(rvvm_reg_dev_t *dev, const void *data, size_t size, s
             // Mirror each set PLL/refclk request bit into its ack bit (and clear
             // the ack when the request drops) so the clock-enable polls succeed.
             for (size_t lane = 0; lane < XE2_CX0_LANE_TOTAL; lane++) {
-                if (cmd & XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_REQUEST_MASK(lane))
+                if (cmd & XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_REQUEST_MASK(lane)) {
                     cmd |= XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_ACK_MASK(lane);
-                else
+                } else {
                     cmd &= ~XE2_REG_XELPDP_PORT_CLOCK_CTL_PLL_ACK_MASK(lane);
-
-                if (cmd & XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_REQUEST_MASK(lane))
+                }
+                if (cmd & XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_REQUEST_MASK(lane)) {
                     cmd |= XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_ACK_MASK(lane);
-                else
+                } else {
                     cmd &= ~XE2_REG_XELPDP_PORT_CLOCK_CTL_REFCLK_ACK_MASK(lane);
+                }
             }
             xe2->port_clock_ctl = cmd;
             break;
@@ -3393,10 +3373,11 @@ static void xe2_mmio_write(rvvm_reg_dev_t *dev, const void *data, size_t size, s
             break;
         case XE2_REG_PP_CONTROL:
             xe2->pp.control = read_uint32_le(data);
-            if (xe2->pp.control & XE2_REG_PP_CONTROL_POWER_ON_MASK)
+            if (xe2->pp.control & XE2_REG_PP_CONTROL_POWER_ON_MASK) {
                 xe2->pp.status = XE2_REG_PP_ON_MASK | XE2_REG_PP_READY_MASK;
-            else
+            } else {
                 xe2->pp.status &= ~(XE2_REG_PP_ON_MASK | XE2_REG_PP_READY_MASK);
+            }
             break;
         case XE2_REG_PP_ON_DELAYS:
             xe2->pp.on_delays = read_uint32_le(data);
@@ -3480,7 +3461,7 @@ static void xe2_mmio_write(rvvm_reg_dev_t *dev, const void *data, size_t size, s
             break;
 
         case XE2_REG_GUC_DMA_ADDR_1_LO:
-            xe2->dma_1  = (rvvm_addr_t) read_uint32_le(data);
+            xe2->dma_1 = (rvvm_addr_t) read_uint32_le(data);
             break;
         case XE2_REG_GUC_DMA_ADDR_1_HI: {
             uint32_t cmd = read_uint32_le(data);
@@ -3524,15 +3505,18 @@ static void xe2_mmio_write(rvvm_reg_dev_t *dev, const void *data, size_t size, s
     if (offset >= XE2_DMC_FW_MAIN_OFFSET && offset + size <= XE2_DMC_FW_MAIN_OFFSET + sizeof(xe2->firmware.main)) {
         size_t fw_off = offset - XE2_DMC_FW_MAIN_OFFSET;
         memcpy(xe2->firmware.main + fw_off, data, size);
-        if (fw_off + size > xe2->firmware.main_loaded)
+        if (fw_off + size > xe2->firmware.main_loaded) {
             xe2->firmware.main_loaded = fw_off + size;
+        }
     }
 
     // Shadow pipe and plane registers for modeset verify readback.
-    if (offset >= 0x60000 && offset + size <= 0x62000)
+    if (offset >= 0x60000 && offset + size <= 0x62000) {
         xe2->display.pipe_regs_shadow[(offset - 0x60000) / 4] = read_uint32_le(data);
-    if (offset >= 0x70000 && offset + size <= 0x78000)
+    }
+    if (offset >= 0x70000 && offset + size <= 0x78000) {
         xe2->display.plane_regs_shadow[(offset - 0x70000) / 4] = read_uint32_le(data);
+    }
 
     // Latch DMC loader register writes so they read back during verification.
     uint8_t *dmc_shadow = xe2_dmc_shadow(xe2, offset);
@@ -3553,14 +3537,20 @@ static rvvm_reg_type_t xe2_type = {
     .max_size = 4,
 };
 
+static rvvm_reg_type_t xe2_type_vram = {
+    .name = "xe2",
+    .cleanup = xe2_remove_vram,
+};
+
 RVVM_PUBLIC rvvm_pci_func_t* rvvm_gpu_xe2_init(rvvm_machine_t *machine, rvvm_fbdev_t *fbdev, rvvm_pci_addr_t addr)
 {
     xe2_dev_t *xe2 = safe_new_obj(xe2_dev_t);
     xe2->aux[0].edid_written = 0;
     xe2->steer_semaphore = 1; // Begin with unlocked state.
     xe2->fbdev = fbdev;
-    if (fbdev)
+    if (fbdev) {
         rvvm_fbdev_inc_ref(fbdev);
+    }
     xe2->vram = vma_alloc(NULL, XE2_VRAM_SIZE, VMA_RDWR);
     xe2->ggtt_pte = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint64_t), VMA_RDWR);
     xe2->ggtt_lo_addrs = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint32_t), VMA_RDWR);
