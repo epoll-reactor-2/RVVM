@@ -1804,6 +1804,9 @@ static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe
         case XE2_MI_OP_ARB_ON_OFF:
         case XE2_MI_OP_BATCH_BUFFER_END:
             return 1;
+        case XE2_MI_OP_USER_INTERRUPT:
+            *user_int = true;
+            return 1;
         case XE2_MI_OP_STORE_REG_MEM:
             // Store from register to the memory. Does this mean, that we need to
             // implement register storage for the hardware engine?
@@ -1820,9 +1823,6 @@ static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe
                 xe2_ring_store(xe2, addr, ctx->seqno);
             }
             return 4;
-        case XE2_MI_OP_USER_INTERRUPT:
-            *user_int = true;
-            return 1;
         case XE2_MI_OP_STORE_DATA_IMM:
             if (h & XE2_MI_SDI_GGTT) {
                 uint32_t a = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
@@ -2018,18 +2018,13 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
         return;
     }
 
-    // Important notice: After adding this right after ring replay, kernel behaves
-    // differently. I need to understand how exactly timestamp & seqno are managed
-    // and what initial values are.
-    //
-    // @{
-    // rvvm_info("Write timestamp: %u", ctx->seqno);
-    // xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_CTX_RING_TIMESTAMP, ctx->seqno);
-    // xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_CTX_RING_TIMESTAMP_UDW, 9);
-    // xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_LRC_SEQNO_PPHWSP_OFFSET, ctx->seqno);
-    // xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_CTX_RING_TIMESTAMP, ctx->seqno);
-    // --ctx->seqno;
-    // @}
+    // BUG: Timestamp and seqno are not the same thing! We need to figure out
+    //      what is the difference, but definitely timestamp has nothing common
+    //      with the time in seconds/microseconds.
+    xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_LRC_SEQNO_PPHWSP_OFFSET, ctx->seqno);
+    xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_CTX_RING_TIMESTAMP, ctx->seqno);
+    xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_CTX_RING_TIMESTAMP_UDW, 0);
+    ++ctx->seqno;
 
     uint32_t src_ggtt = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_INT_SRC_REPORT_PTR);
     uint32_t sts_ggtt = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_INT_STATUS_REPORT_PTR);
@@ -2054,14 +2049,19 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
 // registered context baselines last_tail to its current ring tail so any ring
 // content present at registration (priming, wa_bb setup) is not replayed as a
 // job; only tail advances past this baseline are treated as submissions.
+//
+// We start with non-zero seqno. Probably kernel decrements it or has hard
+// condition asserting that seqno=0 is no job was started at all. Assign non-zero
+// value, though I have no idea about semantics of such value. We set 0xFFFFFF.
 static xe2_submit_ctx_t *xe2_track_context(xe2_dev_t *xe2, xe2_dma_addr_t pphwsp)
 {
     int free_slot = -1;
     for (size_t i = 0; i < XE2_MAX_CONTEXTS; i++) {
         if (xe2->ctx[i].valid && xe2->ctx[i].pphwsp.addr == pphwsp.addr) {
             // Re-registration: re-baseline so stale ring content is ignored.
-            xe2->ctx[i].pphwsp = pphwsp;
-            xe2->ctx[i].last_tail = xe2_lrc_ctx_reg(xe2, &xe2->ctx[i], XE2_CTX_RING_TAIL);
+            xe2->ctx[i].pphwsp        = pphwsp;
+            xe2->ctx[i].last_tail     = xe2_lrc_ctx_reg(xe2, &xe2->ctx[i], XE2_CTX_RING_TAIL);
+            xe2->ctx[free_slot].seqno = 0xFFFFFF;
             return &xe2->ctx[i];
         }
         if (free_slot < 0 && !xe2->ctx[i].valid) {
@@ -2072,6 +2072,7 @@ static xe2_submit_ctx_t *xe2_track_context(xe2_dev_t *xe2, xe2_dma_addr_t pphwsp
         xe2->ctx[free_slot].pphwsp    = pphwsp;
         xe2->ctx[free_slot].last_tail = xe2_lrc_ctx_reg(xe2, &xe2->ctx[free_slot], XE2_CTX_RING_TAIL);
         xe2->ctx[free_slot].valid     = true;
+        xe2->ctx[free_slot].seqno     = 0xFFFFFF;
     } else {
         rvvm_warn("All hardware engine slots are busy");
         free_slot = 0;
