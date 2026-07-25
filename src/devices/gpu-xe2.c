@@ -21,24 +21,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // boot arguments:
 // - fbcon=map:0 xe.enable_dc=0 xe.enable_dsb=0 xe.disable_power_well=0
 //
-// When running DRM-based OpenGL benchmark (corrupted seqno):
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
-// xe 0000:00:01.0: [drm] Check your /sys/class/drm/card0/device/devcoredump/data
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=3, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=3, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=3, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=4, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=7, not started
-// xe 0000:00:01.0: [drm] Tile0: GT0: Check job timeout: seqno=4294967169, lrc_seqno=4294967169, guc_id=2, not started
+// glmark2-es2-drm runs stumbling, trying to process non-existent commands.
+// No timeouts.
 
 /*
 XDG setup:
@@ -813,8 +797,9 @@ glmark2-es2-drm
 #define XE2_LRC_CTX_JOB_TIMESTAMP_OFFSET                  528
 #define XE2_LRC_PARALLEL_OFFSET                           2048
 
-// Up to eight engine contexts (rcs0/bcs0/ccs0/...) may be registered at once.
-#define XE2_MAX_CONTEXTS                                  8
+// Theoretically this number of contexts (rcs0/bcs0/ccs0/...) may be registered at once.
+// This is extremely pessimistic scenario, just compatible with original Xe2 driver.
+#define XE2_MAX_CONTEXTS                                  65535
 
 // Ring command stream decode. Type lives in bits 31:29 (MI = 0, GFXPIPE = 3);
 // the MI opcode is bits 28:23. The completion postamble a job appends to its
@@ -1544,7 +1529,7 @@ static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
     };
 }
 
-static uint32_t xe2_dma_read32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
+static uint32_t xe2_dma_read_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
 {
     if (dma.type == XE2_MEM_LMEM) {
         if (unlikely(dma.addr + off + 4 > XE2_VRAM_SIZE)) {
@@ -1559,7 +1544,7 @@ static uint32_t xe2_dma_read32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
     }
 }
 
-static void xe2_dma_write32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint32_t msg)
+static void xe2_dma_write_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint32_t msg)
 {
     if (dma.type == XE2_MEM_LMEM) {
         if (unlikely(dma.addr + off + 4 > XE2_VRAM_SIZE)) {
@@ -1640,7 +1625,7 @@ static uint32_t xe2_guc_emit_hwconfig(xe2_dev_t *xe2, uint64_t ggtt_addr)
     if (ggtt_addr != 0) {
         xe2_dma_addr_t dst = xe2_ggtt_translate(xe2, ggtt_addr);
         for (size_t i = 0; i < STATIC_ARRAY_SIZE(table); i++) {
-            xe2_dma_write32(xe2, dst, i * 4, table[i]);
+            xe2_dma_write_32(xe2, dst, i * 4, table[i]);
         }
     }
 
@@ -1696,12 +1681,12 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
 // within the buffer.
 static inline uint32_t xe2_ctb_get(xe2_dev_t *xe2, xe2_dma_addr_t buf, uint32_t idx, uint32_t dwords)
 {
-    return xe2_dma_read32(xe2, buf, (idx % dwords) * 4);
+    return xe2_dma_read_32(xe2, buf, (idx % dwords) * 4);
 }
 
 static inline void xe2_ctb_put(xe2_dev_t *xe2, xe2_dma_addr_t buf, uint32_t idx, uint32_t dwords, uint32_t val)
 {
-    xe2_dma_write32(xe2, buf, (idx % dwords) * 4, val);
+    xe2_dma_write_32(xe2, buf, (idx % dwords) * 4, val);
 }
 
 // Frame an HXG message into the G2H ring as [CTB header][n payload dwords],
@@ -1714,7 +1699,7 @@ static void xe2_guc_g2h_push(xe2_dev_t *xe2, uint32_t fence, const uint32_t *hxg
         return;
     }
 
-    uint32_t tail = xe2_dma_read32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 4);
+    uint32_t tail = xe2_dma_read_32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 4);
 
     uint32_t header = xe2_reg_field_prep(XE2_GUC_CTB_MSG_0_FENCE, fence)
                     | xe2_reg_field_prep(XE2_GUC_CTB_MSG_0_FORMAT, XE2_GUC_CTB_FORMAT_HXG)
@@ -1726,7 +1711,7 @@ static void xe2_guc_g2h_push(xe2_dev_t *xe2, uint32_t fence, const uint32_t *hxg
     }
 
     tail = (tail + XE2_GUC_CTB_HDR_LEN + n) % dwords;
-    xe2_dma_write32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 4, tail);
+    xe2_dma_write_32(xe2, xe2->guc.ctb_g2h_descriptor_addr, 4, tail);
 
     // Deliver the GuC-to-host interrupt. The driver wires MSI-X vector 0 to the
     // register-based top-level handler (not the memirq path used for engines),
@@ -1763,9 +1748,15 @@ static void xe2_guc_g2h_event(xe2_dev_t *xe2, uint32_t action,
 }
 
 // Read a dword from the registered context's LRC register state.
-static uint32_t xe2_lrc_ctx_reg(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, uint32_t idx)
+static inline uint32_t xe2_lrc_reg_read(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, uint32_t idx)
 {
-    return xe2_dma_read32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + idx * 4);
+    return xe2_dma_read_32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + idx * 4);
+}
+
+// Write a dword to the registered context's LRC register state.
+static inline void xe2_lrc_reg_write(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, uint32_t idx, uint32_t msg)
+{
+    xe2_dma_write_32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + idx * 4, msg);
 }
 
 // Perform a ring post-sync store: write a value to a GGTT address.
@@ -1778,7 +1769,7 @@ static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
     if (unlikely(dst.addr == 0)) {
         return;
     }
-    xe2_dma_write32(xe2, dst, 0, value);
+    xe2_dma_write_32(xe2, dst, 0, value);
 }
 
 // intel-gfx-prm-osrc-dg1-vol02a-commandreference-instructions.pdf:MI_STORE_REGISTER_MEM
@@ -1814,9 +1805,9 @@ static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe
             // Timestamp is stored there probably via PPGTT. Then driver
             // stucks reading this shit.
             if (h & XE2_MI_SRM_USE_GGTT) {
-                uint32_t reg  = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
-                uint32_t lo   = xe2_dma_read32(xe2, ring, ((it + 2) % ring_dw) * 4);
-                uint32_t hi   = xe2_dma_read32(xe2, ring, ((it + 3) % ring_dw) * 4);
+                uint32_t reg  = xe2_dma_read_32(xe2, ring, ((it + 1) % ring_dw) * 4);
+                uint32_t lo   = xe2_dma_read_32(xe2, ring, ((it + 2) % ring_dw) * 4);
+                uint32_t hi   = xe2_dma_read_32(xe2, ring, ((it + 3) % ring_dw) * 4);
                 uint64_t addr = (uint64_t) lo | ((uint64_t) hi << 32);
 
                 (void) reg;
@@ -1825,15 +1816,15 @@ static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe
             return 4;
         case XE2_MI_OP_STORE_DATA_IMM:
             if (h & XE2_MI_SDI_GGTT) {
-                uint32_t a = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
-                uint32_t v = xe2_dma_read32(xe2, ring, ((it + 3) % ring_dw) * 4);
+                uint32_t a = xe2_dma_read_32(xe2, ring, ((it + 1) % ring_dw) * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, ((it + 3) % ring_dw) * 4);
                 xe2_ring_store(xe2, a, v);
             }
             return (h & 0x3FF) + 2;
         case XE2_MI_OP_FLUSH_DW:
             if (h & XE2_MI_FLUSH_DW_OP_STOREDW) {
-                uint32_t a = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
-                uint32_t v = xe2_dma_read32(xe2, ring, ((it + 3) % ring_dw) * 4);
+                uint32_t a = xe2_dma_read_32(xe2, ring, ((it + 1) % ring_dw) * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, ((it + 3) % ring_dw) * 4);
                 if (a & XE2_MI_FLUSH_DW_USE_GTT) {
                     xe2_ring_store(xe2, a & ~0x7U, v);
                 }
@@ -1857,17 +1848,17 @@ static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe
             // Tiled resources VA translation table L3 pointer table says:
             // For physical memory option, address bits [47:39] has to be programmed to "0" as it is defined the
             // limit of physical memory allocation.
-            uint32_t lo = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
-            uint32_t hi = xe2_dma_read32(xe2, ring, ((it + 2) % ring_dw) * 4);
+            uint32_t lo = xe2_dma_read_32(xe2, ring, ((it + 1) % ring_dw) * 4);
+            uint32_t hi = xe2_dma_read_32(xe2, ring, ((it + 2) % ring_dw) * 4);
             rvvm_addr_t bo = (uint64_t) lo
                            | (uint64_t) hi << 32;
             if (h & XE2_MI_OP_BATCH_BUFFER_START_PPGTT) {
-                rvvm_info("MI batch buffer start (PPGTT): BO - 0x%"PRIu64, bo);
+                rvvm_info("MI batch buffer start (PPGTT): BO - 0x%"PRIx64, bo);
             } else {
-                rvvm_info("MI batch buffer start (GGTT): BO - 0x%"PRIu64, bo);
+                rvvm_info("MI batch buffer start (GGTT): BO - 0x%"PRIx64, bo);
                 xe2_dma_addr_t dma = xe2_ggtt_translate(xe2, bo);
                 for (size_t __i = 0; __i < 4; ++__i) {
-                    uint32_t cmd = xe2_dma_read32(xe2, dma, __i * sizeof(uint32_t));
+                    uint32_t cmd = xe2_dma_read_32(xe2, dma, __i * sizeof(uint32_t));
                     rvvm_info("Read GGTT cmd: 0x%x", cmd);
                 }
             }
@@ -1886,11 +1877,11 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
     // following command processing will explode.
     rvvm_info("GFX opcode: 0x%x", XE2_GFXPIPE_OPCODE(h));
     if ((h >> 24) == XE2_PIPE_CONTROL_SIG) {
-        uint32_t flags = xe2_dma_read32(xe2, ring, ((it + 1) % ring_dw) * 4);
+        uint32_t flags = xe2_dma_read_32(xe2, ring, ((it + 1) % ring_dw) * 4);
         if ((flags & XE2_PIPE_CONTROL_QW_WRITE)
             && (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
-            uint32_t a = xe2_dma_read32(xe2, ring, ((it + 2) % ring_dw) * 4);
-            uint32_t v = xe2_dma_read32(xe2, ring, ((it + 4) % ring_dw) * 4);
+            uint32_t a = xe2_dma_read_32(xe2, ring, ((it + 2) % ring_dw) * 4);
+            uint32_t v = xe2_dma_read_32(xe2, ring, ((it + 4) % ring_dw) * 4);
             xe2_ring_store(xe2, a, v);
         }
     }
@@ -1925,12 +1916,13 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
 static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
 {
     xe2_submit_ctx_t *ctx = &xe2->ctx[context_idx];
-    uint32_t ring_ggtt    = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_RING_START);
-    uint32_t head         = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_RING_HEAD);
-    uint32_t tail         = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_RING_TAIL);
-    uint32_t ctl          = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_RING_CTL);
-    uint32_t ppgtt_lo     = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_RING_PDP0_LDW);
-    uint32_t ppgtt_hi     = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_RING_PDP0_UDW);
+
+    uint32_t ring_ggtt    = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_START);
+    uint32_t head         = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_HEAD);
+    uint32_t tail         = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_TAIL);
+    uint32_t ctl          = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_CTL);
+    uint32_t ppgtt_lo     = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_PDP0_LDW);
+    uint32_t ppgtt_hi     = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_PDP0_UDW);
     rvvm_addr_t ppgtt     = ((rvvm_addr_t) ppgtt_hi << 32) | (rvvm_addr_t) ppgtt_lo;
 
     UNUSED(ppgtt);
@@ -1953,7 +1945,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
     uint32_t end = (tail / 4) % ring_dw;
 
     for (uint32_t guard = 0; i != end && guard < ring_dw; guard++) {
-        uint32_t h   = xe2_dma_read32(xe2, ring, i * 4);
+        uint32_t h   = xe2_dma_read_32(xe2, ring, i * 4);
         // How many bytes was consumed by incoming command. That far we
         // will go over the buffer in the next iteration.
         uint32_t len = 1;
@@ -1975,8 +1967,8 @@ static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
     }
 
     // The ring is now drained; advance HEAD so the next submission is isolated.
-    xe2_dma_write32(xe2, ctx->pphwsp,
-                    XE2_LRC_REGS_OFFSET + XE2_CTX_RING_HEAD * 4, tail);
+    xe2_lrc_reg_write(xe2, ctx, XE2_CTX_RING_HEAD, tail);
+
     return user_int;
 }
 
@@ -1985,28 +1977,11 @@ static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
 // driver baked into the LRC register state, so it wakes, reads the seqno and
 // signals the job fence.
 //
-// Problem with seqno/timestamp. Driver doesn't notice seqno change and fails
-// to submit a task when running OpenGL benchmark in DRM mode. Seqno is per-context
-// number. If such procedure fails, driver goes and invalidates GuC with
-// XE2_GUC_ACTION_TLB_INVALIDATION.
-//
-// I see following scheme:
-// - Driver setups buffer as follows:
-//   - dword 0: MI_STORE_REGISTER_MEM
-//   - dword 1: Engine 0 address
-//   - dword 2: Engine 0 ID
-//   - dword 3: 0
-//
-//   - dword 0: MI_STORE_DATA_IMM
-//   - dword 1: Engine timestamp
-//   - dword 2: 0
-//   - dword 3: 1 (Context active marker)
-//
 // We must needs discern by what manner timestamp and seqno do pass one unto
 // the other. The driver doth commit the timestamp by means of a fashioned
 // batch of MI commands and/or LRC DMA, and thereafter doth read it back
 // through the selfsame DMA.
-static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
+static void xe2_signal_job_completion(xe2_dev_t *xe2, size_t context_idx)
 {
     xe2_submit_ctx_t *ctx = &xe2->ctx[context_idx];
 
@@ -2018,30 +1993,25 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
         return;
     }
 
-    // BUG: Timestamp and seqno are not the same thing! We need to figure out
-    //      what is the difference, but definitely timestamp has nothing common
-    //      with the time in seconds/microseconds.
-    xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_LRC_SEQNO_PPHWSP_OFFSET, ctx->seqno);
-    xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_CTX_RING_TIMESTAMP, ctx->seqno);
-    xe2_dma_write32(xe2, ctx->pphwsp, XE2_LRC_REGS_OFFSET + XE2_CTX_RING_TIMESTAMP_UDW, 0);
+    xe2_lrc_reg_write(xe2, ctx, XE2_LRC_SEQNO_PPHWSP_OFFSET / 4, ctx->seqno++);
     ++ctx->seqno;
 
-    uint32_t src_ggtt = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_INT_SRC_REPORT_PTR);
-    uint32_t sts_ggtt = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_INT_STATUS_REPORT_PTR);
+    uint32_t src_ggtt = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_INT_SRC_REPORT_PTR);
+    uint32_t sts_ggtt = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_INT_STATUS_REPORT_PTR);
 
     if (src_ggtt && sts_ggtt) {
         // Render source byte: its IIR bit in the engine's source-report page.
         xe2_dma_addr_t src = xe2_ggtt_translate(xe2, src_ggtt);
-        xe2_dma_write32(xe2, src, XE2_MEMIRQ_RENDER_SRC_BYTE, XE2_MEMIRQ_BYTE_SET);
+        xe2_dma_write_32(xe2, src, XE2_MEMIRQ_RENDER_SRC_BYTE, XE2_MEMIRQ_BYTE_SET);
 
         // Render user-interrupt byte: byte 0 of the engine's status vector.
         xe2_dma_addr_t sts = xe2_ggtt_translate(xe2, sts_ggtt);
-        xe2_dma_write32(xe2, sts, XE2_MEMIRQ_RENDER_STATUS_BYTE, XE2_MEMIRQ_BYTE_SET);
+        xe2_dma_write_32(xe2, sts, XE2_MEMIRQ_RENDER_STATUS_BYTE, XE2_MEMIRQ_BYTE_SET);
     }
 
     // The engine reports on its own MSI-X vector, which the driver recorded in
     // the context; the GuC owns vector 0, so raising 0 here would be ignored.
-    uint32_t msix_vec = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_CS_INT_VEC_DATA) & 0xFFFF;
+    uint32_t msix_vec = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_CS_INT_VEC_DATA) & 0xFFFF;
     rvvm_pci_send_irq(xe2->pci_func, msix_vec);
 }
 
@@ -2050,9 +2020,8 @@ static void xe2_signal_render_completion(xe2_dev_t *xe2, size_t context_idx)
 // content present at registration (priming, wa_bb setup) is not replayed as a
 // job; only tail advances past this baseline are treated as submissions.
 //
-// We start with non-zero seqno. Probably kernel decrements it or has hard
-// condition asserting that seqno=0 is no job was started at all. Assign non-zero
-// value, though I have no idea about semantics of such value. We set 0xFFFFFF.
+// Note that we don't strictly need to initialize seqno, since driver
+// could start with any number if we increment its value.
 static xe2_submit_ctx_t *xe2_track_context(xe2_dev_t *xe2, xe2_dma_addr_t pphwsp)
 {
     int free_slot = -1;
@@ -2060,8 +2029,7 @@ static xe2_submit_ctx_t *xe2_track_context(xe2_dev_t *xe2, xe2_dma_addr_t pphwsp
         if (xe2->ctx[i].valid && xe2->ctx[i].pphwsp.addr == pphwsp.addr) {
             // Re-registration: re-baseline so stale ring content is ignored.
             xe2->ctx[i].pphwsp        = pphwsp;
-            xe2->ctx[i].last_tail     = xe2_lrc_ctx_reg(xe2, &xe2->ctx[i], XE2_CTX_RING_TAIL);
-            xe2->ctx[free_slot].seqno = 0xFFFFFF;
+            xe2->ctx[i].last_tail     = xe2_lrc_reg_read(xe2, &xe2->ctx[i], XE2_CTX_RING_TAIL);
             return &xe2->ctx[i];
         }
         if (free_slot < 0 && !xe2->ctx[i].valid) {
@@ -2070,9 +2038,8 @@ static xe2_submit_ctx_t *xe2_track_context(xe2_dev_t *xe2, xe2_dma_addr_t pphwsp
     }
     if (free_slot >= 0) {
         xe2->ctx[free_slot].pphwsp    = pphwsp;
-        xe2->ctx[free_slot].last_tail = xe2_lrc_ctx_reg(xe2, &xe2->ctx[free_slot], XE2_CTX_RING_TAIL);
+        xe2->ctx[free_slot].last_tail = xe2_lrc_reg_read(xe2, &xe2->ctx[free_slot], XE2_CTX_RING_TAIL);
         xe2->ctx[free_slot].valid     = true;
-        xe2->ctx[free_slot].seqno     = 0xFFFFFF;
     } else {
         rvvm_warn("All hardware engine slots are busy");
         free_slot = 0;
@@ -2090,11 +2057,11 @@ static void xe2_complete_advanced_contexts(xe2_dev_t *xe2)
         if (!xe2->ctx[i].valid) {
             continue;
         }
-        uint32_t tail = xe2_lrc_ctx_reg(xe2, &xe2->ctx[i], XE2_CTX_RING_TAIL);
+        uint32_t tail = xe2_lrc_reg_read(xe2, &xe2->ctx[i], XE2_CTX_RING_TAIL);
         if (tail == xe2->ctx[i].last_tail) {
             continue;
         }
-        xe2_signal_render_completion(xe2, i);
+        xe2_signal_job_completion(xe2, i);
         xe2->ctx[i].last_tail = tail;
     }
 }
@@ -2110,9 +2077,9 @@ static void xe2_slpc_publish(xe2_dev_t *xe2)
     }
     uint32_t freq = xe2_reg_field_prep(XE2_SLPC_FREQ_MAX_UNSLICE_MASK, XE2_GT_FREQ_RP0_RATIO)
                   | xe2_reg_field_prep(XE2_SLPC_FREQ_MIN_UNSLICE_MASK, XE2_GT_FREQ_RPN_RATIO);
-    xe2_dma_write32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_HEADER_SIZE,     XE2_SLPC_SHARED_DATA_SIZE);
-    xe2_dma_write32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_GLOBAL_STATE,    XE2_SLPC_GLOBAL_STATE_RUNNING);
-    xe2_dma_write32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_TASK_STATE_FREQ, freq);
+    xe2_dma_write_32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_HEADER_SIZE,     XE2_SLPC_SHARED_DATA_SIZE);
+    xe2_dma_write_32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_GLOBAL_STATE,    XE2_SLPC_GLOBAL_STATE_RUNNING);
+    xe2_dma_write_32(xe2, xe2->guc.slpc_data_addr, XE2_SLPC_OFF_TASK_STATE_FREQ, freq);
 }
 
 // Handle an SLPC request sub-event. The reset/query events carry the shared-data
@@ -2159,8 +2126,8 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
         return;
     }
 
-    uint32_t head = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0);
-    uint32_t tail = xe2_dma_read32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 4);
+    uint32_t head = xe2_dma_read_32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0);
+    uint32_t tail = xe2_dma_read_32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 4);
 
     while (head != tail) {
         uint32_t header     = xe2_ctb_get(xe2, xe2->guc.ctb_h2g_addr, head, dwords);
@@ -2195,7 +2162,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
                 // The first registered context is rcs0 (irq_page 0); its source
                 // pointer reveals the shared memirq BO base for GuC signalling.
                 if (xe2->guc.memirq_base_ggtt == 0) {
-                    uint32_t src = xe2_lrc_ctx_reg(xe2, ctx, XE2_CTX_INT_SRC_REPORT_PTR);
+                    uint32_t src = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_INT_SRC_REPORT_PTR);
                     if (src > XE2_MEMIRQ_SOURCE_PAGE_OFFSET) {
                         xe2->guc.memirq_base_ggtt = src - XE2_MEMIRQ_SOURCE_PAGE_OFFSET;
                     }
@@ -2258,7 +2225,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
     }
 
     // Publish the updated consumer head.
-    xe2_dma_write32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0, head);
+    xe2_dma_write_32(xe2, xe2->guc.ctb_h2g_descriptor_addr, 0, head);
 
     // The job-submission and CT-message doorbells share register 0x1901F0. Rather
     // than gate on the presence of CT traffic (which also rides submission
@@ -2529,6 +2496,7 @@ static inline void xe2_cx0_msgbus_transaction(xe2_cx0_lane_t *lane, uint32_t cmd
 
 static inline bool xe2_skip_mmio_range(size_t offset)
 {
+    return 1;
     bool skip = 0;
     skip |= offset >= 0x050000 && offset <= 0x05FFFF;
     skip |= offset >= 0x090000 && offset <= 0x09FFFF;
