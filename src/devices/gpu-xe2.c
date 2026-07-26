@@ -1271,6 +1271,12 @@ static const uint8_t xe2_vbt[] = {
     0x00, 0x00,
 };
 
+static inline rvvm_addr_t xe2_concat_lohi(uint32_t lo, uint32_t hi)
+{
+    return (rvvm_addr_t) lo
+         | (rvvm_addr_t) hi << 32;
+}
+
 // Return the little-endian 32-bit flash word at the latched SPI address, served
 // from the synthetic VBT image at flash offset 0 (zero-filled beyond its end).
 static uint32_t xe2_spi_read32(xe2_dev_t *xe2)
@@ -1339,7 +1345,7 @@ static inline bool xe2_display_pending(xe2_dev_t *xe2)
 // bytes readable from the returned pointer before the next page in *avail.
 //
 // \return Obtained DMA pointer, that must be freed with `rvvm_pci_end_dma()` when no longer needed.
-static uint8_t *xe2_scanout_page_dma(xe2_dev_t *xe2, uint64_t ggtt, size_t *avail)
+static uint8_t *xe2_scanout_page_dma(xe2_dev_t *xe2, rvvm_addr_t ggtt, size_t *avail)
 {
     uint64_t page = ggtt >> 12;
     uint64_t off  = ggtt & 0xFFF;
@@ -1493,43 +1499,12 @@ static inline void xe2_ggtt_mmio_write(xe2_dev_t *xe2, uint32_t offset, uint32_t
     }
 
     if (xe2->ggtt_pte_valid[idx]) {
-        uint64_t pte = ((uint64_t) value << 32) | (uint64_t) xe2->ggtt_lo_addrs[idx];
-        // rvvm_info("Write PTE[0x%lx]: 0x%lx", idx, pte);
+        rvvm_addr_t pte = xe2_concat_lohi(xe2->ggtt_lo_addrs[idx], value);
         xe2->ggtt_pte[idx] = pte;
     }
 }
 
-static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, uint64_t ggtt)
-{
-    uint64_t idx = ggtt >> 12;
-    uint64_t off = ggtt & 0xFFF;
-    uint64_t pte = xe2->ggtt_pte[idx];
-
-    // rvvm_info("PTE: ggtt addr:       0x%lx", ggtt);
-    // rvvm_info("PTE: ggtt index:      0x%lx", idx);
-    // rvvm_info("PTE: ggtt off:        0x%lx", off);
-    // rvvm_info("PTE: raw pte:         0x%lx", pte);
-    // rvvm_info("PTE:   result:        0x%llx", (pte & 0x0000FFFFFFFFF000ULL) + off);
-    // rvvm_info("PTE: flag (NULL)?     %lu", pte & (1 << 9));
-    // rvvm_info("PTE: flag (PS64)?     %lu", pte & (1 << 8));
-    // rvvm_info("PTE: flag (RW)?       %lu", pte & (1 << 1));
-    // rvvm_info("PTE: flag (present)?  %lu", pte & (1 << 0));
-
-    if (unlikely(!(pte & 1))) {
-        rvvm_warn("PTE 0x%" PRIu64 " is invalid!", pte);
-        return (xe2_dma_addr_t) {
-            .addr = 0,
-            .type = 0
-        };
-    }
-
-    return (xe2_dma_addr_t) {
-        .addr = (pte & 0x0000FFFFFFFFF000ULL) + off,
-        .type = (pte & 2) ? XE2_MEM_LMEM : XE2_MEM_SMEM
-    };
-}
-
-static uint32_t xe2_dma_read_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
+static inline uint32_t xe2_dma_read_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off)
 {
     if (dma.type == XE2_MEM_LMEM) {
         if (unlikely(dma.addr + off + 4 > XE2_VRAM_SIZE)) {
@@ -1561,6 +1536,102 @@ static void xe2_dma_write_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uin
     }
 }
 
+static rvvm_addr_t xe2_read_pte_lmem(xe2_dev_t *xe2, rvvm_addr_t phys_addr)
+{
+    // Table levels (PML4/PDPT/PD/PT) are always LMEM-resident.
+    xe2_dma_addr_t dma = {
+        .addr = phys_addr & ~0xFFFULL,
+        .type = XE2_MEM_LMEM
+    };
+    uint32_t lo = xe2_dma_read_32(xe2, dma,  phys_addr & 0xFFFULL);
+    uint32_t hi = xe2_dma_read_32(xe2, dma, (phys_addr & 0xFFFULL) + 4);
+    return xe2_concat_lohi(lo, hi);
+}
+
+static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t *xe2, rvvm_addr_t ggtt)
+{
+    uint64_t idx = ggtt >> 12;
+    uint64_t off = ggtt & 0xFFF;
+    uint64_t pte = xe2->ggtt_pte[idx];
+
+    if (unlikely(!(pte & 1))) {
+        rvvm_warn("PTE 0x%" PRIu64 " is invalid!", pte);
+        return (xe2_dma_addr_t) {
+            .addr = 0,
+            .type = 0
+        };
+    }
+
+    return (xe2_dma_addr_t) {
+        .addr = (pte & 0x0000FFFFFFFFF000ULL) + off,
+        .type = (pte & 2) ? XE2_MEM_LMEM : XE2_MEM_SMEM
+    };
+}
+
+// This implements multi-level PPGTT page walk. We have 4 or 5 translation
+// levels, where most often 4 is enough for 2 MiB pages.
+//
+// I hope this translation will not be used in GPU rendering hotspots due
+// to ton branching and lookups.
+static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t *xe2, rvvm_addr_t pdp4, rvvm_addr_t va)
+{
+    // 48-bit addressing mode, where
+    //
+    // PML4      PDP        PD        PT        offset
+    // 000000000 0100000000 000000001 100000001 100100100000
+    // |         |        |         |         |            |
+    // 47        39       30        21        12           0
+    rvvm_addr_t pml4_idx = (va >> 39) & 0x1FF; // 9 bits
+    rvvm_addr_t pdpt_idx = (va >> 30) & 0x1FF; // 9 bits
+    rvvm_addr_t pd_idx   = (va >> 21) & 0x1FF; // 9 bits
+    rvvm_addr_t pt_idx   = (va >> 12) & 0x1FF; // 9 bits
+    rvvm_addr_t offset   =  va        & 0xFFF; // 12 bits
+
+    rvvm_addr_t pml4_addr = (pdp4 & ~0xFFFULL) + pml4_idx * 8;
+    rvvm_addr_t pml4e = xe2_read_pte_lmem(xe2, pml4_addr);
+    if (unlikely(!(pml4e & 1))) {
+        rvvm_warn("PPGTT: PML4e not present (VA=0x%lx)", va);
+        return (xe2_dma_addr_t) {0};
+    }
+
+    rvvm_addr_t pdpt_addr = (pml4e & ~0xFFFULL) + pdpt_idx * 8;
+    rvvm_addr_t pdpte = xe2_read_pte_lmem(xe2, pdpt_addr);
+    if (unlikely(!(pdpte & 1))) {
+        rvvm_warn("PPGTT: PDPTe not present (VA=0x%lx)", va);
+        return (xe2_dma_addr_t) {0};
+    }
+
+    rvvm_addr_t pd_addr = (pdpte & ~0xFFFULL) + pd_idx * 8;
+    rvvm_addr_t pde = xe2_read_pte_lmem(xe2, pd_addr);
+    if (unlikely(!(pde & 1))) {
+        rvvm_warn("PPGTT: PDE not present (VA=0x%lx)", va);
+        return (xe2_dma_addr_t) {0};
+    }
+
+    // 2MB huge page - this PDE is the leaf.
+    if (likely(pde & (1 << 7))) {
+        rvvm_addr_t phys = (pde & ~0x1FFFFFULL) + (va & 0x1FFFFF);
+        rvvm_info("Phys: 0x%lx", phys);
+        return (xe2_dma_addr_t) {
+            .addr = phys,
+            .type = (pde & (1 << 11)) ? XE2_MEM_LMEM : XE2_MEM_SMEM
+        };
+    }
+
+    rvvm_addr_t pt_addr = (pde & ~0xFFFULL) + pt_idx * 8;
+    rvvm_addr_t pte = xe2_read_pte_lmem(xe2, pt_addr);
+    if (unlikely(!(pte & 1))) {
+        rvvm_warn("PPGTT: PTE not present (VA=0x%lx)", va);
+        return (xe2_dma_addr_t) {0};
+    }
+
+    return (xe2_dma_addr_t) {
+        .addr = (pte & ~0xFFFULL) + offset,
+        .type = (pte & (1 << 11)) ? XE2_MEM_LMEM : XE2_MEM_SMEM
+    };
+}
+
+
 static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions)
 {
     uint32_t key = xe2_reg_field_get(xe2_reg_genmask(31, 16), actions[1]);
@@ -1569,8 +1640,7 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
                       | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_TYPE_MASK, 7)   // Success
                       | xe2_reg_field_prep(XE2_REG_GUC_FW_SW_X_MSG_0_DATA_MASK, 1);  // AUX data
 
-    uint64_t value = (uint64_t) actions[2]
-                   | (uint64_t) actions[3] << 32;
+    rvvm_addr_t value = xe2_concat_lohi(actions[2], actions[3]);
 
     switch (key) {
         case XE2_GUC_KLV_SELF_CFG_MEMIRQ_STATUS_ADDR_KEY:
@@ -1615,14 +1685,14 @@ static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions
 // Emit the hwconfig table as key/length/value triplets into the supplied buffer
 // and return its size in bytes. The driver first queries the size (address 0),
 // then re-requests with a buffer to copy into.
-static uint32_t xe2_guc_emit_hwconfig(xe2_dev_t *xe2, uint64_t ggtt_addr)
+static uint32_t xe2_guc_emit_hwconfig(xe2_dev_t *xe2, rvvm_addr_t ggtt_addr)
 {
     static const uint32_t table[] = {
         XE2_HWCONFIG_ATTR_MAX_SLICES,    1, XE2_HWCONFIG_MAX_SLICES_VAL,
         XE2_HWCONFIG_ATTR_MAX_SUBSLICES, 1, XE2_HWCONFIG_MAX_SUBSLICES_VAL,
     };
 
-    if (ggtt_addr != 0) {
+    if (ggtt_addr != 0ULL) {
         xe2_dma_addr_t dst = xe2_ggtt_translate(xe2, ggtt_addr);
         for (size_t i = 0; i < STATIC_ARRAY_SIZE(table); i++) {
             xe2_dma_write_32(xe2, dst, i * 4, table[i]);
@@ -1652,7 +1722,7 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
 
     switch (h2g[0]) {
         case XE2_GUC_ACTION_GET_HWCONFIG: {
-            uint64_t ggtt = (uint64_t) h2g[1] | (uint64_t) h2g[2] << 32;
+            rvvm_addr_t ggtt = xe2_concat_lohi(h2g[1], h2g[2]);
             arg = xe2_guc_emit_hwconfig(xe2, ggtt);
             break;
         }
@@ -1772,21 +1842,7 @@ static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
     xe2_dma_write_32(xe2, dst, 0, value);
 }
 
-// intel-gfx-prm-osrc-dg1-vol02a-commandreference-instructions.pdf:MI_STORE_REGISTER_MEM
-//
-// Analyze carefully guc_exec_queue_timedout_job().
-//
-// guc_exec_queue_timedout_job() called only if guc_exec_queue_run_job() took
-// too long to execute and didn't fetched response from GPU.
-//
-// | guc_exec_queue_run_job()
-// |__ register_exec_queue()
-// |   ... parallel GGTT? No
-// |       this calls XE2_GUC_ACTION_REGISTER_CONTEXT
-// |
-// |__ submit_exec_queue()
-// |   ... this calls XE2_GUC_ACTION_SCHED_CONTEXT
-static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe2_dma_addr_t ring, uint32_t h, uint32_t it, uint32_t ring_dw, bool *user_int)
+static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, uint32_t h, uint32_t it, uint32_t ring_dw, rvvm_addr_t pdp4, bool *user_int)
 {
     rvvm_info("MI opcode: 0x%x", XE2_MI_OPCODE(h));
     switch (XE2_MI_OPCODE(h)) {
@@ -1798,22 +1854,6 @@ static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe
         case XE2_MI_OP_USER_INTERRUPT:
             *user_int = true;
             return 1;
-        case XE2_MI_OP_STORE_REG_MEM:
-            // Store from register to the memory. Does this mean, that we need to
-            // implement register storage for the hardware engine?
-            //
-            // Timestamp is stored there probably via PPGTT. Then driver
-            // stucks reading this shit.
-            if (h & XE2_MI_SRM_USE_GGTT) {
-                uint32_t reg  = xe2_dma_read_32(xe2, ring, ((it + 1) % ring_dw) * 4);
-                uint32_t lo   = xe2_dma_read_32(xe2, ring, ((it + 2) % ring_dw) * 4);
-                uint32_t hi   = xe2_dma_read_32(xe2, ring, ((it + 3) % ring_dw) * 4);
-                uint64_t addr = (uint64_t) lo | ((uint64_t) hi << 32);
-
-                (void) reg;
-                xe2_ring_store(xe2, addr, ctx->seqno);
-            }
-            return 4;
         case XE2_MI_OP_STORE_DATA_IMM:
             if (h & XE2_MI_SDI_GGTT) {
                 uint32_t a = xe2_dma_read_32(xe2, ring, ((it + 1) % ring_dw) * 4);
@@ -1831,29 +1871,14 @@ static inline uint32_t xe2_ring_mi_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe
             }
             return (h & 0x3F) + 2;
         case XE2_MI_OP_BATCH_BUFFER_START: {
-            // Key command to start receiving batch buffers from the guest.
-            // Guest there only publishes batch address. We only should do something
-            // with that on MI_USER_INTERRUPT.
-            //
-            // Note that this uses PPGTT instead of normal GGTT. This means
-            // page table lookup should be implemented to interpret 39-bit
-            // addressing.
-            //
-            // Typical PPGTT address:
-            // 0x4000300000
-            // 0100000000000000001100010001010111010000
-            // |      |       |       |       |       |
-            // 39     32      24     16       8       0
-            //
-            // Tiled resources VA translation table L3 pointer table says:
-            // For physical memory option, address bits [47:39] has to be programmed to "0" as it is defined the
-            // limit of physical memory allocation.
             uint32_t lo = xe2_dma_read_32(xe2, ring, ((it + 1) % ring_dw) * 4);
             uint32_t hi = xe2_dma_read_32(xe2, ring, ((it + 2) % ring_dw) * 4);
-            rvvm_addr_t bo = (uint64_t) lo
-                           | (uint64_t) hi << 32;
+            rvvm_addr_t bo = xe2_concat_lohi(lo, hi);
             if (h & XE2_MI_OP_BATCH_BUFFER_START_PPGTT) {
-                rvvm_info("MI batch buffer start (PPGTT): BO - 0x%"PRIx64, bo);
+                xe2_dma_addr_t ppgtt = xe2_ppgtt_translate(xe2, pdp4, bo);
+                for (uint32_t i = 0; i < 16; ++i) {
+                    rvvm_info("Read PPGTT contents: 0x%x", xe2_dma_read_32(xe2, ppgtt, i * 4));
+                }
             } else {
                 rvvm_info("MI batch buffer start (GGTT): BO - 0x%"PRIx64, bo);
                 xe2_dma_addr_t dma = xe2_ggtt_translate(xe2, bo);
@@ -1894,38 +1919,17 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
 // GGTT write). We do not run the batch itself; only its completion postamble has
 // observable side effects the driver waits on (the seqno reaching the fence
 // value). Returns true if a user interrupt was found in the stream.
-//
-// Init sequence being sent in every tested scenario:
-//
-// MI opcode: 0x24       XE2_MI_OP_STORE_REG_MEM
-// MI opcode: 0x20       XE2_MI_OP_STORE_DATA_IMM
-// MI opcode: 0x8        XE2_MI_OP_ARB_ON_OFF
-// MI opcode: 0x31       XE2_MI_OP_BATCH_BUFFER_START
-// MI opcode: 0x0        XE2_MI_OP_NOOP
-// MI opcode: 0x5        XE2_MI_OP_ARB_CHECK
-// MI opcode: 0x26       XE2_MI_OP_FLUSH_DW
-// MI opcode: 0x5        XE2_MI_OP_ARB_CHECK
-// MI opcode: 0x31       XE2_MI_OP_BATCH_BUFFER_START
-// MI opcode: 0x0        XE2_MI_OP_NOOP
-// MI opcode: 0x26       XE2_MI_OP_FLUSH_DW
-//
-// ... emit_user_interrupt
-// MI opcode: 0x2        XE2_MI_OP_USER_INTERRUPT
-// MI opcode: 0x8        XE2_MI_OP_ARB_ON_OFF
-// MI opcode: 0x5        XE2_MI_OP_ARB_CHECK
 static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
 {
     xe2_submit_ctx_t *ctx = &xe2->ctx[context_idx];
 
-    uint32_t ring_ggtt    = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_START);
-    uint32_t head         = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_HEAD);
-    uint32_t tail         = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_TAIL);
-    uint32_t ctl          = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_CTL);
-    uint32_t ppgtt_lo     = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_PDP0_LDW);
-    uint32_t ppgtt_hi     = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_PDP0_UDW);
-    rvvm_addr_t ppgtt     = ((rvvm_addr_t) ppgtt_hi << 32) | (rvvm_addr_t) ppgtt_lo;
-
-    UNUSED(ppgtt);
+    uint32_t ring_ggtt = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_START);
+    uint32_t head      = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_HEAD);
+    uint32_t tail      = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_TAIL);
+    uint32_t ctl       = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_CTL);
+    uint32_t ppgtt_lo  = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_PDP0_LDW);
+    uint32_t ppgtt_hi  = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_RING_PDP0_UDW);
+    rvvm_addr_t pdp4   = xe2_concat_lohi(ppgtt_lo, ppgtt_hi);
 
     if (unlikely(ring_ggtt == 0 || head == tail)) {
         return false;
@@ -1937,7 +1941,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
     }
 
     // RING_CTL holds (size - PAGE_SIZE) page-aligned; recover the dword count.
-    uint32_t ring_bytes = (ctl & 0x003ff000U) + 0x1000U;
+    uint32_t ring_bytes = (ctl & 0x003FF000U) + 0x1000U;
     uint32_t ring_dw    = ring_bytes / 4;
     bool     user_int   = false;
 
@@ -1954,7 +1958,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
 
         switch (XE2_INSTR_TYPE(h)) {
             case XE2_INSTR_TYPE_MI:
-                len = xe2_ring_mi_cmd(xe2, ctx, ring, h, i, ring_dw, &user_int);
+                len = xe2_ring_mi_cmd(xe2, ring, h, i, ring_dw, pdp4, &user_int);
                 break;
             case XE2_INSTR_TYPE_GFXPIPE:
                 len = xe2_ring_gfxpipe_cmd(xe2, ring, h, i, ring_dw);
@@ -2099,7 +2103,7 @@ static void xe2_slpc_request(xe2_dev_t *xe2, const uint32_t *msg)
     switch (event) {
         case XE2_SLPC_EVENT_RESET:
         case XE2_SLPC_EVENT_QUERY_TASK_STATE: {
-            uint64_t bo = (uint64_t) msg[2] | (uint64_t) msg[3] << 32;
+            rvvm_addr_t bo           = xe2_concat_lohi(msg[2], msg[3]);
             xe2->guc.slpc_data_addr  = xe2_ggtt_translate(xe2, bo);
             xe2->guc.slpc_data_valid = true;
             break;
@@ -2153,8 +2157,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
             case XE2_GUC_ACTION_REGISTER_CONTEXT: {
                 // The registered context address points at the per-process HW
                 // status page (PPHWSP), which is the first page of the context.
-                rvvm_addr_t hwlrca = (rvvm_addr_t) msg[10]
-                                   | (rvvm_addr_t) msg[11] << 32;
+                rvvm_addr_t hwlrca = xe2_concat_lohi(msg[10], msg[11]);
                 hwlrca &= 0x0000FFFFFFFFF000ULL; // page addr only; drop desc flags + engine class/instance
                 xe2_dma_addr_t hwlrca_dma = xe2_ggtt_translate(xe2, hwlrca);
                 // Begin tracking this context for tail-advance completion.
