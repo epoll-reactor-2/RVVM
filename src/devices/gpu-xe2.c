@@ -820,49 +820,6 @@ INTEL_DEBUG=bat glmark2-es2-drm
 #define XE2_LRC_CTX_JOB_TIMESTAMP_OFFSET                  528
 #define XE2_LRC_PARALLEL_OFFSET                           2048
 
-// Theoretically this number of contexts (rcs0/bcs0/ccs0/...) may be registered at once.
-// This is extremely pessimistic scenario, just compatible with original Xe2 driver.
-#define XE2_MAX_CONTEXTS                                  65535
-
-// Ring command stream decode. Type lives in bits 31:29 (MI = 0, GFXPIPE = 3);
-// the MI opcode is bits 28:23. The completion postamble a job appends to its
-// ring stores the seqno (MI_STORE_DATA_IMM / MI_FLUSH_DW / PIPE_CONTROL with a
-// GGTT post-sync write) and raises MI_USER_INTERRUPT.
-#define XE2_INSTR_TYPE(h)                                 ((h) >> 29)
-#define XE2_INSTR_TYPE_MI                                 0
-#define XE2_INSTR_TYPE_GSC                                2
-#define XE2_INSTR_TYPE_GFXPIPE                            3
-#define XE2_INSTR_TYPE_GFX_STATE                          4
-#define XE2_MI_OPCODE(h)                                  (((h) >> 23) & 0x3F) // [28:23]
-#define XE2_MI_OP_NOOP                                    0x00
-#define XE2_MI_OP_USER_INTERRUPT                          0x02
-#define XE2_MI_OP_ARB_CHECK                               0x05
-#define XE2_MI_OP_ARB_ON_OFF                              0x08
-#define XE2_MI_OP_BATCH_BUFFER_END                        0x0a
-#define XE2_MI_OP_STORE_DATA_IMM                          0x20
-#define XE2_MI_OP_STORE_REG_MEM                           0x24
-#define XE2_MI_SRM_USE_GGTT                               xe2_reg_bit(22)
-#define XE2_MI_SRM_ADD_CS_OFFSET                          xe2_reg_bit(19)
-#define XE2_MI_OP_FLUSH_DW                                0x26
-#define XE2_MI_OP_BATCH_BUFFER_START                      0x31
-#define XE2_MI_OP_BATCH_BUFFER_START_PPGTT                xe2_reg_bit( 8)
-#define XE2_MI_SDI_GGTT                                   xe2_reg_bit(22)
-#define XE2_MI_FLUSH_DW_OP_STOREDW                        xe2_reg_bit(14)
-#define XE2_MI_FLUSH_DW_USE_GTT                           xe2_reg_bit( 2)
-#define XE2_PIPE_CONTROL_SIG                              0x7a             // (h >> 24)
-#define XE2_PIPE_CONTROL_QW_WRITE                         xe2_reg_bit(14)
-#define XE2_PIPE_CONTROL_GLOBAL_GTT                       xe2_reg_bit(24)
-
-#define XE2_GFXPIPE_PIPELINE(h)                           (((h) >> 27) & 0x3)   // [28:27]
-#define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)   // [26:24]
-#define XE2_GFXPIPE_SUBOPCODE(h)                          (((h) >> 16) & 0x1FF) // [23:16]
-// Mask [26:16] dedicated for opcode + subopcode pair.
-#define XE2_GFXPIPE_OPCODES_MASKED(h)                     (h & 0x7FF0000)
-// [26:24] - 3D command opcode.
-// [23:16] - 3D command subopcode.
-#define XE2_GFXPIPE_CMD(op, subop)                        ((op & 0x7) << 24 | (subop & 0x1FF) << 16)
-#define XE2_GFXPIPE_OP_PIPE_CONTROL                       XE2_GFXPIPE_CMD(0x2, 0x0)
-
 // memirq page geometry. The source-report page sits 0x400 into the shared BO;
 // each status vector is 16 bytes. The GuC's own interrupt sits at bit 25
 // (INTR_GUC): source byte at +0x400+25, status vector at +25*16, and its
@@ -954,6 +911,173 @@ INTEL_DEBUG=bat glmark2-es2-drm
 #define XE2_GGTT_PTE_ADDR_MASK                            0x0000FFFFFFFFF000ULL
 #define XE2_GGTT_MMIO_BASE                                0x800000 // 8 MiB
 #define XE2_GGTT_MMIO_SIZE                                0x800000 // 8 MiB
+
+// Theoretically this number of contexts (rcs0/bcs0/ccs0/...) may be registered at once.
+// This is extremely pessimistic scenario, just compatible with original Xe2 driver.
+#define XE2_MAX_CONTEXTS                                  65535
+
+// Ring command stream decode. Type lives in bits 31:29 (MI = 0, GFXPIPE = 3);
+// the MI opcode is bits 28:23. The completion postamble a job appends to its
+// ring stores the seqno (MI_STORE_DATA_IMM / MI_FLUSH_DW / PIPE_CONTROL with a
+// GGTT post-sync write) and raises MI_USER_INTERRUPT.
+#define XE2_INSTR_TYPE(h)                                 ((h) >> 29)
+#define XE2_INSTR_TYPE_MI                                 0
+#define XE2_INSTR_TYPE_GSC                                2
+#define XE2_INSTR_TYPE_GFXPIPE                            3
+#define XE2_INSTR_TYPE_GFX_STATE                          4
+// Undocumented in kernel & Mesa command type. As per
+// $ https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/intel/genxml/xe2.xml?ref_type=heads
+// this command type use only one kind of instruction.
+//
+// <instruction name="RESOURCE_BARRIER" bias="2" length="5" engine="render|compute">
+//   <field name="DWord Length" dword="0" bits="7:0" type="uint" default="3" />
+//   <field name="Predicate Enable" dword="0" bits="24:24" type="bool" />
+//   <field name="Opcode" dword="0" bits="28:26" type="uint" default="3">
+//     <value name="RESOURCE_BARRIER" value="3" />
+//   </field>
+//   <field name="Command Type" dword="0" bits="31:29" type="uint" default="5" />
+//   <field name="Resource Barrier Body" dword="1" bits="127:0" type="RESOURCE_BARRIER_BODY" />
+// </instruction>
+#define XE2_INSTR_TYPE_RESOURCE_BARRIER                   5
+#define XE2_MI_OPCODE(h)                                  (((h) >> 23) & 0x3F) // [28:23]
+#define XE2_MI_OP_NOOP                                    0x00
+#define XE2_MI_OP_USER_INTERRUPT                          0x02
+#define XE2_MI_OP_ARB_CHECK                               0x05
+#define XE2_MI_OP_ARB_ON_OFF                              0x08
+#define XE2_MI_OP_BATCH_BUFFER_END                        0x0a
+#define XE2_MI_OP_STORE_DATA_IMM                          0x20
+#define XE2_MI_OP_STORE_REG_MEM                           0x24
+#define XE2_MI_SRM_USE_GGTT                               xe2_reg_bit(22)
+#define XE2_MI_SRM_ADD_CS_OFFSET                          xe2_reg_bit(19)
+#define XE2_MI_OP_FLUSH_DW                                0x26
+#define XE2_MI_OP_BATCH_BUFFER_START                      0x31
+#define XE2_MI_OP_BATCH_BUFFER_START_PPGTT                xe2_reg_bit( 8)
+#define XE2_MI_SDI_GGTT                                   xe2_reg_bit(22)
+#define XE2_MI_FLUSH_DW_OP_STOREDW                        xe2_reg_bit(14)
+#define XE2_MI_FLUSH_DW_USE_GTT                           xe2_reg_bit( 2)
+
+// GFXPIPE (Graphics pipe) commands are mainly used to configure GPU
+// pipeline. Actual rendering logic is contained in shaders submitted
+// with 3DSTATE_VS.
+//
+// We ignore pipeline field for simplicity now. Probably there is no
+// command which indicies could clatch with other instruction.
+#define XE2_GFXPIPE_PIPELINE(h)                           (((h) >> 27) & 0x3)   // [28:27]
+#define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)   // [26:24]
+#define XE2_GFXPIPE_SUBOPCODE(h)                          (((h) >> 16) & 0x1FF) // [23:16]
+// Mask [26:16] dedicated for opcode + subopcode pair.
+#define XE2_GFXPIPE_OPCODES_MASKED(h)                     (h & 0x7FF0000)
+// [28:27] - 3D command pipeline (common/single DW/compute/3D).
+// [26:24] - 3D command opcode.
+// [23:16] - 3D command subopcode.
+#define XE2_GFXPIPE_CMD(op, subop)                         ((op & 0x7) << 24 | (subop & 0x1FF) << 16)
+#define XE2_GFXPIPE_CMD_PIPE_CONTROL                       XE2_GFXPIPE_CMD(0x2, 0x0)
+#define XE2_GFXPIPE_CMD_PIPE_CONTROL_QW_WRITE              xe2_reg_bit(14)
+#define XE2_GFXPIPE_CMD_PIPE_CONTROL_GLOBAL_GTT            xe2_reg_bit(24)
+#define XE2_GFXPIPE_CMD_3DSTATE_DRAWING_RECTANGLE_FAST     XE2_GFXPIPE_CMD(0x0, 0x00)
+#define XE2_GFXPIPE_CMD_3DSTATE_CLEAR_PARAMS               XE2_GFXPIPE_CMD(0x0, 0x04)
+#define XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BUFFER               XE2_GFXPIPE_CMD(0x0, 0x05)
+#define XE2_GFXPIPE_CMD_3DSTATE_STENCIL_BUFFER             XE2_GFXPIPE_CMD(0x0, 0x06)
+#define XE2_GFXPIPE_CMD_3DSTATE_HIER_DEPTH_BUFFER          XE2_GFXPIPE_CMD(0x0, 0x07)
+#define XE2_GFXPIPE_CMD_3DSTATE_VERTEX_BUFFERS             XE2_GFXPIPE_CMD(0x0, 0x08)
+#define XE2_GFXPIPE_CMD_3DSTATE_VERTEX_ELEMENTS            XE2_GFXPIPE_CMD(0x0, 0x09)
+#define XE2_GFXPIPE_CMD_3DSTATE_INDEX_BUFFER               XE2_GFXPIPE_CMD(0x0, 0x0A)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF                         XE2_GFXPIPE_CMD(0x0, 0x0C)
+#define XE2_GFXPIPE_CMD_3DSTATE_MULTISAMPLE                XE2_GFXPIPE_CMD(0x0, 0x0D)
+#define XE2_GFXPIPE_CMD_3DSTATE_CC_STATE_POINTERS          XE2_GFXPIPE_CMD(0x0, 0x0E)
+#define XE2_GFXPIPE_CMD_3DSTATE_SCISSOR_STATE_POINTERS     XE2_GFXPIPE_CMD(0x0, 0x0F)
+#define XE2_GFXPIPE_CMD_3DSTATE_VS                         XE2_GFXPIPE_CMD(0x0, 0x10)
+#define XE2_GFXPIPE_CMD_3DSTATE_GS                         XE2_GFXPIPE_CMD(0x0, 0x11)
+#define XE2_GFXPIPE_CMD_3DSTATE_CLIP                       XE2_GFXPIPE_CMD(0x0, 0x12)
+#define XE2_GFXPIPE_CMD_3DSTATE_SF                         XE2_GFXPIPE_CMD(0x0, 0x13)
+#define XE2_GFXPIPE_CMD_3DSTATE_WM                         XE2_GFXPIPE_CMD(0x0, 0x14)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_VS                XE2_GFXPIPE_CMD(0x0, 0x15)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_GS                XE2_GFXPIPE_CMD(0x0, 0x16)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_PS                XE2_GFXPIPE_CMD(0x0, 0x17)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLE_MASK                XE2_GFXPIPE_CMD(0x0, 0x18)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_HS                XE2_GFXPIPE_CMD(0x0, 0x19)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_DS                XE2_GFXPIPE_CMD(0x0, 0x1A)
+#define XE2_GFXPIPE_CMD_3DSTATE_HS                         XE2_GFXPIPE_CMD(0x0, 0x1B)
+#define XE2_GFXPIPE_CMD_3DSTATE_TE                         XE2_GFXPIPE_CMD(0x0, 0x1C)
+#define XE2_GFXPIPE_CMD_3DSTATE_DS                         XE2_GFXPIPE_CMD(0x0, 0x1D)
+#define XE2_GFXPIPE_CMD_3DSTATE_STREAMOUT                  XE2_GFXPIPE_CMD(0x0, 0x1E)
+#define XE2_GFXPIPE_CMD_3DSTATE_SBE                        XE2_GFXPIPE_CMD(0x0, 0x1F)
+#define XE2_GFXPIPE_CMD_3DSTATE_PS                         XE2_GFXPIPE_CMD(0x0, 0x20)
+#define XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP XE2_GFXPIPE_CMD(0x0, 0x21)
+#define XE2_GFXPIPE_CMD_3DSTATE_CPS_POINTERS               XE2_GFXPIPE_CMD(0x0, 0x22)
+#define XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_POINTERS_CC XE2_GFXPIPE_CMD(0x0, 0x23)
+#define XE2_GFXPIPE_CMD_3DSTATE_BLEND_STATE_POINTERS       XE2_GFXPIPE_CMD(0x0, 0x24)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_VS  XE2_GFXPIPE_CMD(0x0, 0x26)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_HS  XE2_GFXPIPE_CMD(0x0, 0x27)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_DS  XE2_GFXPIPE_CMD(0x0, 0x28)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_GS  XE2_GFXPIPE_CMD(0x0, 0x29)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_PS  XE2_GFXPIPE_CMD(0x0, 0x2A)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_VS  XE2_GFXPIPE_CMD(0x0, 0x2B)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_HS  XE2_GFXPIPE_CMD(0x0, 0x2C)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_DS  XE2_GFXPIPE_CMD(0x0, 0x2D)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_GS  XE2_GFXPIPE_CMD(0x0, 0x2E)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_PS  XE2_GFXPIPE_CMD(0x0, 0x2F)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_INSTANCING              XE2_GFXPIPE_CMD(0x0, 0x49)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_SGVS                    XE2_GFXPIPE_CMD(0x0, 0x4A)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_TOPOLOGY                XE2_GFXPIPE_CMD(0x0, 0x4B)
+#define XE2_GFXPIPE_CMD_3DSTATE_WM_CHROMAKEY               XE2_GFXPIPE_CMD(0x0, 0x4C)
+#define XE2_GFXPIPE_CMD_3DSTATE_PS_BLEND                   XE2_GFXPIPE_CMD(0x0, 0x4D)
+#define XE2_GFXPIPE_CMD_3DSTATE_WM_DEPTH_STENCIL           XE2_GFXPIPE_CMD(0x0, 0x4E)
+#define XE2_GFXPIPE_CMD_3DSTATE_PS_EXTRA                   XE2_GFXPIPE_CMD(0x0, 0x4F)
+#define XE2_GFXPIPE_CMD_3DSTATE_RASTER                     XE2_GFXPIPE_CMD(0x0, 0x50)
+#define XE2_GFXPIPE_CMD_3DSTATE_SBE_SWIZ                   XE2_GFXPIPE_CMD(0x0, 0x51)
+#define XE2_GFXPIPE_CMD_3DSTATE_WM_HZ_OP                   XE2_GFXPIPE_CMD(0x0, 0x52)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_COMPONENT_PACKING       XE2_GFXPIPE_CMD(0x0, 0x55)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_SGVS_2                  XE2_GFXPIPE_CMD(0x0, 0x56)
+#define XE2_GFXPIPE_CMD_3DSTATE_VFG                        XE2_GFXPIPE_CMD(0x0, 0x57)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_VS               XE2_GFXPIPE_CMD(0x0, 0x58)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_HS               XE2_GFXPIPE_CMD(0x0, 0x59)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_DS               XE2_GFXPIPE_CMD(0x0, 0x5A)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_GS               XE2_GFXPIPE_CMD(0x0, 0x5B)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_0          XE2_GFXPIPE_CMD(0x0, 0x60)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_1          XE2_GFXPIPE_CMD(0x0, 0x61)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_2          XE2_GFXPIPE_CMD(0x0, 0x62)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_3          XE2_GFXPIPE_CMD(0x0, 0x63)
+#define XE2_GFXPIPE_CMD_3DSTATE_PRIMITIVE_REPLICATION      XE2_GFXPIPE_CMD(0x0, 0x6C)
+#define XE2_GFXPIPE_CMD_3DSTATE_TBIMR_TILE_PASS_INFO       XE2_GFXPIPE_CMD(0x0, 0x6E)
+#define XE2_GFXPIPE_CMD_3DSTATE_AMFS                       XE2_GFXPIPE_CMD(0x0, 0x6F)
+#define XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BOUNDS               XE2_GFXPIPE_CMD(0x0, 0x71)
+#define XE2_GFXPIPE_CMD_3DSTATE_AMFS_TEXTURE_POINTERS      XE2_GFXPIPE_CMD(0x0, 0x72)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_TS_POINTER        XE2_GFXPIPE_CMD(0x0, 0x73)
+#define XE2_GFXPIPE_CMD_3DSTATE_MESH_CONTROL               XE2_GFXPIPE_CMD(0x0, 0x77)
+#define XE2_GFXPIPE_CMD_3DSTATE_MESH_DISTRIB               XE2_GFXPIPE_CMD(0x0, 0x78)
+#define XE2_GFXPIPE_CMD_3DSTATE_TASK_REDISTRIB             XE2_GFXPIPE_CMD(0x0, 0x79)
+#define XE2_GFXPIPE_CMD_3DSTATE_MESH_SHADER                XE2_GFXPIPE_CMD(0x0, 0x7A)
+#define XE2_GFXPIPE_CMD_3DSTATE_MESH_SHADER_DATA           XE2_GFXPIPE_CMD(0x0, 0x7B)
+#define XE2_GFXPIPE_CMD_3DSTATE_TASK_CONTROL               XE2_GFXPIPE_CMD(0x0, 0x7C)
+#define XE2_GFXPIPE_CMD_3DSTATE_TASK_SHADER                XE2_GFXPIPE_CMD(0x0, 0x7D)
+#define XE2_GFXPIPE_CMD_3DSTATE_TASK_SHADER_DATA           XE2_GFXPIPE_CMD(0x0, 0x7E)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_MESH             XE2_GFXPIPE_CMD(0x0, 0x7F)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_TASK             XE2_GFXPIPE_CMD(0x0, 0x80)
+#define XE2_GFXPIPE_CMD_3DSTATE_CLIP_MESH                  XE2_GFXPIPE_CMD(0x0, 0x81)
+#define XE2_GFXPIPE_CMD_3DSTATE_SBE_MESH                   XE2_GFXPIPE_CMD(0x0, 0x82)
+#define XE2_GFXPIPE_CMD_3DSTATE_CPSIZE_CONTROL_BUFFER      XE2_GFXPIPE_CMD(0x0, 0x83)
+#define XE2_GFXPIPE_CMD_3DSTATE_COARSE_PIXEL               XE2_GFXPIPE_CMD(0x0, 0x89)
+#define XE2_GFXPIPE_CMD_3DSTATE_DRAWING_RECTANGLE          XE2_GFXPIPE_CMD(0x1, 0x00)
+#define XE2_GFXPIPE_CMD_3DSTATE_CHROMA_KEY                 XE2_GFXPIPE_CMD(0x1, 0x04)
+#define XE2_GFXPIPE_CMD_3DSTATE_POLY_STIPPLE_OFFSET        XE2_GFXPIPE_CMD(0x1, 0x06)
+#define XE2_GFXPIPE_CMD_3DSTATE_POLY_STIPPLE_PATTERN       XE2_GFXPIPE_CMD(0x1, 0x07)
+#define XE2_GFXPIPE_CMD_3DSTATE_LINE_STIPPLE               XE2_GFXPIPE_CMD(0x1, 0x08)
+#define XE2_GFXPIPE_CMD_3DSTATE_AA_LINE_PARAMETERS         XE2_GFXPIPE_CMD(0x1, 0x0A)
+#define XE2_GFXPIPE_CMD_3DSTATE_MONOFILTER_SIZE            XE2_GFXPIPE_CMD(0x1, 0x11)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_VS     XE2_GFXPIPE_CMD(0x1, 0x12)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_HS     XE2_GFXPIPE_CMD(0x1, 0x13)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_DS     XE2_GFXPIPE_CMD(0x1, 0x14)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_GS     XE2_GFXPIPE_CMD(0x1, 0x15)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_PS     XE2_GFXPIPE_CMD(0x1, 0x16)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_DECL_LIST               XE2_GFXPIPE_CMD(0x1, 0x17)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER                  XE2_GFXPIPE_CMD(0x1, 0x18)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POOL_ALLOC   XE2_GFXPIPE_CMD(0x1, 0x19)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLE_PATTERN             XE2_GFXPIPE_CMD(0x1, 0x1C)
+#define XE2_GFXPIPE_CMD_3DSTATE_3D_MODE                    XE2_GFXPIPE_CMD(0x1, 0x1E)
+#define XE2_GFXPIPE_CMD_3DSTATE_SUBSLICE_HASH_TABLE        XE2_GFXPIPE_CMD(0x1, 0x1F)
+#define XE2_GFXPIPE_CMD_3DSTATE_SLICE_TABLE_STATE_POINTERS XE2_GFXPIPE_CMD(0x1, 0x20)
+#define XE2_GFXPIPE_CMD_3DSTATE_PTBR_TILE_PASS_INFO        XE2_GFXPIPE_CMD(0x1, 0x22)
 
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
@@ -1990,21 +2114,27 @@ static inline uint32_t xe2_ring_mi_cmd(
 
 static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, uint32_t op, uint32_t i)
 {
+    rvvm_info("GFX command (%02x, %02x)",
+        XE2_GFXPIPE_OPCODE(op),
+        XE2_GFXPIPE_SUBOPCODE(op)
+    );
     switch (XE2_GFXPIPE_OPCODES_MASKED(op)) {
-        case XE2_GFXPIPE_OP_PIPE_CONTROL: {
+        case XE2_GFXPIPE_CMD_PIPE_CONTROL: {
             rvvm_info("GFX pipe control");
             uint32_t flags = xe2_dma_read_32(xe2, ring, ((i + 1)) * 4);
-            if ((flags & XE2_PIPE_CONTROL_QW_WRITE) &&
-                (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
+            if ((flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_QW_WRITE) &&
+                (flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_GLOBAL_GTT)) {
                 uint32_t a = xe2_dma_read_32(xe2, ring, ((i + 2)) * 4);
                 uint32_t v = xe2_dma_read_32(xe2, ring, ((i + 4)) * 4);
                 xe2_ring_store(xe2, a, v);
             }
             break;
         }
+        case XE2_GFXPIPE_CMD_3DSTATE_GS:
+            rvvm_info("GFX: 3DSTATE Graphics shader caught");
+            break;
     }
 
-    rvvm_info("Return GFX length: %u", (op & 0xFF) + 2);
     return (op & 0xFF) + 2;
 }
 
@@ -2024,22 +2154,9 @@ static uint32_t xe2_ring_cmd(
             return xe2_ring_gfxpipe_cmd(xe2, ring, op, i);
             break;
         case XE2_INSTR_TYPE_GSC:
-            rvvm_info("GSC opcode: 0x%x", op);
             return (op & 0xFF) + 2;
-        // Undocumented in kernel & Mesa command type. As per
-        // $ https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/intel/genxml/xe2.xml?ref_type=heads
-        // this command type use only one kind of instruction.
-        //
-        // <instruction name="RESOURCE_BARRIER" bias="2" length="5" engine="render|compute">
-        //   <field name="DWord Length" dword="0" bits="7:0" type="uint" default="3" />
-        //   <field name="Predicate Enable" dword="0" bits="24:24" type="bool" />
-        //   <field name="Opcode" dword="0" bits="28:26" type="uint" default="3">
-        //     <value name="RESOURCE_BARRIER" value="3" />
-        //   </field>
-        //   <field name="Command Type" dword="0" bits="31:29" type="uint" default="5" />
-        //   <field name="Resource Barrier Body" dword="1" bits="127:0" type="RESOURCE_BARRIER_BODY" />
-        // </instruction>
-        case 0x05: // Resource barrier
+        case XE2_INSTR_TYPE_RESOURCE_BARRIER:
+            // This instruction always has size equals 1 byte per Mesa.
             return 1;
         default:
             rvvm_fatal("Unknown instruction type: %u", XE2_INSTR_TYPE(op));
