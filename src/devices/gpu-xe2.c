@@ -856,6 +856,12 @@ INTEL_DEBUG=bat glmark2-es2-drm
 #define XE2_GFXPIPE_PIPELINE(h)                           (((h) >> 27) & 0x3)   // [28:27]
 #define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)   // [26:24]
 #define XE2_GFXPIPE_SUBOPCODE(h)                          (((h) >> 16) & 0x1FF) // [23:16]
+// Mask [26:16] dedicated for opcode + subopcode pair.
+#define XE2_GFXPIPE_OPCODES_MASKED(h)                     (h & 0x7FF0000)
+// [26:24] - 3D command opcode.
+// [23:16] - 3D command subopcode.
+#define XE2_GFXPIPE_CMD(op, subop)                        ((op & 0x7) << 24 | (subop & 0x1FF) << 16)
+#define XE2_GFXPIPE_OP_PIPE_CONTROL                       XE2_GFXPIPE_CMD(0x2, 0x0)
 
 // memirq page geometry. The source-report page sits 0x400 into the shared BO;
 // each status vector is 16 bytes. The GuC's own interrupt sits at bit 25
@@ -1984,22 +1990,17 @@ static inline uint32_t xe2_ring_mi_cmd(
 
 static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, uint32_t op, uint32_t i)
 {
-    // We need to verify GFX commands encoding and set proper length
-    // depending on it. Length is crucial because on incorrect value we
-    // will advance the command buffer with corrupted offset and whole
-    // following command processing will explode.
-    rvvm_info("GFX command (full): 0x%x", op);
-    rvvm_info(" |  opcode:         0x%x", XE2_GFXPIPE_OPCODE(op));
-    rvvm_info(" |  subopcode:      0x%x", XE2_GFXPIPE_SUBOPCODE(op));
-    rvvm_info(" |  pipeline:       0x%x", XE2_GFXPIPE_PIPELINE(op));
-    if ((op >> 24) == XE2_PIPE_CONTROL_SIG) {
-        rvvm_info("GFX pipe control");
-        uint32_t flags = xe2_dma_read_32(xe2, ring, ((i + 1)) * 4);
-        if ((flags & XE2_PIPE_CONTROL_QW_WRITE)
-            && (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
-            uint32_t a = xe2_dma_read_32(xe2, ring, ((i + 2)) * 4);
-            uint32_t v = xe2_dma_read_32(xe2, ring, ((i + 4)) * 4);
-            xe2_ring_store(xe2, a, v);
+    switch (XE2_GFXPIPE_OPCODES_MASKED(op)) {
+        case XE2_GFXPIPE_OP_PIPE_CONTROL: {
+            rvvm_info("GFX pipe control");
+            uint32_t flags = xe2_dma_read_32(xe2, ring, ((i + 1)) * 4);
+            if ((flags & XE2_PIPE_CONTROL_QW_WRITE) &&
+                (flags & XE2_PIPE_CONTROL_GLOBAL_GTT)) {
+                uint32_t a = xe2_dma_read_32(xe2, ring, ((i + 2)) * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, ((i + 4)) * 4);
+                xe2_ring_store(xe2, a, v);
+            }
+            break;
         }
     }
 
