@@ -833,7 +833,7 @@ INTEL_DEBUG=bat glmark2-es2-drm
 #define XE2_INSTR_TYPE_GSC                                2
 #define XE2_INSTR_TYPE_GFXPIPE                            3
 #define XE2_INSTR_TYPE_GFX_STATE                          4
-#define XE2_MI_OPCODE(h)                                  (((h) >> 23) & 0x3f)
+#define XE2_MI_OPCODE(h)                                  (((h) >> 23) & 0x3F) // [28:23]
 #define XE2_MI_OP_NOOP                                    0x00
 #define XE2_MI_OP_USER_INTERRUPT                          0x02
 #define XE2_MI_OP_ARB_CHECK                               0x05
@@ -850,10 +850,12 @@ INTEL_DEBUG=bat glmark2-es2-drm
 #define XE2_MI_FLUSH_DW_OP_STOREDW                        xe2_reg_bit(14)
 #define XE2_MI_FLUSH_DW_USE_GTT                           xe2_reg_bit( 2)
 #define XE2_PIPE_CONTROL_SIG                              0x7a             // (h >> 24)
-#define XE2_PIPE_CONTROL_QW_WRITE                         xe2_reg_bit( 14)
-#define XE2_PIPE_CONTROL_GLOBAL_GTT                       xe2_reg_bit( 24)
+#define XE2_PIPE_CONTROL_QW_WRITE                         xe2_reg_bit(14)
+#define XE2_PIPE_CONTROL_GLOBAL_GTT                       xe2_reg_bit(24)
 
-#define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)
+#define XE2_GFXPIPE_PIPELINE(h)                           (((h) >> 27) & 0x3)   // [28:27]
+#define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)   // [26:24]
+#define XE2_GFXPIPE_SUBOPCODE(h)                          (((h) >> 16) & 0x1FF) // [23:16]
 
 // memirq page geometry. The source-report page sits 0x400 into the shared BO;
 // each status vector is 16 bytes. The GuC's own interrupt sits at bit 25
@@ -1986,7 +1988,10 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
     // depending on it. Length is crucial because on incorrect value we
     // will advance the command buffer with corrupted offset and whole
     // following command processing will explode.
-    rvvm_info("GFX opcode: 0x%x", XE2_GFXPIPE_OPCODE(op));
+    rvvm_info("GFX command (full): 0x%x", op);
+    rvvm_info(" |  opcode:         0x%x", XE2_GFXPIPE_OPCODE(op));
+    rvvm_info(" |  subopcode:      0x%x", XE2_GFXPIPE_SUBOPCODE(op));
+    rvvm_info(" |  pipeline:       0x%x", XE2_GFXPIPE_PIPELINE(op));
     if ((op >> 24) == XE2_PIPE_CONTROL_SIG) {
         rvvm_info("GFX pipe control");
         uint32_t flags = xe2_dma_read_32(xe2, ring, ((i + 1)) * 4);
@@ -2020,6 +2025,21 @@ static uint32_t xe2_ring_cmd(
         case XE2_INSTR_TYPE_GSC:
             rvvm_info("GSC opcode: 0x%x", op);
             return (op & 0xFF) + 2;
+        // Undocumented in kernel & Mesa command type. As per
+        // $ https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/intel/genxml/xe2.xml?ref_type=heads
+        // this command type use only one kind of instruction.
+        //
+        // <instruction name="RESOURCE_BARRIER" bias="2" length="5" engine="render|compute">
+        //   <field name="DWord Length" dword="0" bits="7:0" type="uint" default="3" />
+        //   <field name="Predicate Enable" dword="0" bits="24:24" type="bool" />
+        //   <field name="Opcode" dword="0" bits="28:26" type="uint" default="3">
+        //     <value name="RESOURCE_BARRIER" value="3" />
+        //   </field>
+        //   <field name="Command Type" dword="0" bits="31:29" type="uint" default="5" />
+        //   <field name="Resource Barrier Body" dword="1" bits="127:0" type="RESOURCE_BARRIER_BODY" />
+        // </instruction>
+        case 0x05: // Resource barrier
+            return 1;
         default:
             rvvm_fatal("Unknown instruction type: %u", XE2_INSTR_TYPE(op));
             return 0;
