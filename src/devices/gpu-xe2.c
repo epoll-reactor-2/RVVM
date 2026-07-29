@@ -1216,6 +1216,10 @@ typedef struct {
     uint8_t  type;
 } xe2_dma_addr_t;
 
+// Power-related registers. Used to handle
+// - PP  (Panel power)
+// - PCH (Panel controller hub)
+// in the same way.
 typedef struct {
     uint32_t    control;
     uint32_t    status;
@@ -1235,6 +1239,78 @@ typedef struct {
     // Monotonic render-engine completion seqno, published at the LRC status page.
     uint32_t       seqno;
 } xe2_submit_ctx_t;
+
+typedef struct {
+    uint32_t       actions_h2g[4];
+    uint32_t       actions_g2h[4];
+
+    xe2_dma_addr_t memirq_status_addr;
+    xe2_dma_addr_t memirq_source_addr;
+    uint32_t       memirq_base_ggtt;
+    xe2_dma_addr_t ctb_h2g_addr;
+    size_t         ctb_h2g_size;
+    xe2_dma_addr_t ctb_g2h_addr;
+    size_t         ctb_g2h_size;
+    xe2_dma_addr_t ctb_h2g_descriptor_addr;
+    xe2_dma_addr_t ctb_g2h_descriptor_addr;
+
+    // GuC-to-host interrupt latch. The driver wires MSI-X vector 0 to the
+    // register-based top-level handler, which walks DG1_MSTR_TILE_INTR ->
+    // GFX_MSTR_IRQ -> GT_INTR_DW -> INTR_IDENTITY_REG to find the source.
+    // Latch a pending GuC interrupt and surface it through that chain.
+    bool           irq_pending;
+
+    // SLPC (GT frequency) shared-data BO, supplied with the SLPC reset
+    // request. The host publishes the running state and frequency caps here
+    // so the driver's GuC-PC start handshake completes.
+    xe2_dma_addr_t slpc_data_addr;
+    bool           slpc_data_valid;
+
+    // Latched once the driver asks the GuC to authenticate the HuC firmware.
+    // Surfaced through HUC_KERNEL_LOAD_INFO, which the driver polls.
+    bool           huc_authenticated;
+} xe2_guc_t;
+
+typedef struct {
+    uint32_t int_ctl;            // GEN11_DISPLAY_INT_CTL (enable bit).
+
+    // Per-pipe Display-Engine interrupt registers.
+    uint32_t imr[XE2_PIPE_COUNT]; // 1 = masked.
+    uint32_t ier[XE2_PIPE_COUNT]; // 1 = enabled.
+    uint32_t iir[XE2_PIPE_COUNT]; // Pending bits (write-1-to-clear).
+    uint32_t isr[XE2_PIPE_COUNT]; // Raw status read-back storage.
+
+    uint32_t frmcount[XE2_PIPE_COUNT];       // Per-pipe frame counter.
+    uint32_t pipe_regs_shadow[0x2000 / 4];   // 0x60000–0x61FFF
+    uint32_t plane_regs_shadow[0x8000 / 4];  // 0x70000–0x77FFF
+
+    uint32_t dp_tp_status;
+
+    // Scanout state of pipe A, plane 1 (the universal plane fbcon drives).
+    // Captured from the driver's plane register writes; consumed by the
+    // refresh tick to blit guest framebuffer memory onto the host window.
+    uint32_t plane_ctl;    // PLANE_CTL_1_A    (enable bit, format, tiling)
+    uint32_t plane_stride; // PLANE_STRIDE_1_A (line stride in units of 64 bytes)
+    uint32_t plane_size;   // PLANE_SIZE_1_A   ((height-1)<<16 | (width-1))
+    uint32_t plane_surf;   // PLANE_SURF_1_A   (surface base, GGTT byte offset)
+} xe2_display_t;
+
+typedef struct {
+    // These sizes come from firmware blob.
+    uint8_t main  [0x470C];
+    uint8_t pipe_a[0x2864];
+    uint8_t pipe_b[0x2D5C];
+    uint8_t pipe_c[0x07D8];
+    uint8_t pipe_d[0x07D8];
+
+    uint32_t main_loaded;
+    uint32_t pipe_a_loaded;
+    uint32_t pipe_b_loaded;
+    uint32_t pipe_c_loaded;
+    uint32_t pipe_d_loaded;
+
+    uint32_t dmc_base;
+} xe2_firmware_t;
 
 typedef struct {
     rvvm_pci_func_t *pci_func;
@@ -1273,60 +1349,9 @@ typedef struct {
 
     xe2_submit_ctx_t ctx[XE2_MAX_CONTEXTS];
 
-    struct {
-        uint32_t       actions_h2g[4];
-        uint32_t       actions_g2h[4];
-
-        xe2_dma_addr_t memirq_status_addr;
-        xe2_dma_addr_t memirq_source_addr;
-        uint32_t       memirq_base_ggtt;
-        xe2_dma_addr_t ctb_h2g_addr;
-        size_t         ctb_h2g_size;
-        xe2_dma_addr_t ctb_g2h_addr;
-        size_t         ctb_g2h_size;
-        xe2_dma_addr_t ctb_h2g_descriptor_addr;
-        xe2_dma_addr_t ctb_g2h_descriptor_addr;
-
-        // GuC-to-host interrupt latch. The driver wires MSI-X vector 0 to the
-        // register-based top-level handler, which walks DG1_MSTR_TILE_INTR ->
-        // GFX_MSTR_IRQ -> GT_INTR_DW -> INTR_IDENTITY_REG to find the source.
-        // Latch a pending GuC interrupt and surface it through that chain.
-        bool           irq_pending;
-
-        // SLPC (GT frequency) shared-data BO, supplied with the SLPC reset
-        // request. The host publishes the running state and frequency caps here
-        // so the driver's GuC-PC start handshake completes.
-        xe2_dma_addr_t slpc_data_addr;
-        bool           slpc_data_valid;
-
-        // Latched once the driver asks the GuC to authenticate the HuC firmware.
-        // Surfaced through HUC_KERNEL_LOAD_INFO, which the driver polls.
-        bool           huc_authenticated;
-    } guc;
-
-    struct {
-        uint32_t int_ctl;            // GEN11_DISPLAY_INT_CTL (enable bit).
-
-        // Per-pipe Display-Engine interrupt registers.
-        uint32_t imr[XE2_PIPE_COUNT]; // 1 = masked.
-        uint32_t ier[XE2_PIPE_COUNT]; // 1 = enabled.
-        uint32_t iir[XE2_PIPE_COUNT]; // Pending bits (write-1-to-clear).
-        uint32_t isr[XE2_PIPE_COUNT]; // Raw status read-back storage.
-
-        uint32_t frmcount[XE2_PIPE_COUNT];       // Per-pipe frame counter.
-        uint32_t pipe_regs_shadow[0x2000 / 4];   // 0x60000–0x61FFF
-        uint32_t plane_regs_shadow[0x8000 / 4];  // 0x70000–0x77FFF
-
-        uint32_t dp_tp_status;
-
-        // Scanout state of pipe A, plane 1 (the universal plane fbcon drives).
-        // Captured from the driver's plane register writes; consumed by the
-        // refresh tick to blit guest framebuffer memory onto the host window.
-        uint32_t plane_ctl;    // PLANE_CTL_1_A    (enable bit, format, tiling)
-        uint32_t plane_stride; // PLANE_STRIDE_1_A (line stride in units of 64 bytes)
-        uint32_t plane_size;   // PLANE_SIZE_1_A   ((height-1)<<16 | (width-1))
-        uint32_t plane_surf;   // PLANE_SURF_1_A   (surface base, GGTT byte offset)
-    } display;
+    xe2_guc_t guc;
+    xe2_display_t display;
+    xe2_firmware_t firmware;
 
     // Host display device. NULL when running headless (-nogui / -nogpu display).
     rvvm_fbdev_t *fbdev;
@@ -1341,29 +1366,20 @@ typedef struct {
 
     uint8_t     *vram;
 
-    struct {
-        // These sizes come from firmware blob.
-        uint8_t main  [0x470C];
-        uint8_t pipe_a[0x2864];
-        uint8_t pipe_b[0x2D5C];
-        uint8_t pipe_c[0x07D8];
-        uint8_t pipe_d[0x07D8];
-
-        uint32_t main_loaded;
-        uint32_t pipe_a_loaded;
-        uint32_t pipe_b_loaded;
-        uint32_t pipe_c_loaded;
-        uint32_t pipe_d_loaded;
-
-        uint32_t dmc_base;
-    } firmware;
-
     // The DMC loader writes a per-firmware list of (register, value) pairs and
     // later verifies the registers read back those values. Shadow the two DMC
     // register windows so those writes stick. These hold no other state.
     uint8_t dmc_mmio_5f[0x1000]; // 0x5F000..0x5FFFF (pipe DMCs)
     uint8_t dmc_mmio_8f[0x1000]; // 0x8F000..0x8FFFF (main DMC)
 } xe2_dev_t;
+
+
+
+// -----------------------------------------------------------
+// Utilities, handy functions
+// -----------------------------------------------------------
+
+
 
 // Encoded configuration:
 // | Block 0, Base EDID:
@@ -1446,19 +1462,6 @@ static uint32_t xe2_spi_read32(xe2_dev_t *xe2)
     return word;
 }
 
-// Map a DMC register-window offset to its backing shadow byte, or NULL if the
-// offset lies outside both windows. Used so DMC loader writes read back.
-static inline uint8_t *xe2_dmc_shadow(xe2_dev_t *xe2, size_t offset)
-{
-    if (offset >= 0x5F000 && offset < sizeof(xe2->dmc_mmio_5f) + 0x5F000) {
-        return &xe2->dmc_mmio_5f[offset - 0x5F000];
-    }
-    if (offset >= 0x8F000 && offset < sizeof(xe2->dmc_mmio_8f) + 0x8F000) {
-        return &xe2->dmc_mmio_8f[offset - 0x8F000];
-    }
-    return NULL;
-}
-
 static void xe2_remove(rvvm_reg_dev_t *dev)
 {
     xe2_dev_t *xe2 = rvvm_region_data(dev);
@@ -1476,6 +1479,14 @@ static void xe2_remove_vram(rvvm_reg_dev_t *dev)
 {
     UNUSED(dev);
 }
+
+
+
+// -----------------------------------------------------------
+// Display scanout
+// -----------------------------------------------------------
+
+
 
 // Bits of a pipe's DE_PIPE interrupt that are currently live, i.e. pending,
 // enabled and not masked.
@@ -1642,6 +1653,14 @@ static void xe2_update(rvvm_reg_dev_t *dev)
     }
 }
 
+
+
+// -----------------------------------------------------------
+// Memory model (GGTT, PPGTT, DMA)
+// -----------------------------------------------------------
+
+
+
 static inline void xe2_ggtt_mmio_write(xe2_dev_t *xe2, uint32_t offset, uint32_t value)
 {
     uint64_t idx = (offset - XE2_GGTT_MMIO_BASE) / 8;
@@ -1806,6 +1825,13 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t *xe2, rvvm_addr_t pdp
 }
 
 
+
+// -----------------------------------------------------------
+// GuC controller (MMIO/CTB)
+// -----------------------------------------------------------
+
+
+
 static inline uint32_t xe2_guc_action_self_cfg(xe2_dev_t *xe2, uint32_t *actions)
 {
     uint32_t key = xe2_reg_field_get(xe2_reg_genmask(31, 16), actions[1]);
@@ -1889,10 +1915,10 @@ static inline void xe2_guc_action(xe2_dev_t *xe2, uint32_t *h2g, uint32_t *g2h)
     uint32_t arg = 0U;
 
     // GuC reports addresses of CTB, CTB descriptor (for both directions)
-    rvvm_info("GUC action (request):      %08x", h2g[0]);
-    rvvm_info("GUC action (key | len):    %08x", h2g[1]);
-    rvvm_info("GUC action (value hi):     %08x", h2g[2]);
-    rvvm_info("GUC action (value lo):     %08x", h2g[3]);
+    // rvvm_info("GUC action (request):      %08x", h2g[0]);
+    // rvvm_info("GUC action (key | len):    %08x", h2g[1]);
+    // rvvm_info("GUC action (value hi):     %08x", h2g[2]);
+    // rvvm_info("GUC action (value lo):     %08x", h2g[3]);
 
     switch (h2g[0]) {
         case XE2_GUC_ACTION_GET_HWCONFIG: {
@@ -1991,6 +2017,14 @@ static void xe2_guc_g2h_event(xe2_dev_t *xe2, uint32_t action,
     xe2_guc_g2h_push(xe2, 0, hxg, n + 1);
 }
 
+
+
+// -----------------------------------------------------------
+// Logical Ring Context (LRC), GPU commands processing
+// -----------------------------------------------------------
+
+
+
 // Read a dword from the registered context's LRC register state.
 static inline uint32_t xe2_lrc_reg_read(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, uint32_t idx)
 {
@@ -2087,23 +2121,23 @@ static inline uint32_t xe2_ring_mi_cmd(
             return 1;
         case XE2_MI_OP_STORE_DATA_IMM:
             if (op & XE2_MI_SDI_GGTT) {
-                uint32_t a = xe2_dma_read_32(xe2, ring, ((i + 1)) * 4);
-                uint32_t v = xe2_dma_read_32(xe2, ring, ((i + 3)) * 4);
+                uint32_t a = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, (i + 3) * 4);
                 xe2_ring_store(xe2, a, v);
             }
             return (op & 0x3FF) + 2;
         case XE2_MI_OP_FLUSH_DW:
             if (op & XE2_MI_FLUSH_DW_OP_STOREDW) {
-                uint32_t a = xe2_dma_read_32(xe2, ring, ((i + 1)) * 4);
-                uint32_t v = xe2_dma_read_32(xe2, ring, ((i + 3)) * 4);
+                uint32_t a = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, (i + 3) * 4);
                 if (a & XE2_MI_FLUSH_DW_USE_GTT) {
                     xe2_ring_store(xe2, a & ~0x7U, v);
                 }
             }
             return (op & 0x3F) + 2;
         case XE2_MI_OP_BATCH_BUFFER_START: {
-            uint32_t lo = xe2_dma_read_32(xe2, ring, ((i + 1)) * 4);
-            uint32_t hi = xe2_dma_read_32(xe2, ring, ((i + 2)) * 4);
+            uint32_t lo = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
+            uint32_t hi = xe2_dma_read_32(xe2, ring, (i + 2) * 4);
             rvvm_addr_t bo = xe2_concat_lohi(lo, hi);
             return xe2_mi_cmd_batch_buffer_start(xe2, pdp4, op, bo, user_int);
         }
@@ -2121,11 +2155,11 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
     switch (XE2_GFXPIPE_OPCODES_MASKED(op)) {
         case XE2_GFXPIPE_CMD_PIPE_CONTROL: {
             rvvm_info("GFX pipe control");
-            uint32_t flags = xe2_dma_read_32(xe2, ring, ((i + 1)) * 4);
+            uint32_t flags = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
             if ((flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_QW_WRITE) &&
                 (flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_GLOBAL_GTT)) {
-                uint32_t a = xe2_dma_read_32(xe2, ring, ((i + 2)) * 4);
-                uint32_t v = xe2_dma_read_32(xe2, ring, ((i + 4)) * 4);
+                uint32_t a = xe2_dma_read_32(xe2, ring, (i + 2) * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, (i + 4) * 4);
                 xe2_ring_store(xe2, a, v);
             }
             break;
@@ -2133,6 +2167,23 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
         case XE2_GFXPIPE_CMD_3DSTATE_GS:
             rvvm_info("GFX: 3DSTATE Graphics shader caught");
             break;
+        case XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BUFFER: {
+            // 3DSTATE_DEPTH_BUFFER[0]: 0x33401dff
+            // 3DSTATE_DEPTH_BUFFER[1]: 0xfec00000
+            // 3DSTATE_DEPTH_BUFFER[2]: 0xfffffffe
+            // 3DSTATE_DEPTH_BUFFER[3]: 0x86e0efe
+            // 3DSTATE_DEPTH_BUFFER[4]: 0x2
+            // 3DSTATE_DEPTH_BUFFER[5]: 0xc4000000
+            // 3DSTATE_DEPTH_BUFFER[6]: 0x10e
+            rvvm_info("3DSTATE_DEPTH_BUFFER[0]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 1) * 4));
+            rvvm_info("3DSTATE_DEPTH_BUFFER[1]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 2) * 4));
+            rvvm_info("3DSTATE_DEPTH_BUFFER[2]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 3) * 4));
+            rvvm_info("3DSTATE_DEPTH_BUFFER[3]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 4) * 4));
+            rvvm_info("3DSTATE_DEPTH_BUFFER[4]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 5) * 4));
+            rvvm_info("3DSTATE_DEPTH_BUFFER[5]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 6) * 4));
+            rvvm_info("3DSTATE_DEPTH_BUFFER[6]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 7) * 4));
+            break;
+        }
     }
 
     return (op & 0xFF) + 2;
@@ -2215,15 +2266,18 @@ static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
     return user_int;
 }
 
+
+
+// -----------------------------------------------------------
+// Context registration & processing
+// -----------------------------------------------------------
+
+
+
 // Complete render-engine work. Replay the ring's seqno stores, then post an rcs0
 // user interrupt via the memory-based interrupt pages whose GGTT locations the
 // driver baked into the LRC register state, so it wakes, reads the seqno and
 // signals the job fence.
-//
-// We must needs discern by what manner timestamp and seqno do pass one unto
-// the other. The driver doth commit the timestamp by means of a fashioned
-// batch of MI commands and/or LRC DMA, and thereafter doth read it back
-// through the selfsame DMA.
 static void xe2_signal_job_completion(xe2_dev_t *xe2, size_t context_idx)
 {
     xe2_submit_ctx_t *ctx = &xe2->ctx[context_idx];
@@ -2389,7 +2443,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
         uint32_t type   = xe2_reg_field_get(XE2_GUC_HXG_MSG_0_TYPE, msg[0]);
         uint32_t action = xe2_reg_field_get(XE2_GUC_HXG_MSG_0_ACTION, msg[0]);
 
-        rvvm_info("GuC CT: action=0x%x type=%u fence=0x%x (%u) dwords=%u", action, type, fence, fence, num_dwords);
+        // rvvm_info("GuC CT: action=0x%x type=%u fence=0x%x (%u) dwords=%u", action, type, fence, fence, num_dwords);
 
         switch (action) {
             // Note that context ID = GuC ID.
@@ -2476,6 +2530,14 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
     // true submission signal and leaves concurrent CT exchanges untouched.
     xe2_complete_advanced_contexts(xe2);
 }
+
+
+
+// -----------------------------------------------------------
+// DisplayPort configuration
+// -----------------------------------------------------------
+
+
 
 // Pack an AUX reply: a leading ACK header byte (0x00) followed by the payload,
 // big-endian within each of the five 32-bit AUX data registers (the same byte
@@ -2649,6 +2711,14 @@ static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
     xe2_dpcd_aux_config(address, request, payload_size, aux);
 }
 
+
+
+// -----------------------------------------------------------
+// Cx0 PHY
+// -----------------------------------------------------------
+
+
+
 // Apply a committed Cx0 register write that targets the indirect SRAM access
 // registers. Staging registers latch their bytes; a committed write to the
 // write-data low byte performs the actual 16-bit SRAM store.
@@ -2736,6 +2806,14 @@ static inline void xe2_cx0_msgbus_transaction(xe2_cx0_lane_t *lane, uint32_t cmd
     }
 }
 
+
+
+// -----------------------------------------------------------
+// MMIO read/write handlers
+// -----------------------------------------------------------
+
+
+
 static inline bool xe2_skip_mmio_range(size_t offset)
 {
     return 1;
@@ -2761,6 +2839,20 @@ static inline bool xe2_skip_mmio_range(size_t offset)
     skip |= offset == 0x70000;
     return skip;
 }
+
+// Map a DMC register-window offset to its backing shadow byte, or NULL if the
+// offset lies outside both windows. Used so DMC loader writes read back.
+static inline uint8_t *xe2_dmc_shadow(xe2_dev_t *xe2, size_t offset)
+{
+    if (offset >= 0x5F000 && offset < sizeof(xe2->dmc_mmio_5f) + 0x5F000) {
+        return &xe2->dmc_mmio_5f[offset - 0x5F000];
+    }
+    if (offset >= 0x8F000 && offset < sizeof(xe2->dmc_mmio_8f) + 0x8F000) {
+        return &xe2->dmc_mmio_8f[offset - 0x8F000];
+    }
+    return NULL;
+}
+
 
 static void xe2_mmio_read(rvvm_reg_dev_t *dev, void *data, size_t size, size_t offset)
 {
@@ -3753,7 +3845,6 @@ static void xe2_mmio_write(rvvm_reg_dev_t *dev, const void *data, size_t size, s
             xe2_guc_host_interrupt(xe2);
             break;
 
-        // This is not called at all.
         case XE2_REG_HW_ENGINE_RING_START(XE2_HW_ENGINE_RENDER_RING_BASE):
             rvvm_info("Write ring start: HW engine renderer: 0x%x", read_uint32_le(data));
             break;
