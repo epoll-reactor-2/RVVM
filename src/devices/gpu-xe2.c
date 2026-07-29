@@ -10,7 +10,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_pci.h>
 #include <rvvm/rvvm_fb.h>
+#include <stdint.h>
 #include "mem_ops.h"
+#include "rvtimer.h"
 #include "spinlock.h"
 #include "utils.h"
 #include "bit_ops.h"
@@ -962,122 +964,135 @@ INTEL_DEBUG=bat glmark2-es2-drm
 //
 // We ignore pipeline field for simplicity now. Probably there is no
 // command which indicies could clatch with other instruction.
-#define XE2_GFXPIPE_PIPELINE(h)                           (((h) >> 27) & 0x3)   // [28:27]
-#define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)   // [26:24]
-#define XE2_GFXPIPE_SUBOPCODE(h)                          (((h) >> 16) & 0x1FF) // [23:16]
-// Mask [26:16] dedicated for opcode + subopcode pair.
-#define XE2_GFXPIPE_OPCODES_MASKED(h)                     (h & 0x7FF0000)
+#define XE2_GFXPIPE_PIPELINE(h)                           (((h) >> 27) & 0x3)  // [28:27]
+#define XE2_GFXPIPE_OPCODE(h)                             (((h) >> 24) & 0x7)  // [26:24]
+#define XE2_GFXPIPE_SUBOPCODE(h)                          (((h) >> 16) & 0xFF) // [23:16]
+#define XE2_GFXPIPE_PIPELINE_COMMON                       0x00
+#define XE2_GFXPIPE_PIPELINE_SINGLE_DW                    0x01
+#define XE2_GFXPIPE_PIPELINE_COMPUTE                      0x02
+#define XE2_GFXPIPE_PIPELINE_3D                           0x03
+// Mask [28:16] dedicated for pipeline + opcode + subopcode triplet.
+#define XE2_GFXPIPE_OPCODES_MASKED(h)                     (h & 0x1FFF0000)
 // [28:27] - 3D command pipeline (common/single DW/compute/3D).
 // [26:24] - 3D command opcode.
 // [23:16] - 3D command subopcode.
-#define XE2_GFXPIPE_CMD(op, subop)                         ((op & 0x7) << 24 | (subop & 0x1FF) << 16)
-#define XE2_GFXPIPE_CMD_PIPE_CONTROL                       XE2_GFXPIPE_CMD(0x2, 0x0)
+#define XE2_GFXPIPE_CMD(pipeline, op, subop)               ((pipeline & 0x3) << 27 | (op & 0x7) << 24 | (subop & 0xFF) << 16)
+#define XE2_GFXPIPE_CMD_3D(op, subop)                      XE2_GFXPIPE_CMD(XE2_GFXPIPE_PIPELINE_3D, op, subop)
+#define XE2_GFXPIPE_CMD_COMMON(op, subop)                  XE2_GFXPIPE_CMD(XE2_GFXPIPE_PIPELINE_COMMON, op, subop)
+#define XE2_GFXPIPE_CMD_STATE_BASE_ADDRESS                 XE2_GFXPIPE_CMD_COMMON(0x1, 0x1)
+#define XE2_GFXPIPE_CMD_STATE_SIP                          XE2_GFXPIPE_CMD_COMMON(0x1, 0x2)
+#define XE2_GFXPIPE_CMD_GPGPU_CSR_BASE_ADDRESS             XE2_GFXPIPE_CMD_COMMON(0x1, 0x4)
+#define XE2_GFXPIPE_CMD_STATE_COMPUTE_MODE                 XE2_GFXPIPE_CMD_COMMON(0x1, 0x5)
+#define XE2_GFXPIPE_CMD_3DSTATE_BTD                        XE2_GFXPIPE_CMD_COMMON(0x1, 0x6)
+#define XE2_GFXPIPE_CMD_STATE_SYSTEM_MEM_FENCE_ADDRESS     XE2_GFXPIPE_CMD_COMMON(0x1, 0x9)
+#define XE2_GFXPIPE_CMD_STATE_CONTEXT_DATA_BASE_ADDRESS    XE2_GFXPIPE_CMD_COMMON(0x1, 0xB)
+#define XE2_GFXPIPE_CMD_PIPE_CONTROL                       XE2_GFXPIPE_CMD_3D(0x2, 0x0)
 #define XE2_GFXPIPE_CMD_PIPE_CONTROL_QW_WRITE              xe2_reg_bit(14)
 #define XE2_GFXPIPE_CMD_PIPE_CONTROL_GLOBAL_GTT            xe2_reg_bit(24)
-#define XE2_GFXPIPE_CMD_3DSTATE_DRAWING_RECTANGLE_FAST     XE2_GFXPIPE_CMD(0x0, 0x00)
-#define XE2_GFXPIPE_CMD_3DSTATE_CLEAR_PARAMS               XE2_GFXPIPE_CMD(0x0, 0x04)
-#define XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BUFFER               XE2_GFXPIPE_CMD(0x0, 0x05)
-#define XE2_GFXPIPE_CMD_3DSTATE_STENCIL_BUFFER             XE2_GFXPIPE_CMD(0x0, 0x06)
-#define XE2_GFXPIPE_CMD_3DSTATE_HIER_DEPTH_BUFFER          XE2_GFXPIPE_CMD(0x0, 0x07)
-#define XE2_GFXPIPE_CMD_3DSTATE_VERTEX_BUFFERS             XE2_GFXPIPE_CMD(0x0, 0x08)
-#define XE2_GFXPIPE_CMD_3DSTATE_VERTEX_ELEMENTS            XE2_GFXPIPE_CMD(0x0, 0x09)
-#define XE2_GFXPIPE_CMD_3DSTATE_INDEX_BUFFER               XE2_GFXPIPE_CMD(0x0, 0x0A)
-#define XE2_GFXPIPE_CMD_3DSTATE_VF                         XE2_GFXPIPE_CMD(0x0, 0x0C)
-#define XE2_GFXPIPE_CMD_3DSTATE_MULTISAMPLE                XE2_GFXPIPE_CMD(0x0, 0x0D)
-#define XE2_GFXPIPE_CMD_3DSTATE_CC_STATE_POINTERS          XE2_GFXPIPE_CMD(0x0, 0x0E)
-#define XE2_GFXPIPE_CMD_3DSTATE_SCISSOR_STATE_POINTERS     XE2_GFXPIPE_CMD(0x0, 0x0F)
-#define XE2_GFXPIPE_CMD_3DSTATE_VS                         XE2_GFXPIPE_CMD(0x0, 0x10)
-#define XE2_GFXPIPE_CMD_3DSTATE_GS                         XE2_GFXPIPE_CMD(0x0, 0x11)
-#define XE2_GFXPIPE_CMD_3DSTATE_CLIP                       XE2_GFXPIPE_CMD(0x0, 0x12)
-#define XE2_GFXPIPE_CMD_3DSTATE_SF                         XE2_GFXPIPE_CMD(0x0, 0x13)
-#define XE2_GFXPIPE_CMD_3DSTATE_WM                         XE2_GFXPIPE_CMD(0x0, 0x14)
-#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_VS                XE2_GFXPIPE_CMD(0x0, 0x15)
-#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_GS                XE2_GFXPIPE_CMD(0x0, 0x16)
-#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_PS                XE2_GFXPIPE_CMD(0x0, 0x17)
-#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLE_MASK                XE2_GFXPIPE_CMD(0x0, 0x18)
-#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_HS                XE2_GFXPIPE_CMD(0x0, 0x19)
-#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_DS                XE2_GFXPIPE_CMD(0x0, 0x1A)
-#define XE2_GFXPIPE_CMD_3DSTATE_HS                         XE2_GFXPIPE_CMD(0x0, 0x1B)
-#define XE2_GFXPIPE_CMD_3DSTATE_TE                         XE2_GFXPIPE_CMD(0x0, 0x1C)
-#define XE2_GFXPIPE_CMD_3DSTATE_DS                         XE2_GFXPIPE_CMD(0x0, 0x1D)
-#define XE2_GFXPIPE_CMD_3DSTATE_STREAMOUT                  XE2_GFXPIPE_CMD(0x0, 0x1E)
-#define XE2_GFXPIPE_CMD_3DSTATE_SBE                        XE2_GFXPIPE_CMD(0x0, 0x1F)
-#define XE2_GFXPIPE_CMD_3DSTATE_PS                         XE2_GFXPIPE_CMD(0x0, 0x20)
-#define XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP XE2_GFXPIPE_CMD(0x0, 0x21)
-#define XE2_GFXPIPE_CMD_3DSTATE_CPS_POINTERS               XE2_GFXPIPE_CMD(0x0, 0x22)
-#define XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_POINTERS_CC XE2_GFXPIPE_CMD(0x0, 0x23)
-#define XE2_GFXPIPE_CMD_3DSTATE_BLEND_STATE_POINTERS       XE2_GFXPIPE_CMD(0x0, 0x24)
-#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_VS  XE2_GFXPIPE_CMD(0x0, 0x26)
-#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_HS  XE2_GFXPIPE_CMD(0x0, 0x27)
-#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_DS  XE2_GFXPIPE_CMD(0x0, 0x28)
-#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_GS  XE2_GFXPIPE_CMD(0x0, 0x29)
-#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_PS  XE2_GFXPIPE_CMD(0x0, 0x2A)
-#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_VS  XE2_GFXPIPE_CMD(0x0, 0x2B)
-#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_HS  XE2_GFXPIPE_CMD(0x0, 0x2C)
-#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_DS  XE2_GFXPIPE_CMD(0x0, 0x2D)
-#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_GS  XE2_GFXPIPE_CMD(0x0, 0x2E)
-#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_PS  XE2_GFXPIPE_CMD(0x0, 0x2F)
-#define XE2_GFXPIPE_CMD_3DSTATE_VF_INSTANCING              XE2_GFXPIPE_CMD(0x0, 0x49)
-#define XE2_GFXPIPE_CMD_3DSTATE_VF_SGVS                    XE2_GFXPIPE_CMD(0x0, 0x4A)
-#define XE2_GFXPIPE_CMD_3DSTATE_VF_TOPOLOGY                XE2_GFXPIPE_CMD(0x0, 0x4B)
-#define XE2_GFXPIPE_CMD_3DSTATE_WM_CHROMAKEY               XE2_GFXPIPE_CMD(0x0, 0x4C)
-#define XE2_GFXPIPE_CMD_3DSTATE_PS_BLEND                   XE2_GFXPIPE_CMD(0x0, 0x4D)
-#define XE2_GFXPIPE_CMD_3DSTATE_WM_DEPTH_STENCIL           XE2_GFXPIPE_CMD(0x0, 0x4E)
-#define XE2_GFXPIPE_CMD_3DSTATE_PS_EXTRA                   XE2_GFXPIPE_CMD(0x0, 0x4F)
-#define XE2_GFXPIPE_CMD_3DSTATE_RASTER                     XE2_GFXPIPE_CMD(0x0, 0x50)
-#define XE2_GFXPIPE_CMD_3DSTATE_SBE_SWIZ                   XE2_GFXPIPE_CMD(0x0, 0x51)
-#define XE2_GFXPIPE_CMD_3DSTATE_WM_HZ_OP                   XE2_GFXPIPE_CMD(0x0, 0x52)
-#define XE2_GFXPIPE_CMD_3DSTATE_VF_COMPONENT_PACKING       XE2_GFXPIPE_CMD(0x0, 0x55)
-#define XE2_GFXPIPE_CMD_3DSTATE_VF_SGVS_2                  XE2_GFXPIPE_CMD(0x0, 0x56)
-#define XE2_GFXPIPE_CMD_3DSTATE_VFG                        XE2_GFXPIPE_CMD(0x0, 0x57)
-#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_VS               XE2_GFXPIPE_CMD(0x0, 0x58)
-#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_HS               XE2_GFXPIPE_CMD(0x0, 0x59)
-#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_DS               XE2_GFXPIPE_CMD(0x0, 0x5A)
-#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_GS               XE2_GFXPIPE_CMD(0x0, 0x5B)
-#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_0          XE2_GFXPIPE_CMD(0x0, 0x60)
-#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_1          XE2_GFXPIPE_CMD(0x0, 0x61)
-#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_2          XE2_GFXPIPE_CMD(0x0, 0x62)
-#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_3          XE2_GFXPIPE_CMD(0x0, 0x63)
-#define XE2_GFXPIPE_CMD_3DSTATE_PRIMITIVE_REPLICATION      XE2_GFXPIPE_CMD(0x0, 0x6C)
-#define XE2_GFXPIPE_CMD_3DSTATE_TBIMR_TILE_PASS_INFO       XE2_GFXPIPE_CMD(0x0, 0x6E)
-#define XE2_GFXPIPE_CMD_3DSTATE_AMFS                       XE2_GFXPIPE_CMD(0x0, 0x6F)
-#define XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BOUNDS               XE2_GFXPIPE_CMD(0x0, 0x71)
-#define XE2_GFXPIPE_CMD_3DSTATE_AMFS_TEXTURE_POINTERS      XE2_GFXPIPE_CMD(0x0, 0x72)
-#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_TS_POINTER        XE2_GFXPIPE_CMD(0x0, 0x73)
-#define XE2_GFXPIPE_CMD_3DSTATE_MESH_CONTROL               XE2_GFXPIPE_CMD(0x0, 0x77)
-#define XE2_GFXPIPE_CMD_3DSTATE_MESH_DISTRIB               XE2_GFXPIPE_CMD(0x0, 0x78)
-#define XE2_GFXPIPE_CMD_3DSTATE_TASK_REDISTRIB             XE2_GFXPIPE_CMD(0x0, 0x79)
-#define XE2_GFXPIPE_CMD_3DSTATE_MESH_SHADER                XE2_GFXPIPE_CMD(0x0, 0x7A)
-#define XE2_GFXPIPE_CMD_3DSTATE_MESH_SHADER_DATA           XE2_GFXPIPE_CMD(0x0, 0x7B)
-#define XE2_GFXPIPE_CMD_3DSTATE_TASK_CONTROL               XE2_GFXPIPE_CMD(0x0, 0x7C)
-#define XE2_GFXPIPE_CMD_3DSTATE_TASK_SHADER                XE2_GFXPIPE_CMD(0x0, 0x7D)
-#define XE2_GFXPIPE_CMD_3DSTATE_TASK_SHADER_DATA           XE2_GFXPIPE_CMD(0x0, 0x7E)
-#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_MESH             XE2_GFXPIPE_CMD(0x0, 0x7F)
-#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_TASK             XE2_GFXPIPE_CMD(0x0, 0x80)
-#define XE2_GFXPIPE_CMD_3DSTATE_CLIP_MESH                  XE2_GFXPIPE_CMD(0x0, 0x81)
-#define XE2_GFXPIPE_CMD_3DSTATE_SBE_MESH                   XE2_GFXPIPE_CMD(0x0, 0x82)
-#define XE2_GFXPIPE_CMD_3DSTATE_CPSIZE_CONTROL_BUFFER      XE2_GFXPIPE_CMD(0x0, 0x83)
-#define XE2_GFXPIPE_CMD_3DSTATE_COARSE_PIXEL               XE2_GFXPIPE_CMD(0x0, 0x89)
-#define XE2_GFXPIPE_CMD_3DSTATE_DRAWING_RECTANGLE          XE2_GFXPIPE_CMD(0x1, 0x00)
-#define XE2_GFXPIPE_CMD_3DSTATE_CHROMA_KEY                 XE2_GFXPIPE_CMD(0x1, 0x04)
-#define XE2_GFXPIPE_CMD_3DSTATE_POLY_STIPPLE_OFFSET        XE2_GFXPIPE_CMD(0x1, 0x06)
-#define XE2_GFXPIPE_CMD_3DSTATE_POLY_STIPPLE_PATTERN       XE2_GFXPIPE_CMD(0x1, 0x07)
-#define XE2_GFXPIPE_CMD_3DSTATE_LINE_STIPPLE               XE2_GFXPIPE_CMD(0x1, 0x08)
-#define XE2_GFXPIPE_CMD_3DSTATE_AA_LINE_PARAMETERS         XE2_GFXPIPE_CMD(0x1, 0x0A)
-#define XE2_GFXPIPE_CMD_3DSTATE_MONOFILTER_SIZE            XE2_GFXPIPE_CMD(0x1, 0x11)
-#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_VS     XE2_GFXPIPE_CMD(0x1, 0x12)
-#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_HS     XE2_GFXPIPE_CMD(0x1, 0x13)
-#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_DS     XE2_GFXPIPE_CMD(0x1, 0x14)
-#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_GS     XE2_GFXPIPE_CMD(0x1, 0x15)
-#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_PS     XE2_GFXPIPE_CMD(0x1, 0x16)
-#define XE2_GFXPIPE_CMD_3DSTATE_SO_DECL_LIST               XE2_GFXPIPE_CMD(0x1, 0x17)
-#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER                  XE2_GFXPIPE_CMD(0x1, 0x18)
-#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POOL_ALLOC   XE2_GFXPIPE_CMD(0x1, 0x19)
-#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLE_PATTERN             XE2_GFXPIPE_CMD(0x1, 0x1C)
-#define XE2_GFXPIPE_CMD_3DSTATE_3D_MODE                    XE2_GFXPIPE_CMD(0x1, 0x1E)
-#define XE2_GFXPIPE_CMD_3DSTATE_SUBSLICE_HASH_TABLE        XE2_GFXPIPE_CMD(0x1, 0x1F)
-#define XE2_GFXPIPE_CMD_3DSTATE_SLICE_TABLE_STATE_POINTERS XE2_GFXPIPE_CMD(0x1, 0x20)
-#define XE2_GFXPIPE_CMD_3DSTATE_PTBR_TILE_PASS_INFO        XE2_GFXPIPE_CMD(0x1, 0x22)
+#define XE2_GFXPIPE_CMD_3DSTATE_DRAWING_RECTANGLE_FAST     XE2_GFXPIPE_CMD_3D(0x0, 0x00)
+#define XE2_GFXPIPE_CMD_3DSTATE_CLEAR_PARAMS               XE2_GFXPIPE_CMD_3D(0x0, 0x04)
+#define XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BUFFER               XE2_GFXPIPE_CMD_3D(0x0, 0x05)
+#define XE2_GFXPIPE_CMD_3DSTATE_STENCIL_BUFFER             XE2_GFXPIPE_CMD_3D(0x0, 0x06)
+#define XE2_GFXPIPE_CMD_3DSTATE_HIER_DEPTH_BUFFER          XE2_GFXPIPE_CMD_3D(0x0, 0x07)
+#define XE2_GFXPIPE_CMD_3DSTATE_VERTEX_BUFFERS             XE2_GFXPIPE_CMD_3D(0x0, 0x08)
+#define XE2_GFXPIPE_CMD_3DSTATE_VERTEX_ELEMENTS            XE2_GFXPIPE_CMD_3D(0x0, 0x09)
+#define XE2_GFXPIPE_CMD_3DSTATE_INDEX_BUFFER               XE2_GFXPIPE_CMD_3D(0x0, 0x0A)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF                         XE2_GFXPIPE_CMD_3D(0x0, 0x0C)
+#define XE2_GFXPIPE_CMD_3DSTATE_MULTISAMPLE                XE2_GFXPIPE_CMD_3D(0x0, 0x0D)
+#define XE2_GFXPIPE_CMD_3DSTATE_CC_STATE_POINTERS          XE2_GFXPIPE_CMD_3D(0x0, 0x0E)
+#define XE2_GFXPIPE_CMD_3DSTATE_SCISSOR_STATE_POINTERS     XE2_GFXPIPE_CMD_3D(0x0, 0x0F)
+#define XE2_GFXPIPE_CMD_3DSTATE_VS                         XE2_GFXPIPE_CMD_3D(0x0, 0x10)
+#define XE2_GFXPIPE_CMD_3DSTATE_GS                         XE2_GFXPIPE_CMD_3D(0x0, 0x11)
+#define XE2_GFXPIPE_CMD_3DSTATE_CLIP                       XE2_GFXPIPE_CMD_3D(0x0, 0x12)
+#define XE2_GFXPIPE_CMD_3DSTATE_SF                         XE2_GFXPIPE_CMD_3D(0x0, 0x13)
+#define XE2_GFXPIPE_CMD_3DSTATE_WM                         XE2_GFXPIPE_CMD_3D(0x0, 0x14)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_VS                XE2_GFXPIPE_CMD_3D(0x0, 0x15)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_GS                XE2_GFXPIPE_CMD_3D(0x0, 0x16)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_PS                XE2_GFXPIPE_CMD_3D(0x0, 0x17)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLE_MASK                XE2_GFXPIPE_CMD_3D(0x0, 0x18)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_HS                XE2_GFXPIPE_CMD_3D(0x0, 0x19)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_DS                XE2_GFXPIPE_CMD_3D(0x0, 0x1A)
+#define XE2_GFXPIPE_CMD_3DSTATE_HS                         XE2_GFXPIPE_CMD_3D(0x0, 0x1B)
+#define XE2_GFXPIPE_CMD_3DSTATE_TE                         XE2_GFXPIPE_CMD_3D(0x0, 0x1C)
+#define XE2_GFXPIPE_CMD_3DSTATE_DS                         XE2_GFXPIPE_CMD_3D(0x0, 0x1D)
+#define XE2_GFXPIPE_CMD_3DSTATE_STREAMOUT                  XE2_GFXPIPE_CMD_3D(0x0, 0x1E)
+#define XE2_GFXPIPE_CMD_3DSTATE_SBE                        XE2_GFXPIPE_CMD_3D(0x0, 0x1F)
+#define XE2_GFXPIPE_CMD_3DSTATE_PS                         XE2_GFXPIPE_CMD_3D(0x0, 0x20)
+#define XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP XE2_GFXPIPE_CMD_3D(0x0, 0x21)
+#define XE2_GFXPIPE_CMD_3DSTATE_CPS_POINTERS               XE2_GFXPIPE_CMD_3D(0x0, 0x22)
+#define XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_POINTERS_CC XE2_GFXPIPE_CMD_3D(0x0, 0x23)
+#define XE2_GFXPIPE_CMD_3DSTATE_BLEND_STATE_POINTERS       XE2_GFXPIPE_CMD_3D(0x0, 0x24)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_VS  XE2_GFXPIPE_CMD_3D(0x0, 0x26)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_HS  XE2_GFXPIPE_CMD_3D(0x0, 0x27)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_DS  XE2_GFXPIPE_CMD_3D(0x0, 0x28)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_GS  XE2_GFXPIPE_CMD_3D(0x0, 0x29)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_PS  XE2_GFXPIPE_CMD_3D(0x0, 0x2A)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_VS  XE2_GFXPIPE_CMD_3D(0x0, 0x2B)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_HS  XE2_GFXPIPE_CMD_3D(0x0, 0x2C)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_DS  XE2_GFXPIPE_CMD_3D(0x0, 0x2D)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_GS  XE2_GFXPIPE_CMD_3D(0x0, 0x2E)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLER_STATE_POINTERS_PS  XE2_GFXPIPE_CMD_3D(0x0, 0x2F)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_INSTANCING              XE2_GFXPIPE_CMD_3D(0x0, 0x49)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_SGVS                    XE2_GFXPIPE_CMD_3D(0x0, 0x4A)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_TOPOLOGY                XE2_GFXPIPE_CMD_3D(0x0, 0x4B)
+#define XE2_GFXPIPE_CMD_3DSTATE_WM_CHROMAKEY               XE2_GFXPIPE_CMD_3D(0x0, 0x4C)
+#define XE2_GFXPIPE_CMD_3DSTATE_PS_BLEND                   XE2_GFXPIPE_CMD_3D(0x0, 0x4D)
+#define XE2_GFXPIPE_CMD_3DSTATE_WM_DEPTH_STENCIL           XE2_GFXPIPE_CMD_3D(0x0, 0x4E)
+#define XE2_GFXPIPE_CMD_3DSTATE_PS_EXTRA                   XE2_GFXPIPE_CMD_3D(0x0, 0x4F)
+#define XE2_GFXPIPE_CMD_3DSTATE_RASTER                     XE2_GFXPIPE_CMD_3D(0x0, 0x50)
+#define XE2_GFXPIPE_CMD_3DSTATE_SBE_SWIZ                   XE2_GFXPIPE_CMD_3D(0x0, 0x51)
+#define XE2_GFXPIPE_CMD_3DSTATE_WM_HZ_OP                   XE2_GFXPIPE_CMD_3D(0x0, 0x52)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_COMPONENT_PACKING       XE2_GFXPIPE_CMD_3D(0x0, 0x55)
+#define XE2_GFXPIPE_CMD_3DSTATE_VF_SGVS_2                  XE2_GFXPIPE_CMD_3D(0x0, 0x56)
+#define XE2_GFXPIPE_CMD_3DSTATE_VFG                        XE2_GFXPIPE_CMD_3D(0x0, 0x57)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_VS               XE2_GFXPIPE_CMD_3D(0x0, 0x58)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_HS               XE2_GFXPIPE_CMD_3D(0x0, 0x59)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_DS               XE2_GFXPIPE_CMD_3D(0x0, 0x5A)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_GS               XE2_GFXPIPE_CMD_3D(0x0, 0x5B)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_0          XE2_GFXPIPE_CMD_3D(0x0, 0x60)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_1          XE2_GFXPIPE_CMD_3D(0x0, 0x61)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_2          XE2_GFXPIPE_CMD_3D(0x0, 0x62)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER_INDEX_3          XE2_GFXPIPE_CMD_3D(0x0, 0x63)
+#define XE2_GFXPIPE_CMD_3DSTATE_PRIMITIVE_REPLICATION      XE2_GFXPIPE_CMD_3D(0x0, 0x6C)
+#define XE2_GFXPIPE_CMD_3DSTATE_TBIMR_TILE_PASS_INFO       XE2_GFXPIPE_CMD_3D(0x0, 0x6E)
+#define XE2_GFXPIPE_CMD_3DSTATE_AMFS                       XE2_GFXPIPE_CMD_3D(0x0, 0x6F)
+#define XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BOUNDS               XE2_GFXPIPE_CMD_3D(0x0, 0x71)
+#define XE2_GFXPIPE_CMD_3DSTATE_AMFS_TEXTURE_POINTERS      XE2_GFXPIPE_CMD_3D(0x0, 0x72)
+#define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_TS_POINTER        XE2_GFXPIPE_CMD_3D(0x0, 0x73)
+#define XE2_GFXPIPE_CMD_3DSTATE_MESH_CONTROL               XE2_GFXPIPE_CMD_3D(0x0, 0x77)
+#define XE2_GFXPIPE_CMD_3DSTATE_MESH_DISTRIB               XE2_GFXPIPE_CMD_3D(0x0, 0x78)
+#define XE2_GFXPIPE_CMD_3DSTATE_TASK_REDISTRIB             XE2_GFXPIPE_CMD_3D(0x0, 0x79)
+#define XE2_GFXPIPE_CMD_3DSTATE_MESH_SHADER                XE2_GFXPIPE_CMD_3D(0x0, 0x7A)
+#define XE2_GFXPIPE_CMD_3DSTATE_MESH_SHADER_DATA           XE2_GFXPIPE_CMD_3D(0x0, 0x7B)
+#define XE2_GFXPIPE_CMD_3DSTATE_TASK_CONTROL               XE2_GFXPIPE_CMD_3D(0x0, 0x7C)
+#define XE2_GFXPIPE_CMD_3DSTATE_TASK_SHADER                XE2_GFXPIPE_CMD_3D(0x0, 0x7D)
+#define XE2_GFXPIPE_CMD_3DSTATE_TASK_SHADER_DATA           XE2_GFXPIPE_CMD_3D(0x0, 0x7E)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_MESH             XE2_GFXPIPE_CMD_3D(0x0, 0x7F)
+#define XE2_GFXPIPE_CMD_3DSTATE_URB_ALLOC_TASK             XE2_GFXPIPE_CMD_3D(0x0, 0x80)
+#define XE2_GFXPIPE_CMD_3DSTATE_CLIP_MESH                  XE2_GFXPIPE_CMD_3D(0x0, 0x81)
+#define XE2_GFXPIPE_CMD_3DSTATE_SBE_MESH                   XE2_GFXPIPE_CMD_3D(0x0, 0x82)
+#define XE2_GFXPIPE_CMD_3DSTATE_CPSIZE_CONTROL_BUFFER      XE2_GFXPIPE_CMD_3D(0x0, 0x83)
+#define XE2_GFXPIPE_CMD_3DSTATE_COARSE_PIXEL               XE2_GFXPIPE_CMD_3D(0x0, 0x89)
+#define XE2_GFXPIPE_CMD_3DSTATE_DRAWING_RECTANGLE          XE2_GFXPIPE_CMD_3D(0x1, 0x00)
+#define XE2_GFXPIPE_CMD_3DSTATE_CHROMA_KEY                 XE2_GFXPIPE_CMD_3D(0x1, 0x04)
+#define XE2_GFXPIPE_CMD_3DSTATE_POLY_STIPPLE_OFFSET        XE2_GFXPIPE_CMD_3D(0x1, 0x06)
+#define XE2_GFXPIPE_CMD_3DSTATE_POLY_STIPPLE_PATTERN       XE2_GFXPIPE_CMD_3D(0x1, 0x07)
+#define XE2_GFXPIPE_CMD_3DSTATE_LINE_STIPPLE               XE2_GFXPIPE_CMD_3D(0x1, 0x08)
+#define XE2_GFXPIPE_CMD_3DSTATE_AA_LINE_PARAMETERS         XE2_GFXPIPE_CMD_3D(0x1, 0x0A)
+#define XE2_GFXPIPE_CMD_3DSTATE_MONOFILTER_SIZE            XE2_GFXPIPE_CMD_3D(0x1, 0x11)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_VS     XE2_GFXPIPE_CMD_3D(0x1, 0x12)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_HS     XE2_GFXPIPE_CMD_3D(0x1, 0x13)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_DS     XE2_GFXPIPE_CMD_3D(0x1, 0x14)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_GS     XE2_GFXPIPE_CMD_3D(0x1, 0x15)
+#define XE2_GFXPIPE_CMD_3DSTATE_PUSH_CONSTANT_ALLOC_PS     XE2_GFXPIPE_CMD_3D(0x1, 0x16)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_DECL_LIST               XE2_GFXPIPE_CMD_3D(0x1, 0x17)
+#define XE2_GFXPIPE_CMD_3DSTATE_SO_BUFFER                  XE2_GFXPIPE_CMD_3D(0x1, 0x18)
+#define XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POOL_ALLOC   XE2_GFXPIPE_CMD_3D(0x1, 0x19)
+#define XE2_GFXPIPE_CMD_3DSTATE_SAMPLE_PATTERN             XE2_GFXPIPE_CMD_3D(0x1, 0x1C)
+#define XE2_GFXPIPE_CMD_3DSTATE_3D_MODE                    XE2_GFXPIPE_CMD_3D(0x1, 0x1E)
+#define XE2_GFXPIPE_CMD_3DSTATE_SUBSLICE_HASH_TABLE        XE2_GFXPIPE_CMD_3D(0x1, 0x1F)
+#define XE2_GFXPIPE_CMD_3DSTATE_SLICE_TABLE_STATE_POINTERS XE2_GFXPIPE_CMD_3D(0x1, 0x20)
+#define XE2_GFXPIPE_CMD_3DSTATE_PTBR_TILE_PASS_INFO        XE2_GFXPIPE_CMD_3D(0x1, 0x22)
 
 // DPCD (DispalyPort configuration data) is GPU-independent standard.
 // May be applied elsewhere.
@@ -2070,14 +2085,12 @@ static inline uint32_t xe2_mi_cmd_batch_buffer_start(xe2_dev_t *xe2, rvvm_addr_t
 
         uint64_t i = 0ULL;
         while (true) {
-            rvvm_info("(PPGTT) ring phys: 0x%"PRIx64, ppgtt_ring.addr);
             rvvm_info("(PPGTT) First 12 dwords (from now):");
             for (uint64_t k = i; k < (i + 12); k++)
                 rvvm_info("(PPGTT)  [%lu] = 0x%08x", k, xe2_dma_read_32(xe2, ppgtt_ring, k * 4));
 
             uint32_t ring_op = xe2_dma_read_32(xe2, ppgtt_ring, i * 4);
-            rvvm_info("(PPGTT) command scanout: %u (0x%x)", ring_op, ring_op);
-            rvvm_info("(PPGTT) Instr type: %u, i: %lu", XE2_INSTR_TYPE(ring_op), i);
+            // rvvm_info("(PPGTT) command scanout: %u (0x%x)", ring_op, ring_op);
             if (XE2_INSTR_TYPE(ring_op) == XE2_INSTR_TYPE_MI) {
                 rvvm_info("(PPGTT) MI instr: 0x%x", XE2_MI_OPCODE(ring_op));
                 if (XE2_MI_OPCODE(ring_op) == XE2_MI_OP_BATCH_BUFFER_END) {
@@ -2146,12 +2159,31 @@ static inline uint32_t xe2_ring_mi_cmd(
     }
 }
 
-static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, uint32_t op, uint32_t i)
+// GFXPIPE structure:
+// Initial memory programming is done with STATE_BASE_ADDRESS, which includes:
+// - General State Base Address: 0x00000000
+// - Surface State Base Address: 0x100000000
+// - Dynamic State Base Address: 0x200000000
+// - Indirect Object Base Address: 0x00000000
+// - Instruction Base Address: 0x00000000
+// - Bindless Surface State Base Address: 0x00000000
+// - Bindless Sampler State Base Address: 0x00000000
+//
+// There addresses represents different state heaps. I assume, that each
+// base address has chosen canonical form for easier human recognition and
+// organization. Let's try to translate those addresses via PPGTT.
+//
+// Encoding:
+// 0xfffffffefff5404c:  0x00000002 : Dword 7 (seven zeros)
+//   Dynamic State Base Address: 0x200000000 (eight zeros)
+// Address is shifted << 32, probably.
+static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, rvvm_addr_t pdp4, uint32_t op, uint32_t i)
 {
     rvvm_info("GFX command (%02x, %02x)",
         XE2_GFXPIPE_OPCODE(op),
         XE2_GFXPIPE_SUBOPCODE(op)
     );
+
     switch (XE2_GFXPIPE_OPCODES_MASKED(op)) {
         case XE2_GFXPIPE_CMD_PIPE_CONTROL: {
             rvvm_info("GFX pipe control");
@@ -2164,28 +2196,21 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
             }
             break;
         }
+        case XE2_GFXPIPE_CMD_STATE_BASE_ADDRESS: {
+            rvvm_info("XE2_GFXPIPE_CMD_STATE_BASE_ADDRESS");
+            for (uint32_t j = 1; j < 20; ++j) {
+                rvvm_info("GFXPIPE_CMD_STATE_BASE_ADDRESS[%u]: 0x%x", j, xe2_dma_read_32(xe2, ring, (i + j) * 4));
+            }
+            break;
+        }
         case XE2_GFXPIPE_CMD_3DSTATE_GS:
             rvvm_info("GFX: 3DSTATE Graphics shader caught");
             break;
-        case XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BUFFER: {
-            // 3DSTATE_DEPTH_BUFFER[0]: 0x33401dff
-            // 3DSTATE_DEPTH_BUFFER[1]: 0xfec00000
-            // 3DSTATE_DEPTH_BUFFER[2]: 0xfffffffe
-            // 3DSTATE_DEPTH_BUFFER[3]: 0x86e0efe
-            // 3DSTATE_DEPTH_BUFFER[4]: 0x2
-            // 3DSTATE_DEPTH_BUFFER[5]: 0xc4000000
-            // 3DSTATE_DEPTH_BUFFER[6]: 0x10e
-            rvvm_info("3DSTATE_DEPTH_BUFFER[0]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 1) * 4));
-            rvvm_info("3DSTATE_DEPTH_BUFFER[1]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 2) * 4));
-            rvvm_info("3DSTATE_DEPTH_BUFFER[2]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 3) * 4));
-            rvvm_info("3DSTATE_DEPTH_BUFFER[3]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 4) * 4));
-            rvvm_info("3DSTATE_DEPTH_BUFFER[4]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 5) * 4));
-            rvvm_info("3DSTATE_DEPTH_BUFFER[5]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 6) * 4));
-            rvvm_info("3DSTATE_DEPTH_BUFFER[6]: 0x%x", xe2_dma_read_32(xe2, ring, (i + 7) * 4));
+        default:
             break;
-        }
     }
 
+    UNUSED(pdp4);
     return (op & 0xFF) + 2;
 }
 
@@ -2202,7 +2227,7 @@ static uint32_t xe2_ring_cmd(
             return xe2_ring_mi_cmd(xe2, ring, op, i, pdp4, user_int);
             break;
         case XE2_INSTR_TYPE_GFXPIPE:
-            return xe2_ring_gfxpipe_cmd(xe2, ring, op, i);
+            return xe2_ring_gfxpipe_cmd(xe2, ring, pdp4, op, i);
             break;
         case XE2_INSTR_TYPE_GSC:
             return (op & 0xFF) + 2;
