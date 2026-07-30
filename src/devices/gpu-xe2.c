@@ -10,9 +10,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_pci.h>
 #include <rvvm/rvvm_fb.h>
-#include <stdint.h>
 #include "mem_ops.h"
-#include "rvtimer.h"
 #include "spinlock.h"
 #include "utils.h"
 #include "bit_ops.h"
@@ -1708,6 +1706,13 @@ static inline uint32_t xe2_dma_read_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_
     }
 }
 
+static inline void xe2_dma_read_many(xe2_dev_t *xe2, xe2_dma_addr_t dma, uint32_t offset, uint32_t *out, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ++i) {
+        out[i] = xe2_dma_read_32(xe2, dma, (offset + i) * 4);
+    }
+}
+
 static void xe2_dma_write_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint32_t msg)
 {
     if (dma.type == XE2_MEM_LMEM) {
@@ -2084,13 +2089,15 @@ static inline uint32_t xe2_mi_cmd_batch_buffer_start(xe2_dev_t *xe2, rvvm_addr_t
         }
 
         uint64_t i = 0ULL;
+        // Process ring commands until XE2_MI_OP_BATCH_BUFFER_END will be found.
+        // Ring iterator will be advanced by instruction length reported by a
+        // specific command handler (MI/GFXPIPE).
         while (true) {
             rvvm_info("(PPGTT) First 12 dwords (from now):");
-            for (uint64_t k = i; k < (i + 12); k++)
+            for (uint64_t k = i; k < i + 12; k++)
                 rvvm_info("(PPGTT)  [%lu] = 0x%08x", k, xe2_dma_read_32(xe2, ppgtt_ring, k * 4));
 
             uint32_t ring_op = xe2_dma_read_32(xe2, ppgtt_ring, i * 4);
-            // rvvm_info("(PPGTT) command scanout: %u (0x%x)", ring_op, ring_op);
             if (XE2_INSTR_TYPE(ring_op) == XE2_INSTR_TYPE_MI) {
                 rvvm_info("(PPGTT) MI instr: 0x%x", XE2_MI_OPCODE(ring_op));
                 if (XE2_MI_OPCODE(ring_op) == XE2_MI_OP_BATCH_BUFFER_END) {
@@ -2159,6 +2166,28 @@ static inline uint32_t xe2_ring_mi_cmd(
     }
 }
 
+// This follows common [63:12] convention for multi-dword address encoding:
+//
+// lo: [xxxxxxxxxxxxxxxxxxxx000000000000]
+//      |     payload      |
+// hi: [xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+//      |     payload << 32            |
+static inline rvvm_addr_t xe2_addr_63_12_mask(uint32_t lo, uint32_t hi)
+{
+    return (rvvm_addr_t) hi << 32 | (lo & 0xFFFFF000);
+}
+
+// This follows common [63:6] convention for multi-dword address encoding:
+//
+// lo: [xxxxxxxxxxxxxxxxxxxxxxxxxx000000]
+//      |     payload            |
+// hi: [xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+//      |     payload << 32            |
+static inline rvvm_addr_t xe2_addr_63_6_mask(uint32_t lo, uint32_t hi)
+{
+    return (rvvm_addr_t) hi << 32 | (lo & 0xFFFFFFC0);
+}
+
 // GFXPIPE structure:
 // Initial memory programming is done with STATE_BASE_ADDRESS, which includes:
 // - General State Base Address: 0x00000000
@@ -2172,11 +2201,6 @@ static inline uint32_t xe2_ring_mi_cmd(
 // There addresses represents different state heaps. I assume, that each
 // base address has chosen canonical form for easier human recognition and
 // organization. Let's try to translate those addresses via PPGTT.
-//
-// Encoding:
-// 0xfffffffefff5404c:  0x00000002 : Dword 7 (seven zeros)
-//   Dynamic State Base Address: 0x200000000 (eight zeros)
-// Address is shifted << 32, probably.
 static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, rvvm_addr_t pdp4, uint32_t op, uint32_t i)
 {
     rvvm_info("GFX command (%02x, %02x)",
@@ -2186,7 +2210,6 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
 
     switch (XE2_GFXPIPE_OPCODES_MASKED(op)) {
         case XE2_GFXPIPE_CMD_PIPE_CONTROL: {
-            rvvm_info("GFX pipe control");
             uint32_t flags = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
             if ((flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_QW_WRITE) &&
                 (flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_GLOBAL_GTT)) {
@@ -2197,15 +2220,39 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
             break;
         }
         case XE2_GFXPIPE_CMD_STATE_BASE_ADDRESS: {
-            rvvm_info("XE2_GFXPIPE_CMD_STATE_BASE_ADDRESS");
-            for (uint32_t j = 1; j < 20; ++j) {
-                rvvm_info("GFXPIPE_CMD_STATE_BASE_ADDRESS[%u]: 0x%x", j, xe2_dma_read_32(xe2, ring, (i + j) * 4));
-            }
+            // We are interested in base addresses for different memory regions,
+            // discard flags (MOCS, modify, enable).
+            //
+            // I assume, these addresses are per-LRC. So we need to store them
+            // accordingly. Store XE2_MAX_CONTEXTS addresses rather senseless,
+            // find optimized approach.
+            uint32_t cmd[21] = {0};
+            xe2_dma_read_many(xe2, ring, i, cmd, STATIC_ARRAY_SIZE(cmd));
+            rvvm_addr_t addr_general_state    = xe2_addr_63_12_mask(cmd[ 1], cmd[ 2]);
+            rvvm_addr_t addr_surf_state       = xe2_addr_63_12_mask(cmd[ 4], cmd[ 5]);
+            rvvm_addr_t addr_dynamic_state    = xe2_addr_63_12_mask(cmd[ 6], cmd[ 7]);
+            rvvm_addr_t addr_indirect_object  = xe2_addr_63_12_mask(cmd[ 8], cmd[ 9]);
+            rvvm_addr_t addr_instr            = xe2_addr_63_12_mask(cmd[10], cmd[11]);
+            rvvm_addr_t addr_bindless_surface = xe2_addr_63_12_mask(cmd[16], cmd[17]);
+            rvvm_addr_t addr_bindless_sampler = xe2_addr_63_12_mask(cmd[19], cmd[20]);
+            rvvm_info("General State Base Address:     0x%lx", addr_general_state);
+            rvvm_info("Surface State Base Address:     0x%lx", addr_surf_state);
+            rvvm_info("Dynamic State Base Address:     0x%lx", addr_dynamic_state);
+            rvvm_info("Indirect Object Base Address:   0x%lx", addr_indirect_object);
+            rvvm_info("Instruction Base Address:       0x%lx", addr_instr);
+            rvvm_info("Bindless Surface Base Address:  0x%lx", addr_bindless_surface);
+            rvvm_info("Bindless Sampler Base Address:  0x%lx", addr_bindless_sampler);
             break;
         }
-        case XE2_GFXPIPE_CMD_3DSTATE_GS:
-            rvvm_info("GFX: 3DSTATE Graphics shader caught");
+        case XE2_GFXPIPE_CMD_3DSTATE_PS: {
+            uint32_t cmd[10] = {0};
+            xe2_dma_read_many(xe2, ring, i, cmd, STATIC_ARRAY_SIZE(cmd));
+            rvvm_addr_t addr_kernel_0 = xe2_addr_63_6_mask(cmd[1], cmd[2]);
+            rvvm_addr_t addr_kernel_1 = xe2_addr_63_6_mask(cmd[8], cmd[9]);
+            rvvm_info("Kernel Start Address 0:     0x%lx", addr_kernel_0);
+            rvvm_info("Kernel Start Address 1:     0x%lx", addr_kernel_1);
             break;
+        }
         default:
             break;
     }
