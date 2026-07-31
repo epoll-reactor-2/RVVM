@@ -1707,10 +1707,19 @@ static inline uint32_t xe2_dma_read_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_
     }
 }
 
-static inline void xe2_dma_read_many(xe2_dev_t *xe2, xe2_dma_addr_t dma, uint32_t offset, uint32_t *out, uint32_t n)
+static inline void xe2_dma_read_many(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint32_t *out, uint32_t n)
 {
-    for (uint32_t i = 0; i < n; ++i) {
-        out[i] = xe2_dma_read_32(xe2, dma, (offset + i) * 4);
+    uint32_t total = n * sizeof(uint32_t);
+
+    if (dma.type == XE2_MEM_LMEM) {
+        if (unlikely(dma.addr + off + total > XE2_VRAM_SIZE)) {
+            return;
+        }
+        memcpy(out, xe2->vram + dma.addr + off, total);
+    } else {
+        uint32_t *ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr + off, 4);
+        memcpy(out, ptr, total);
+        rvvm_pci_end_dma(xe2->pci_func, ptr);
     }
 }
 
