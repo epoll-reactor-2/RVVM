@@ -10,6 +10,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_pci.h>
 #include <rvvm/rvvm_fb.h>
+#include <sys/types.h>
 #include "mem_ops.h"
 #include "spinlock.h"
 #include "utils.h"
@@ -1730,6 +1731,15 @@ static void xe2_dma_write_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uin
     }
 }
 
+// Add/subtract an offset to the DMA address. DMA type left unchanged.
+static inline xe2_dma_addr_t xe2_dma_offset(xe2_dma_addr_t dma, ssize_t off)
+{
+    return (xe2_dma_addr_t) {
+        .addr = dma.addr + off,
+        .type = dma.type
+    };
+}
+
 static rvvm_addr_t xe2_read_pte_lmem(xe2_dev_t *xe2, rvvm_addr_t phys_addr)
 {
     // Table levels (PML4/PDPT/PD/PT) are always LMEM-resident.
@@ -2070,62 +2080,60 @@ static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
     xe2_dma_write_32(xe2, dst, 0, value);
 }
 
+// The supplied ring DMA address is normalized such that the first dword is the
+// currently processed instruction header (opcode).
+//
 // Forward declaration due to nested handling inside BATCH_BUFFER_START.
 static uint32_t xe2_ring_cmd(
     xe2_dev_t *xe2,
     xe2_dma_addr_t ring,
     rvvm_addr_t pdp4,
     uint32_t op,
-    uint32_t i,
     bool *user_int
 );
 
-static inline uint32_t xe2_mi_cmd_batch_buffer_start(xe2_dev_t *xe2, rvvm_addr_t pdp4, uint32_t op, rvvm_addr_t bo, bool *user_int)
+static inline uint32_t xe2_process_batch_buffer(xe2_dev_t *xe2, rvvm_addr_t pdp4, uint32_t op, rvvm_addr_t bo, bool *user_int)
 {
+    // From the command processor's point of view, we treat GGTT/PPGTT-allocated
+    // rings in exactly the same way.
+    xe2_dma_addr_t ring = {0};
     if (op & XE2_MI_OP_BATCH_BUFFER_START_PPGTT) {
-        xe2_dma_addr_t ppgtt_ring = xe2_ppgtt_translate(xe2, pdp4, bo);
-        if (unlikely(ppgtt_ring.addr == 0ULL)) {
-            return 3;
-        }
-
-        uint64_t i = 0ULL;
-        // Process ring commands until XE2_MI_OP_BATCH_BUFFER_END will be found.
-        // Ring iterator will be advanced by instruction length reported by a
-        // specific command handler (MI/GFXPIPE).
-        while (true) {
-            rvvm_info("(PPGTT) First 12 dwords (from now):");
-            for (uint64_t k = i; k < i + 12; k++)
-                rvvm_info("(PPGTT)  [%lu] = 0x%08x", k, xe2_dma_read_32(xe2, ppgtt_ring, k * 4));
-
-            uint32_t ring_op = xe2_dma_read_32(xe2, ppgtt_ring, i * 4);
-            if (XE2_INSTR_TYPE(ring_op) == XE2_INSTR_TYPE_MI) {
-                rvvm_info("(PPGTT) MI instr: 0x%x", XE2_MI_OPCODE(ring_op));
-                if (XE2_MI_OPCODE(ring_op) == XE2_MI_OP_BATCH_BUFFER_END) {
-                    break;
-                }
-            }
-
-            uint32_t len = xe2_ring_cmd(xe2, ppgtt_ring, pdp4, ring_op, i, user_int);
-            i += len;
-        }
-        rvvm_info("(PPGTT) ... Done, moved %zu bytes", i);
+        ring = xe2_ppgtt_translate(xe2, pdp4, bo);
     } else {
-        rvvm_info("MI batch buffer start (GGTT): BO - 0x%"PRIx64, bo);
-        xe2_dma_addr_t dma = xe2_ggtt_translate(xe2, bo);
-        for (size_t __i = 0; __i < 4; ++__i) {
-            uint32_t cmd = xe2_dma_read_32(xe2, dma, __i * sizeof(uint32_t));
-            rvvm_info("Read GGTT cmd: 0x%x", cmd);
-        }
+        ring = xe2_ggtt_translate(xe2, bo);
     }
+
+    if (unlikely(ring.addr == 0ULL)) {
+        rvvm_warn("Failed to translate batch buffer address! bo: 0x%" PRIx64, bo);
+        return 3;
+    }
+
+    uint64_t i = 0ULL;
+    // Process ring commands until XE2_MI_OP_BATCH_BUFFER_END will be found.
+    // Ring iterator will be advanced by instruction length reported by a
+    // specific command handler (MI/GFXPIPE).
+    while (true) {
+        uint32_t ring_op = xe2_dma_read_32(xe2, ring, i * 4);
+        if (XE2_INSTR_TYPE(ring_op) == XE2_INSTR_TYPE_MI &&
+            XE2_MI_OPCODE(ring_op) == XE2_MI_OP_BATCH_BUFFER_END) {
+                break;
+        }
+
+        // Advance by reported from command handler length.
+        i += xe2_ring_cmd(xe2, xe2_dma_offset(ring, i * 4), pdp4, ring_op, user_int);
+    }
+    rvvm_info("(PPGTT) ... Done, moved %zu bytes", i);
+
     return 3;
 }
 
-static inline uint32_t xe2_ring_mi_cmd(
+// The supplied ring DMA address is normalized such that the first dword is the
+// currently processed instruction header (opcode).
+static inline uint32_t xe2_mi_cmd(
     xe2_dev_t *xe2,
     xe2_dma_addr_t ring,
-    uint32_t op,
-    uint32_t i,
     rvvm_addr_t pdp4,
+    uint32_t op,
     bool *user_int
 ) {
     rvvm_info("MI opcode: 0x%x", XE2_MI_OPCODE(op));
@@ -2141,25 +2149,25 @@ static inline uint32_t xe2_ring_mi_cmd(
             return 1;
         case XE2_MI_OP_STORE_DATA_IMM:
             if (op & XE2_MI_SDI_GGTT) {
-                uint32_t a = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
-                uint32_t v = xe2_dma_read_32(xe2, ring, (i + 3) * 4);
+                uint32_t a = xe2_dma_read_32(xe2, ring, 1 * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, 3 * 4);
                 xe2_ring_store(xe2, a, v);
             }
             return (op & 0x3FF) + 2;
         case XE2_MI_OP_FLUSH_DW:
             if (op & XE2_MI_FLUSH_DW_OP_STOREDW) {
-                uint32_t a = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
-                uint32_t v = xe2_dma_read_32(xe2, ring, (i + 3) * 4);
+                uint32_t a = xe2_dma_read_32(xe2, ring, 1 * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, 3 * 4);
                 if (a & XE2_MI_FLUSH_DW_USE_GTT) {
                     xe2_ring_store(xe2, a & ~0x7U, v);
                 }
             }
             return (op & 0x3F) + 2;
         case XE2_MI_OP_BATCH_BUFFER_START: {
-            uint32_t lo = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
-            uint32_t hi = xe2_dma_read_32(xe2, ring, (i + 2) * 4);
+            uint32_t lo = xe2_dma_read_32(xe2, ring, 1 * 4);
+            uint32_t hi = xe2_dma_read_32(xe2, ring, 2 * 4);
             rvvm_addr_t bo = xe2_concat_lohi(lo, hi);
-            return xe2_mi_cmd_batch_buffer_start(xe2, pdp4, op, bo, user_int);
+            return xe2_process_batch_buffer(xe2, pdp4, op, bo, user_int);
         }
         default:
             return (op & 0xFF) + 2;
@@ -2188,33 +2196,27 @@ static inline rvvm_addr_t xe2_addr_63_6_mask(uint32_t lo, uint32_t hi)
     return (rvvm_addr_t) hi << 32 | (lo & 0xFFFFFFC0);
 }
 
-// GFXPIPE structure:
-// Initial memory programming is done with STATE_BASE_ADDRESS, which includes:
-// - General State Base Address: 0x00000000
-// - Surface State Base Address: 0x100000000
-// - Dynamic State Base Address: 0x200000000
-// - Indirect Object Base Address: 0x00000000
-// - Instruction Base Address: 0x00000000
-// - Bindless Surface State Base Address: 0x00000000
-// - Bindless Sampler State Base Address: 0x00000000
-//
-// There addresses represents different state heaps. I assume, that each
-// base address has chosen canonical form for easier human recognition and
-// organization. Let's try to translate those addresses via PPGTT.
-static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, rvvm_addr_t pdp4, uint32_t op, uint32_t i)
+// The supplied ring DMA address is normalized such that the first dword is the
+// currently processed instruction header (opcode).
+static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, rvvm_addr_t pdp4, uint32_t op)
 {
     rvvm_info("GFX command (%02x, %02x)",
         XE2_GFXPIPE_OPCODE(op),
         XE2_GFXPIPE_SUBOPCODE(op)
     );
 
+    uint32_t len = (op & 0xFF) + 2;
+    for (uint32_t dump = 0; dump < len; ++dump) {
+        rvvm_info("  [%2u]: 0x%08x", dump, xe2_dma_read_32(xe2, ring, dump * 4));
+    }
+
     switch (XE2_GFXPIPE_OPCODES_MASKED(op)) {
         case XE2_GFXPIPE_CMD_PIPE_CONTROL: {
-            uint32_t flags = xe2_dma_read_32(xe2, ring, (i + 1) * 4);
+            uint32_t flags = xe2_dma_read_32(xe2, ring, 1 * 4);
             if ((flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_QW_WRITE) &&
                 (flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_GLOBAL_GTT)) {
-                uint32_t a = xe2_dma_read_32(xe2, ring, (i + 2) * 4);
-                uint32_t v = xe2_dma_read_32(xe2, ring, (i + 4) * 4);
+                uint32_t a = xe2_dma_read_32(xe2, ring, 2 * 4);
+                uint32_t v = xe2_dma_read_32(xe2, ring, 4 * 4);
                 xe2_ring_store(xe2, a, v);
             }
             break;
@@ -2227,7 +2229,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
             // accordingly. Store XE2_MAX_CONTEXTS addresses rather senseless,
             // find optimized approach.
             uint32_t cmd[21] = {0};
-            xe2_dma_read_many(xe2, ring, i, cmd, STATIC_ARRAY_SIZE(cmd));
+            xe2_dma_read_many(xe2, ring, 0, cmd, STATIC_ARRAY_SIZE(cmd));
             rvvm_addr_t addr_general_state    = xe2_addr_63_12_mask(cmd[ 1], cmd[ 2]);
             rvvm_addr_t addr_surf_state       = xe2_addr_63_12_mask(cmd[ 4], cmd[ 5]);
             rvvm_addr_t addr_dynamic_state    = xe2_addr_63_12_mask(cmd[ 6], cmd[ 7]);
@@ -2246,7 +2248,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
         }
         case XE2_GFXPIPE_CMD_3DSTATE_PS: {
             uint32_t cmd[10] = {0};
-            xe2_dma_read_many(xe2, ring, i, cmd, STATIC_ARRAY_SIZE(cmd));
+            xe2_dma_read_many(xe2, ring, 0, cmd, STATIC_ARRAY_SIZE(cmd));
             rvvm_addr_t addr_kernel_0 = xe2_addr_63_6_mask(cmd[1], cmd[2]);
             rvvm_addr_t addr_kernel_1 = xe2_addr_63_6_mask(cmd[8], cmd[9]);
             rvvm_info("Kernel Start Address 0:     0x%lx", addr_kernel_0);
@@ -2266,21 +2268,20 @@ static uint32_t xe2_ring_cmd(
     xe2_dma_addr_t ring,
     rvvm_addr_t pdp4,
     uint32_t op,
-    uint32_t i,
     bool *user_int
 ) {
     switch (XE2_INSTR_TYPE(op)) {
         case XE2_INSTR_TYPE_MI:
-            return xe2_ring_mi_cmd(xe2, ring, op, i, pdp4, user_int);
+            return xe2_mi_cmd(xe2, ring, pdp4, op, user_int);
             break;
         case XE2_INSTR_TYPE_GFXPIPE:
-            return xe2_ring_gfxpipe_cmd(xe2, ring, pdp4, op, i);
+            return xe2_ring_gfxpipe_cmd(xe2, ring, pdp4, op);
             break;
         case XE2_INSTR_TYPE_GSC:
             return (op & 0xFF) + 2;
         case XE2_INSTR_TYPE_RESOURCE_BARRIER:
-            // This instruction always has size equals 1 byte per Mesa.
-            return 1;
+            // This instruction always has size equals 3 bytes per Mesa.
+            return 3;
         default:
             rvvm_fatal("Unknown instruction type: %u", XE2_INSTR_TYPE(op));
             return 0;
@@ -2327,7 +2328,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
 
         // How many bytes was consumed by incoming command. That far we
         // will go over the buffer in the next iteration.
-        uint32_t len = xe2_ring_cmd(xe2, ring, pdp4, op, i, &user_int);
+        uint32_t len = xe2_ring_cmd(xe2, xe2_dma_offset(ring, i * 4), pdp4, op, &user_int);
 
         i = (i + len) % ring_dw;
     }
