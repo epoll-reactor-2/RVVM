@@ -1947,6 +1947,281 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t *xe2, rvvm_addr_t pdp
 
 
 // -----------------------------------------------------------
+// DisplayPort configuration
+// -----------------------------------------------------------
+
+
+
+// Pack an AUX reply: a leading ACK header byte (0x00) followed by the payload,
+// big-endian within each of the five 32-bit AUX data registers (the same byte
+// order the EDID-over-AUX path uses).
+static inline void xe2_aux_reply(xe2_aux_t *aux, const uint8_t *payload, size_t n)
+{
+    uint8_t buf[20] = {0};
+    for (size_t i = 0; i < n && i + 1 < sizeof(buf); i++) {
+        buf[1 + i] = payload[i];
+    }
+    for (size_t d = 0; d < 5; d++) {
+        aux->data[d] = read_uint32_be_m(&buf[d * 4]);
+    }
+}
+
+static inline void xe2_aux_reply_uint8(xe2_aux_t *aux, uint8_t cmd)
+{
+    xe2_aux_reply(aux, &cmd, 1);
+}
+
+static inline void xe2_aux_reply_uint16(xe2_aux_t *aux, uint16_t cmd)
+{
+    xe2_aux_reply(aux, (const uint8_t *) &cmd, 2);
+}
+
+static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
+{
+    // Outgoing AUX request layout:
+    // [0]: [********........................]
+    //      31  ACK | data                   0
+    //
+    // [1]: [................................]
+    //      31        data                   0
+    //
+    // [2]: [................................]
+    //      31        data                   0
+    //
+    // [3]: [................................]
+    //      31        data                   0
+    //
+    // [4]: [........************************]
+    //      31 data | unused                 0
+    //
+    // 16 bytes total.
+
+    rvvm_info("AUX cmd: 0x%x", cmd);
+
+    switch (cmd) {
+        case DPCD_REG_REV: {
+            // Full receiver capability block. The driver reads it in one go and
+            // rejects the link (tearing down the eDP connector) unless the rev,
+            // link rate and lane count are all non-zero.
+            uint8_t caps[DPCD_RECEIVER_CAP_SIZE] = {0};
+            caps[DPCD_REG_REV]            = 0x12; // DPCD rev 1.2
+            caps[DPCD_REG_MAX_LINK_RATE]  = DPCD_LINK_RATE_HBR2;
+            caps[DPCD_REG_MAX_LANE_COUNT] = DPCD_LANE_COUNT_4_ENHANCED;
+            xe2_aux_reply(aux, caps, sizeof(caps));
+            break;
+        }
+        case DPCD_REG_EDP_DPCD_REV:
+            // eDP capability block; rev 1.3 keeps the sink on the MAX_LINK_RATE
+            // path, so no separate supported-link-rate table is needed.
+            xe2_aux_reply_uint8(aux, DPCD_EDP_REV_1_3);
+            break;
+        case DPCD_REG_RECEIVER_ALPM_CAP:
+            // DP_ALPM_CAP
+            xe2_aux_reply_uint8(aux, 1);
+            break;
+        case DPCD_REG_DSC_SUPPORT:
+            // DP_DSC_DECOMPRESSION_IS_SUPPORTED & DP_DSC_PASSTHROUGH_IS_SUPPORTED
+            xe2_aux_reply_uint8(aux, 3);
+            break;
+        case DPCD_REG_PSR_SUPPORT:
+            // DP_PSR_IS_SUPPORTED
+            xe2_aux_reply_uint8(aux, 1);
+            break;
+        case DPCD_REG_PANEL_REPLAY_CAP_SUPPORT:
+            // DP_PANEL_REPLAY_SUPPORT
+            xe2_aux_reply_uint8(aux, 1);
+            break;
+        case DPCD_REG_SOURCE_OUI:
+            // Probably hardcoded value (0xAA01 after write).
+            xe2_aux_reply_uint16(aux, 0x01AA);
+            break;
+        case DPCD_REG_DP_LINK_BW_SET:
+            // This is the Church of Satan where Anton LaVey, the
+            // high priest, says, "Live is evil spelt backwards".
+            xe2_aux_reply_uint8(aux, DPCD_DP_LINK_BW_5_4);
+            break;
+        case DPCD_REG_SET_POWER:
+            xe2_aux_reply_uint8(aux, DPCD_SET_POWER_D0);
+            break;
+        case DPCD_REG_TRAINING_PATTERN_SET:
+            xe2_aux_reply_uint8(aux, DPCD_TRAINING_PATTERN_2_CDS);
+            break;
+        case DPCD_REG_TRAINING_LANE0_SET:
+            xe2_aux_reply_uint8(aux, DPCD_TRAINING_LANEX_SWING_LEVEL_2);
+            break;
+        case DPCD_REG_LANE0_1_STATUS: {
+            // DPCD driver expects 6-byte reply pack.
+            uint8_t status[6] = {
+                /* 0x202 */ [0] = DPCD_LANEX_X_CHANNEL_EQ_BITS,
+                /* 0x203 */ [1] = DPCD_LANEX_X_CHANNEL_EQ_BITS,
+                /* 0x204 */ [2] = DPCD_INTERLANE_ALIGN_DONE,
+                /* 0x205 */ [3] = DPCD_RECEIVE_PORT_0_STATUS,
+                /* 0x206 */ [4] = 0, // Adjust request for lane 0/1
+                /* 0x207 */ [5] = 0  // Adjust request for lane 2/3
+            };
+            xe2_aux_reply(aux, status, sizeof(status));
+            break;
+        }
+        case DPCD_TEST_REQUEST:
+            xe2_aux_reply_uint8(aux, DPCD_TEST_REQUEST_LINK_TRAINING);
+            break;
+        case DPCD_INTEL_EDID_ADDR: {
+            uint32_t header  = read_uint32_be_m(&xe2_edid[aux->edid_written +  0]) >> 8;
+            uint32_t chunk_1 = read_uint32_be_m(&xe2_edid[aux->edid_written +  3]);
+            uint32_t chunk_2 = read_uint32_be_m(&xe2_edid[aux->edid_written +  7]);
+            uint32_t chunk_3 = read_uint32_be_m(&xe2_edid[aux->edid_written + 11]);
+            uint32_t chunk_4 = read_uint8(&xe2_edid[aux->edid_written + 15]) << 24;
+
+            switch (request) {
+                case DPCD_REQ_I2C_WRITE_MOT:
+                    // When driver writes I2C-over-AUX, it expects this kind of ACK,
+                    // which is different from read ACK (upper 8 bits = 0x00).
+                    write_uint32_le(&aux->data[0], xe2_reg_field_prep(xe2_reg_genmask(23, 0), 0x110000));
+                    // This represents sequenced interface. We can assume that
+                    // I2C write-MOT could serve as reset condition, despite this
+                    // is not formally defined in DisplayPort IP.
+                    aux->edid_written = 0;
+                    break;
+                case DPCD_REQ_I2C_READ_MOT:
+                    if (size == 16 && aux->edid_written < (sizeof(xe2_edid) - 16)) {
+                        aux->edid_written += 16;
+                    }
+                    write_uint32_le(&aux->data[0], header);
+                    break;
+                default:
+                    write_uint32_le(&aux->data[0], header);
+                    break;
+            }
+
+            write_uint32_le(&aux->data[1], chunk_1);
+            write_uint32_le(&aux->data[2], chunk_2);
+            write_uint32_le(&aux->data[3], chunk_3);
+            write_uint32_le(&aux->data[4], chunk_4);
+            break;
+        }
+        default:
+            // Otherwise enable everything.
+            xe2_aux_reply_uint8(aux, 0xFF);
+            break;
+    }
+}
+
+static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
+{
+    xe2_aux_t *aux = &xe2->aux[aux_no];
+    uint32_t   cmd = aux->data[0];
+
+    uint32_t request = xe2_reg_field_get(xe2_reg_genmask(31, 28), cmd);
+    uint32_t address = xe2_reg_field_get(xe2_reg_genmask(27,  8), cmd);
+    uint32_t size    = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
+    // Linux manipulates with AUX transfer size taking header (1 byte)
+    // into the account. Finally, GPU returns size equal len(payload) + 2(headers).
+    uint32_t payload_size = size - 1;
+
+    xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, 0xF);
+    xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, size);
+
+    xe2_dpcd_aux_config(address, request, payload_size, aux);
+}
+
+
+
+// -----------------------------------------------------------
+// Cx0 PHY
+// -----------------------------------------------------------
+
+
+
+// Apply a committed Cx0 register write that targets the indirect SRAM access
+// registers. Staging registers latch their bytes; a committed write to the
+// write-data low byte performs the actual 16-bit SRAM store.
+static inline void xe2_cx0_sram_write(xe2_cx0_lane_t *lane, uint32_t address, uint8_t value)
+{
+    switch (address) {
+        case XE2_CX0_REG_SRAM_WR_ADDRESS_H:
+            lane->sram_wr_addr = (lane->sram_wr_addr & 0x00FF) | ((uint16_t)value << 8);
+            break;
+        case XE2_CX0_REG_SRAM_WR_ADDRESS_L:
+            lane->sram_wr_addr = (lane->sram_wr_addr & 0xFF00) | value;
+            break;
+        case XE2_CX0_REG_SRAM_WR_DATA_H:
+            lane->sram_wr_data = (lane->sram_wr_data & 0x00FF) | ((uint16_t)value << 8);
+            break;
+        case XE2_CX0_REG_SRAM_WR_DATA_L:
+            // Committing the low byte performs the 16-bit SRAM store.
+            lane->sram_wr_data = (lane->sram_wr_data & 0xFF00) | value;
+            lane->sram[lane->sram_wr_addr] = lane->sram_wr_data;
+            break;
+        case XE2_CX0_REG_SRAM_RD_ADDRESS_H:
+            lane->sram_rd_addr = (lane->sram_rd_addr & 0x00FF) | ((uint16_t)value << 8);
+            break;
+        case XE2_CX0_REG_SRAM_RD_ADDRESS_L:
+            lane->sram_rd_addr = (lane->sram_rd_addr & 0xFF00) | value;
+            break;
+        default:
+            break;
+    }
+}
+
+// Return the byte a Cx0 register read should yield. The SRAM read-data
+// registers expose the high/low byte of the latched 16-bit SRAM word; all
+// other registers read back from the Cx0 register file.
+static inline uint8_t xe2_cx0_reg_read(xe2_cx0_lane_t *lane, uint32_t address)
+{
+    switch (address) {
+        case XE2_CX0_REG_SRAM_RD_DATA_H:
+            return lane->sram[lane->sram_rd_addr] >> 8;
+        case XE2_CX0_REG_SRAM_RD_DATA_L:
+            return lane->sram[lane->sram_rd_addr] & 0xFF;
+        default:
+            return lane->regs[address & 0xFFF];
+    }
+}
+
+// Emulate a single Cx0 message-bus transaction. Called when the host writes
+// M2P_MSGBUS_CTL with TRANSACTION_PENDING set. The pending bit is cleared in
+// the stored M2P value so the host's poll-for-clear succeeds, and the matching
+// P2M response is staged for committed/read commands.
+static inline void xe2_cx0_msgbus_transaction(xe2_cx0_lane_t *lane, uint32_t cmd)
+{
+    if (cmd & XE2_REG_CX0_M2P_TRANSACTION_RESET_MASK) {
+        // Bus reset is self-clearing: read M2P/P2M back as cleared.
+        lane->m2p = 0;
+        lane->p2m = 0;
+        return;
+    }
+
+    uint32_t command = xe2_reg_field_get(XE2_REG_CX0_M2P_COMMAND_TYPE_MASK, cmd);
+    uint32_t address = xe2_reg_field_get(XE2_REG_CX0_M2P_ADDRESS_MASK, cmd);
+    uint8_t  payload = xe2_reg_field_get(XE2_REG_CX0_M2P_DATA_MASK, cmd);
+
+    // Store the command word with PENDING cleared so the host poll succeeds.
+    lane->m2p = cmd & ~XE2_REG_CX0_M2P_TRANSACTION_PENDING_MASK;
+
+    switch (command) {
+        case XE2_CX0_M2P_COMMAND_WRITE_UNCOMMITTED:
+            lane->regs[address & 0xFFF] = payload;
+            xe2_cx0_sram_write(lane, address, payload);
+            break;
+        case XE2_CX0_M2P_COMMAND_WRITE_COMMITTED:
+            lane->regs[address & 0xFFF] = payload;
+            xe2_cx0_sram_write(lane, address, payload);
+            lane->p2m = XE2_REG_CX0_P2M_RESPONSE_READY_MASK
+                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_COMMAND_TYPE_MASK, XE2_CX0_P2M_COMMAND_WRITE_ACK);
+            break;
+        case XE2_CX0_M2P_COMMAND_READ:
+            lane->p2m = XE2_REG_CX0_P2M_RESPONSE_READY_MASK
+                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_COMMAND_TYPE_MASK, XE2_CX0_P2M_COMMAND_READ_ACK)
+                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_DATA_MASK, xe2_cx0_reg_read(lane, address));
+            break;
+        default:
+            break;
+    }
+}
+
+
+
+// -----------------------------------------------------------
 // GuC controller (MMIO/CTB)
 // -----------------------------------------------------------
 
@@ -2748,281 +3023,6 @@ static void xe2_guc_host_interrupt(xe2_dev_t *xe2)
     // when its LRC ring tail has advanced past what we last serviced. This is the
     // true submission signal and leaves concurrent CT exchanges untouched.
     xe2_complete_advanced_contexts(xe2);
-}
-
-
-
-// -----------------------------------------------------------
-// DisplayPort configuration
-// -----------------------------------------------------------
-
-
-
-// Pack an AUX reply: a leading ACK header byte (0x00) followed by the payload,
-// big-endian within each of the five 32-bit AUX data registers (the same byte
-// order the EDID-over-AUX path uses).
-static inline void xe2_aux_reply(xe2_aux_t *aux, const uint8_t *payload, size_t n)
-{
-    uint8_t buf[20] = {0};
-    for (size_t i = 0; i < n && i + 1 < sizeof(buf); i++) {
-        buf[1 + i] = payload[i];
-    }
-    for (size_t d = 0; d < 5; d++) {
-        aux->data[d] = read_uint32_be_m(&buf[d * 4]);
-    }
-}
-
-static inline void xe2_aux_reply_uint8(xe2_aux_t *aux, uint8_t cmd)
-{
-    xe2_aux_reply(aux, &cmd, 1);
-}
-
-static inline void xe2_aux_reply_uint16(xe2_aux_t *aux, uint16_t cmd)
-{
-    xe2_aux_reply(aux, (const uint8_t *) &cmd, 2);
-}
-
-static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t size, xe2_aux_t *aux)
-{
-    // Outgoing AUX request layout:
-    // [0]: [********........................]
-    //      31  ACK | data                   0
-    //
-    // [1]: [................................]
-    //      31        data                   0
-    //
-    // [2]: [................................]
-    //      31        data                   0
-    //
-    // [3]: [................................]
-    //      31        data                   0
-    //
-    // [4]: [........************************]
-    //      31 data | unused                 0
-    //
-    // 16 bytes total.
-
-    rvvm_info("AUX cmd: 0x%x", cmd);
-
-    switch (cmd) {
-        case DPCD_REG_REV: {
-            // Full receiver capability block. The driver reads it in one go and
-            // rejects the link (tearing down the eDP connector) unless the rev,
-            // link rate and lane count are all non-zero.
-            uint8_t caps[DPCD_RECEIVER_CAP_SIZE] = {0};
-            caps[DPCD_REG_REV]            = 0x12; // DPCD rev 1.2
-            caps[DPCD_REG_MAX_LINK_RATE]  = DPCD_LINK_RATE_HBR2;
-            caps[DPCD_REG_MAX_LANE_COUNT] = DPCD_LANE_COUNT_4_ENHANCED;
-            xe2_aux_reply(aux, caps, sizeof(caps));
-            break;
-        }
-        case DPCD_REG_EDP_DPCD_REV:
-            // eDP capability block; rev 1.3 keeps the sink on the MAX_LINK_RATE
-            // path, so no separate supported-link-rate table is needed.
-            xe2_aux_reply_uint8(aux, DPCD_EDP_REV_1_3);
-            break;
-        case DPCD_REG_RECEIVER_ALPM_CAP:
-            // DP_ALPM_CAP
-            xe2_aux_reply_uint8(aux, 1);
-            break;
-        case DPCD_REG_DSC_SUPPORT:
-            // DP_DSC_DECOMPRESSION_IS_SUPPORTED & DP_DSC_PASSTHROUGH_IS_SUPPORTED
-            xe2_aux_reply_uint8(aux, 3);
-            break;
-        case DPCD_REG_PSR_SUPPORT:
-            // DP_PSR_IS_SUPPORTED
-            xe2_aux_reply_uint8(aux, 1);
-            break;
-        case DPCD_REG_PANEL_REPLAY_CAP_SUPPORT:
-            // DP_PANEL_REPLAY_SUPPORT
-            xe2_aux_reply_uint8(aux, 1);
-            break;
-        case DPCD_REG_SOURCE_OUI:
-            // Probably hardcoded value (0xAA01 after write).
-            xe2_aux_reply_uint16(aux, 0x01AA);
-            break;
-        case DPCD_REG_DP_LINK_BW_SET:
-            // This is the Church of Satan where Anton LaVey, the
-            // high priest, says, "Live is evil spelt backwards".
-            xe2_aux_reply_uint8(aux, DPCD_DP_LINK_BW_5_4);
-            break;
-        case DPCD_REG_SET_POWER:
-            xe2_aux_reply_uint8(aux, DPCD_SET_POWER_D0);
-            break;
-        case DPCD_REG_TRAINING_PATTERN_SET:
-            xe2_aux_reply_uint8(aux, DPCD_TRAINING_PATTERN_2_CDS);
-            break;
-        case DPCD_REG_TRAINING_LANE0_SET:
-            xe2_aux_reply_uint8(aux, DPCD_TRAINING_LANEX_SWING_LEVEL_2);
-            break;
-        case DPCD_REG_LANE0_1_STATUS: {
-            // DPCD driver expects 6-byte reply pack.
-            uint8_t status[6] = {
-                /* 0x202 */ [0] = DPCD_LANEX_X_CHANNEL_EQ_BITS,
-                /* 0x203 */ [1] = DPCD_LANEX_X_CHANNEL_EQ_BITS,
-                /* 0x204 */ [2] = DPCD_INTERLANE_ALIGN_DONE,
-                /* 0x205 */ [3] = DPCD_RECEIVE_PORT_0_STATUS,
-                /* 0x206 */ [4] = 0, // Adjust request for lane 0/1
-                /* 0x207 */ [5] = 0  // Adjust request for lane 2/3
-            };
-            xe2_aux_reply(aux, status, sizeof(status));
-            break;
-        }
-        case DPCD_TEST_REQUEST:
-            xe2_aux_reply_uint8(aux, DPCD_TEST_REQUEST_LINK_TRAINING);
-            break;
-        case DPCD_INTEL_EDID_ADDR: {
-            uint32_t header  = read_uint32_be_m(&xe2_edid[aux->edid_written +  0]) >> 8;
-            uint32_t chunk_1 = read_uint32_be_m(&xe2_edid[aux->edid_written +  3]);
-            uint32_t chunk_2 = read_uint32_be_m(&xe2_edid[aux->edid_written +  7]);
-            uint32_t chunk_3 = read_uint32_be_m(&xe2_edid[aux->edid_written + 11]);
-            uint32_t chunk_4 = read_uint8(&xe2_edid[aux->edid_written + 15]) << 24;
-
-            switch (request) {
-                case DPCD_REQ_I2C_WRITE_MOT:
-                    // When driver writes I2C-over-AUX, it expects this kind of ACK,
-                    // which is different from read ACK (upper 8 bits = 0x00).
-                    write_uint32_le(&aux->data[0], xe2_reg_field_prep(xe2_reg_genmask(23, 0), 0x110000));
-                    // This represents sequenced interface. We can assume that
-                    // I2C write-MOT could serve as reset condition, despite this
-                    // is not formally defined in DisplayPort IP.
-                    aux->edid_written = 0;
-                    break;
-                case DPCD_REQ_I2C_READ_MOT:
-                    if (size == 16 && aux->edid_written < (sizeof(xe2_edid) - 16)) {
-                        aux->edid_written += 16;
-                    }
-                    write_uint32_le(&aux->data[0], header);
-                    break;
-                default:
-                    write_uint32_le(&aux->data[0], header);
-                    break;
-            }
-
-            write_uint32_le(&aux->data[1], chunk_1);
-            write_uint32_le(&aux->data[2], chunk_2);
-            write_uint32_le(&aux->data[3], chunk_3);
-            write_uint32_le(&aux->data[4], chunk_4);
-            break;
-        }
-        default:
-            // Otherwise enable everything.
-            xe2_aux_reply_uint8(aux, 0xFF);
-            break;
-    }
-}
-
-static inline void xe2_emulate_aux_transfer(xe2_dev_t *xe2, size_t aux_no)
-{
-    xe2_aux_t *aux = &xe2->aux[aux_no];
-    uint32_t   cmd = aux->data[0];
-
-    uint32_t request = xe2_reg_field_get(xe2_reg_genmask(31, 28), cmd);
-    uint32_t address = xe2_reg_field_get(xe2_reg_genmask(27,  8), cmd);
-    uint32_t size    = xe2_reg_field_get(xe2_reg_genmask( 4,  0), cmd) + 2;
-    // Linux manipulates with AUX transfer size taking header (1 byte)
-    // into the account. Finally, GPU returns size equal len(payload) + 2(headers).
-    uint32_t payload_size = size - 1;
-
-    xe2->aux[0].ctl &= ~xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, 0xF);
-    xe2->aux[0].ctl |=  xe2_reg_field_prep(XE2_REG_DPX_AUX_CH_CTL_MSG_SIZE_MASK, size);
-
-    xe2_dpcd_aux_config(address, request, payload_size, aux);
-}
-
-
-
-// -----------------------------------------------------------
-// Cx0 PHY
-// -----------------------------------------------------------
-
-
-
-// Apply a committed Cx0 register write that targets the indirect SRAM access
-// registers. Staging registers latch their bytes; a committed write to the
-// write-data low byte performs the actual 16-bit SRAM store.
-static inline void xe2_cx0_sram_write(xe2_cx0_lane_t *lane, uint32_t address, uint8_t value)
-{
-    switch (address) {
-        case XE2_CX0_REG_SRAM_WR_ADDRESS_H:
-            lane->sram_wr_addr = (lane->sram_wr_addr & 0x00FF) | ((uint16_t)value << 8);
-            break;
-        case XE2_CX0_REG_SRAM_WR_ADDRESS_L:
-            lane->sram_wr_addr = (lane->sram_wr_addr & 0xFF00) | value;
-            break;
-        case XE2_CX0_REG_SRAM_WR_DATA_H:
-            lane->sram_wr_data = (lane->sram_wr_data & 0x00FF) | ((uint16_t)value << 8);
-            break;
-        case XE2_CX0_REG_SRAM_WR_DATA_L:
-            // Committing the low byte performs the 16-bit SRAM store.
-            lane->sram_wr_data = (lane->sram_wr_data & 0xFF00) | value;
-            lane->sram[lane->sram_wr_addr] = lane->sram_wr_data;
-            break;
-        case XE2_CX0_REG_SRAM_RD_ADDRESS_H:
-            lane->sram_rd_addr = (lane->sram_rd_addr & 0x00FF) | ((uint16_t)value << 8);
-            break;
-        case XE2_CX0_REG_SRAM_RD_ADDRESS_L:
-            lane->sram_rd_addr = (lane->sram_rd_addr & 0xFF00) | value;
-            break;
-        default:
-            break;
-    }
-}
-
-// Return the byte a Cx0 register read should yield. The SRAM read-data
-// registers expose the high/low byte of the latched 16-bit SRAM word; all
-// other registers read back from the Cx0 register file.
-static inline uint8_t xe2_cx0_reg_read(xe2_cx0_lane_t *lane, uint32_t address)
-{
-    switch (address) {
-        case XE2_CX0_REG_SRAM_RD_DATA_H:
-            return lane->sram[lane->sram_rd_addr] >> 8;
-        case XE2_CX0_REG_SRAM_RD_DATA_L:
-            return lane->sram[lane->sram_rd_addr] & 0xFF;
-        default:
-            return lane->regs[address & 0xFFF];
-    }
-}
-
-// Emulate a single Cx0 message-bus transaction. Called when the host writes
-// M2P_MSGBUS_CTL with TRANSACTION_PENDING set. The pending bit is cleared in
-// the stored M2P value so the host's poll-for-clear succeeds, and the matching
-// P2M response is staged for committed/read commands.
-static inline void xe2_cx0_msgbus_transaction(xe2_cx0_lane_t *lane, uint32_t cmd)
-{
-    if (cmd & XE2_REG_CX0_M2P_TRANSACTION_RESET_MASK) {
-        // Bus reset is self-clearing: read M2P/P2M back as cleared.
-        lane->m2p = 0;
-        lane->p2m = 0;
-        return;
-    }
-
-    uint32_t command = xe2_reg_field_get(XE2_REG_CX0_M2P_COMMAND_TYPE_MASK, cmd);
-    uint32_t address = xe2_reg_field_get(XE2_REG_CX0_M2P_ADDRESS_MASK, cmd);
-    uint8_t  payload = xe2_reg_field_get(XE2_REG_CX0_M2P_DATA_MASK, cmd);
-
-    // Store the command word with PENDING cleared so the host poll succeeds.
-    lane->m2p = cmd & ~XE2_REG_CX0_M2P_TRANSACTION_PENDING_MASK;
-
-    switch (command) {
-        case XE2_CX0_M2P_COMMAND_WRITE_UNCOMMITTED:
-            lane->regs[address & 0xFFF] = payload;
-            xe2_cx0_sram_write(lane, address, payload);
-            break;
-        case XE2_CX0_M2P_COMMAND_WRITE_COMMITTED:
-            lane->regs[address & 0xFFF] = payload;
-            xe2_cx0_sram_write(lane, address, payload);
-            lane->p2m = XE2_REG_CX0_P2M_RESPONSE_READY_MASK
-                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_COMMAND_TYPE_MASK, XE2_CX0_P2M_COMMAND_WRITE_ACK);
-            break;
-        case XE2_CX0_M2P_COMMAND_READ:
-            lane->p2m = XE2_REG_CX0_P2M_RESPONSE_READY_MASK
-                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_COMMAND_TYPE_MASK, XE2_CX0_P2M_COMMAND_READ_ACK)
-                      | xe2_reg_field_prep(XE2_REG_CX0_P2M_DATA_MASK, xe2_cx0_reg_read(lane, address));
-            break;
-        default:
-            break;
-    }
 }
 
 
