@@ -10,7 +10,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_pci.h>
 #include <rvvm/rvvm_fb.h>
-#include <sys/types.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include "mem_ops.h"
 #include "spinlock.h"
 #include "utils.h"
@@ -21,32 +24,101 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // boot arguments:
 // - fbcon=map:0 xe.enable_dc=0 xe.enable_dsb=0 xe.disable_power_well=0
 //
-// Current status: RVVM can see commands composed by Mesa and sent from
-// userspace through the driver.
 //
-// [   28.067253] xe 0000:00:01.0: [drm] Tile0: GT0: Context scheduled
-//        iris_fence.c:266: render batch [1] flush with  1200b (0.9%) (cmds),   10 BOs (21.3Mb aperture)
-// 0xfffffffefffd8000:  0x7a000004:  PIPE_CONTROL
-// 0xfffffffefffd8000:  0x7a000004 : Dword 0
-//     DWord Length: 4
-//     HDC Pipeline Flush Enable: false
-//     L3 Read Only Cache Invalidation Enable: false
-//     Untyped Data Port Cache Flush Enable: false
-//     CCS Flush Enable: false
-// 0xfffffffefffd8004:  0x00102021 : Dword 1
-//     Depth Cache Flush Enable: true
-//     Stall At Pixel Scoreboard: false
-//     State Cache Invalidation Enable: false
-//     Constant Cache Invalidation Enable: false
-//     VF Cache Invalidation Enable: false
-//     Force Device Coherency: true
-//     Pipe Control Flush Enable: false
-//     Notify Enable: false
-//     Indirect State Pointers Disable: false
-//     Texture Cache Invalidation Enable: false
-//     Instruction Cache Invalidate Enable: false
-//     Render Target Cache Flush Enable: false
-//  ........
+// Current status:
+// Fetched shaders coded in some Intel ISA (probably BRW assembly).
+//
+// (VS) Kernel Start Address 0:     0xfffef000, 0xfffef000
+// PTE page: 0x700000
+// dumped 155 dwords (620 bytes) → decompiled.xe2
+// 00000000: 4100 8020 1303 0409 4100 1000 a00a 0514  A.. ....A.......
+// 00000010: 5403 000a 0509 4600 4100 8020 1503 0c09  T.....F.A.. ....
+// 00000020: 6100 0080 6046 0533 0000 0000 abaa 2a3f  a...`F.3......*?
+// 00000030: 4100 8020 2702 0405 4100 1000 a00a 0528  A.. '...A......(
+// 00000040: 5402 000a 0505 4600 4100 8020 2902 0c05  T.....F.A.. )...
+// 00000050: 4100 1000 a00a 052a 7402 000a 0505 4600  A......*t.....F.
+// 00000060: 6100 1000 2042 050b 0000 0000 003c 003c  a... B.......<.<
+// 00000070: 6100 8064 0c00 0000 6100 8064 0d00 0000  a..d....a..d....
+// 00000080: 6100 8064 0e00 0000 5b17 1000 a80a 0416  a..d....[.......
+// 00000090: 0513 0a0a 0508 0403 5b17 1000 a80a 0417  ........[.......
+// 000000a0: 0514 0a0a 0508 1403 5b17 1000 a80a 0418  ........[.......
+// 000000b0: 0515 0a0a 0508 2403 5b17 1000 a80a 042b  ......$.[......+
+// 000000c0: 0527 0a0a 0504 0402 5b17 1000 a80a 042c  .'......[......,
+// 000000d0: 0528 0a0a 0504 1402 5b17 1000 a80a 042d  .(......[......-
+// 000000e0: 0529 0a0a 0504 2402 5b17 1000 a80a 042e  .)....$.[.......
+// 000000f0: 052a 0a0a 0504 3402 5b17 1000 a80a 0419  .*....4.[.......
+// 00000100: 0516 0a0a 050a 8403 5b17 1000 a80a 041a  ........[.......
+// 00000110: 0517 0a0a 050a 9403 5b17 1000 a80a 041b  ........[.......
+// 00000120: 0518 0a0a 050a a403 5b17 1000 a80a 042f  ........[....../
+// 00000130: 052b 0a0a 0506 8402 5b17 1000 a80a 0430  .+......[......0
+// 00000140: 052c 0a0a 0506 9402 5b17 1000 a80a 0431  .,......[......1
+// 00000150: 052d 0a0a 0506 a402 5b17 1000 a80a 0432  .-......[......2
+// 00000160: 052e 0a0a 0506 b402 4017 1000 a00a 051c  ........@.......
+// 00000170: 0519 460a c403 0000 4017 1000 a00a 051d  ..F.....@.......
+// 00000180: 051a 460a d403 0000 4017 0020 1e1b e003  ..F.....@.. ....
+// 00000190: 4017 1000 a00a 050f 052f 460a c402 0000  @......../F.....
+// 000001a0: 4017 1000 a00a 0510 0530 460a d402 0000  @........0F.....
+// 000001b0: 4017 0020 1131 e002 4017 0020 1232 9002  @.. .1..@.. .2..
+// 000001c0: 4016 0020 221c 001d 4116 0020 1f1e 001e  @.. "...A.. ....
+// 000001d0: 4100 1000 a08a 0523 051e 460a abaa aa3e  A......#..F....>
+// 000001e0: 5b12 1000 a80a 0420 051f 0a0a 051d 051d  [...... ........
+// 000001f0: 010a 0080 0000 0000 0000 0000 0000 0000  ................
+// 00000200: 5b00 1000 a80a 0424 0523 0a0a 0522 0433  [......$.#...".3
+// 00000210: 5b12 1000 a80a 0421 0520 0a0a 051c 051c  [......!. ......
+// 00000220: 3811 1000 a00a 0525 0521 465a 0100 4600  8......%.!FZ..F.
+// 00000230: 4109 0020 2625 0024 6211 1430 7b26 0000  A.. &%.$b..0{&..
+// 00000240: 3120 1100 0000 0000 0c01 086a 440b 9000  1 .........jD...
+// 00000250: 61a0 002c 7f01 1000 3109 1000 0402 0000  a..,....1.......
+// 00000260: 0c7f 086a 247b 8c00 6000 0020            ...j${..`.. 
+// byte offset 0x268: warning: unexpected padding at end of kernel
+// L0:
+//         mul (16|M0)              r19.0<1>:f    r3.4<0;1,0>:f     r9.0<1;1,0>:f    {Compacted}
+//         mul (16|M0)              r20.0<1>:f    r3.5<0;1,0>:f     r9.0<8;8,1>:f
+//         mul (16|M0)              r21.0<1>:f    r3.6<0;1,0>:f     r9.0<1;1,0>:f    {Compacted}
+// (W)     mov (1|M0)               r51.0<1>:d    1059760811:d
+//         mul (16|M0)              r39.0<1>:f    r2.4<0;1,0>:f     r5.0<1;1,0>:f    {Compacted}
+//         mul (16|M0)              r40.0<1>:f    r2.5<0;1,0>:f     r5.0<8;8,1>:f
+//         mul (16|M0)              r41.0<1>:f    r2.6<0;1,0>:f     r5.0<1;1,0>:f    {Compacted}
+//         mul (16|M0)              r42.0<1>:f    r2.7<0;1,0>:f     r5.0<8;8,1>:f
+//         mov (16|M0)              r11.0<1>:ud   0x3C003C00:ud
+//         mov (16|M0)              r12.0<1>:ud   0x0:ud                              {Compacted}
+//         mov (16|M0)              r13.0<1>:ud   0x0:ud                              {Compacted}
+//         mov (16|M0)              r14.0<1>:ud   0x0:ud                              {Compacted}
+//         mad (16|M0)              r22.0<1>:f    r19.0<8;1>:f      r8.0<8;1>:f       r3.0<0>:f        {F@7}
+//         mad (16|M0)              r23.0<1>:f    r20.0<8;1>:f      r8.0<8;1>:f       r3.1<0>:f        {F@7}
+//         mad (16|M0)              r24.0<1>:f    r21.0<8;1>:f      r8.0<8;1>:f       r3.2<0>:f        {F@7}
+//         mad (16|M0)              r43.0<1>:f    r39.0<8;1>:f      r4.0<8;1>:f       r2.0<0>:f        {F@7}
+//         mad (16|M0)              r44.0<1>:f    r40.0<8;1>:f      r4.0<8;1>:f       r2.1<0>:f        {F@7}
+//         mad (16|M0)              r45.0<1>:f    r41.0<8;1>:f      r4.0<8;1>:f       r2.2<0>:f        {F@7}
+//         mad (16|M0)              r46.0<1>:f    r42.0<8;1>:f      r4.0<8;1>:f       r2.3<0>:f        {F@7}
+//         mad (16|M0)              r25.0<1>:f    r22.0<8;1>:f      r10.0<8;1>:f      r3.8<0>:f        {F@7}
+//         mad (16|M0)              r26.0<1>:f    r23.0<8;1>:f      r10.0<8;1>:f      r3.9<0>:f        {F@7}
+//         mad (16|M0)              r27.0<1>:f    r24.0<8;1>:f      r10.0<8;1>:f      r3.10<0>:f       {F@7}
+//         mad (16|M0)              r47.0<1>:f    r43.0<8;1>:f      r6.0<8;1>:f       r2.8<0>:f        {F@7}
+//         mad (16|M0)              r48.0<1>:f    r44.0<8;1>:f      r6.0<8;1>:f       r2.9<0>:f        {F@7}
+//         mad (16|M0)              r49.0<1>:f    r45.0<8;1>:f      r6.0<8;1>:f       r2.10<0>:f       {F@7}
+//         mad (16|M0)              r50.0<1>:f    r46.0<8;1>:f      r6.0<8;1>:f       r2.11<0>:f       {F@7}
+//         add (16|M0)              r28.0<1>:f    r25.0<8;8,1>:f    r3.12<0;1,0>:f   {F@7}
+//         add (16|M0)              r29.0<1>:f    r26.0<8;8,1>:f    r3.13<0;1,0>:f   {F@7}
+//         add (16|M0)              r30.0<1>:f    r27.0<1;1,0>:f    r3.14<0;1,0>:f   {Compacted,F@7}
+//         add (16|M0)              r15.0<1>:f    r47.0<8;8,1>:f    r2.12<0;1,0>:f   {F@7}
+//         add (16|M0)              r16.0<1>:f    r48.0<8;8,1>:f    r2.13<0;1,0>:f   {F@7}
+//         add (16|M0)              r17.0<1>:f    r49.0<1;1,0>:f    r2.14<0;1,0>:f   {Compacted,F@7}
+//         add (16|M0)              r18.0<1>:f    r50.0<1;1,0>:f    r2.15<0;1,0>:f   {Compacted,F@7}
+//         add (16|M0)              r34.0<1>:f    r28.0<1;1,0>:f    r29.0<1;1,0>:f   {Compacted,F@6}
+//         mul (16|M0)              r31.0<1>:f    r30.0<1;1,0>:f    r30.0<1;1,0>:f   {Compacted,F@6}
+//         mul (16|M0)              r35.0<1>:f    r30.0<8;8,1>:f    0x3EAAAAAB:f
+//         mad (16|M0)              r32.0<1>:f    r31.0<8;1>:f      r29.0<8;1>:f      r29.0<1>:f       {F@2}
+// (W)     sync.nop                             null                             {A@2}
+//         mad (16|M0)              r36.0<1>:f    r35.0<8;1>:f      r34.0<8;1>:f      r51.0<0>:f
+//         mad (16|M0)              r33.0<1>:f    r32.0<8;1>:f      r28.0<8;1>:f      r28.0<1>:f       {F@2}
+//         math.rsqt (16|M0)        r37.0<1>:f    r33.0<8;8,1>:f                   {F@1}
+//         mul (16|M0)              r38.0<1>:f    r37.0<1;1,0>:f    r36.0<1;1,0>:f   {Compacted,A@1}
+//         sel (16|M0)   (ge)f0.0   r123.0<1>:f   r38.0<1;1,0>:f    0.0:f               {Compacted,F@1}
+//         send.urb (16|M0)         null     r1  r11:8  0x0            0x02024504           {A@1,$0} // wr:1+8, rd:0; store.urb.d32x8.a32.uc.uc
+//         mov (16|M0)              r127.0<1>:ud  r1.0<1;1,0>:ud                   {Compacted,$0.src}
+//         send.urb (16|M0)         null     r127  r123:4  0x20000            0x02023504           {EOT,A@1} // wr:1+4, rd:0; store.urb.d32x4.a32.uc.uc.flat[A+0x20]
+// L616:
 
 /*
 XDG setup:
@@ -1252,6 +1324,15 @@ typedef struct {
     bool           valid;
     // Monotonic render-engine completion seqno, published at the LRC status page.
     uint32_t       seqno;
+
+    // Registered per-context base addresses for batch buffer.
+    rvvm_addr_t    addr_general_state;
+    rvvm_addr_t    addr_surf_state;
+    rvvm_addr_t    addr_dynamic_state;
+    rvvm_addr_t    addr_indirect_object;
+    rvvm_addr_t    addr_instr;
+    rvvm_addr_t    addr_bindless_surface;
+    rvvm_addr_t    addr_bindless_sampler;
 } xe2_submit_ctx_t;
 
 typedef struct {
@@ -1707,17 +1788,17 @@ static inline uint32_t xe2_dma_read_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_
     }
 }
 
-static inline void xe2_dma_read_many(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_t off, uint32_t *out, uint32_t n)
+static inline void xe2_dma_read_many(xe2_dev_t *xe2, xe2_dma_addr_t dma, uint32_t *out, uint32_t n)
 {
     uint32_t total = n * sizeof(uint32_t);
 
     if (dma.type == XE2_MEM_LMEM) {
-        if (unlikely(dma.addr + off + total > XE2_VRAM_SIZE)) {
+        if (unlikely(dma.addr + total > XE2_VRAM_SIZE)) {
             return;
         }
-        memcpy(out, xe2->vram + dma.addr + off, total);
+        memcpy(out, xe2->vram + dma.addr, total);
     } else {
-        uint32_t *ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr + off, 4);
+        uint32_t *ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr, 4);
         memcpy(out, ptr, total);
         rvvm_pci_end_dma(xe2->pci_func, ptr);
     }
@@ -2095,13 +2176,14 @@ static void xe2_ring_store(xe2_dev_t *xe2, uint32_t ggtt_addr, uint32_t value)
 // Forward declaration due to nested handling inside BATCH_BUFFER_START.
 static uint32_t xe2_ring_cmd(
     xe2_dev_t *xe2,
+    xe2_submit_ctx_t *ctx,
     xe2_dma_addr_t ring,
     rvvm_addr_t pdp4,
     uint32_t op,
     bool *user_int
 );
 
-static inline uint32_t xe2_process_batch_buffer(xe2_dev_t *xe2, rvvm_addr_t pdp4, uint32_t op, rvvm_addr_t bo, bool *user_int)
+static inline uint32_t xe2_process_batch_buffer(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, rvvm_addr_t pdp4, uint32_t op, rvvm_addr_t bo, bool *user_int)
 {
     // From the command processor's point of view, we treat GGTT/PPGTT-allocated
     // rings in exactly the same way.
@@ -2129,7 +2211,7 @@ static inline uint32_t xe2_process_batch_buffer(xe2_dev_t *xe2, rvvm_addr_t pdp4
         }
 
         // Advance by reported from command handler length.
-        i += xe2_ring_cmd(xe2, xe2_dma_offset(ring, i * 4), pdp4, ring_op, user_int);
+        i += xe2_ring_cmd(xe2, ctx, xe2_dma_offset(ring, i * 4), pdp4, ring_op, user_int);
     }
     rvvm_info("(PPGTT) ... Done, moved %zu bytes", i);
 
@@ -2140,6 +2222,7 @@ static inline uint32_t xe2_process_batch_buffer(xe2_dev_t *xe2, rvvm_addr_t pdp4
 // currently processed instruction header (opcode).
 static inline uint32_t xe2_mi_cmd(
     xe2_dev_t *xe2,
+    xe2_submit_ctx_t *ctx,
     xe2_dma_addr_t ring,
     rvvm_addr_t pdp4,
     uint32_t op,
@@ -2176,7 +2259,7 @@ static inline uint32_t xe2_mi_cmd(
             uint32_t lo = xe2_dma_read_32(xe2, ring, 1 * 4);
             uint32_t hi = xe2_dma_read_32(xe2, ring, 2 * 4);
             rvvm_addr_t bo = xe2_concat_lohi(lo, hi);
-            return xe2_process_batch_buffer(xe2, pdp4, op, bo, user_int);
+            return xe2_process_batch_buffer(xe2, ctx, pdp4, op, bo, user_int);
         }
         default:
             return (op & 0xFF) + 2;
@@ -2205,9 +2288,56 @@ static inline rvvm_addr_t xe2_addr_63_6_mask(uint32_t lo, uint32_t hi)
     return (rvvm_addr_t) hi << 32 | (lo & 0xFFFFFFC0);
 }
 
+// Function was forged only for debugging purposes.
+static void xe2_print_decompiled_shader(xe2_dev_t *xe2, xe2_dma_addr_t dma)
+{
+    if (dma.addr == 0U) {
+        return;
+    }
+
+    static const uint32_t limit = 4096;
+    uint32_t code[4096] = {0};
+    uint32_t len = 0U;
+    uint32_t zeros = 0U;
+
+    for (uint32_t i = 0; i < limit; ++i) {
+        uint32_t op = xe2_dma_read_32(xe2, dma, i * 4);
+        code[i] = op;
+        if (op == 0U) {
+            if (++zeros >= 4 && len > 0) {
+                break;
+            }
+        } else {
+            zeros = 0;
+            len = i + 1;
+        }
+    }
+
+    int fd = open("decompiled.xe2", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        rvvm_warn("cannot open decompiled.xe2: %s", strerror(errno));
+        return;
+    }
+
+    uint32_t dump_len = len > limit ? limit : len;
+
+    if (write(fd, code, dump_len * sizeof(uint32_t)) == (ssize_t) -1) {
+        rvvm_warn("write() failed");
+    }
+    rvvm_info("dumped %u dwords (%u bytes) into decompiled.xe2",
+              dump_len, dump_len * 4);
+
+    if (system("xxd decompiled.xe2") != 0) {
+        rvvm_warn("xxd failed");
+    }
+    if (system("iga64 -d -p 2 decompiled.xe2 2>&1") != 0) {
+        rvvm_warn("iga64 failed");
+    }
+}
+
 // The supplied ring DMA address is normalized such that the first dword is the
 // currently processed instruction header (opcode).
-static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring, rvvm_addr_t pdp4, uint32_t op)
+static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe2_dma_addr_t ring, rvvm_addr_t pdp4, uint32_t op)
 {
     rvvm_info("GFX command (%02x, %02x)",
         XE2_GFXPIPE_OPCODE(op),
@@ -2238,30 +2368,36 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
             // accordingly. Store XE2_MAX_CONTEXTS addresses rather senseless,
             // find optimized approach.
             uint32_t cmd[21] = {0};
-            xe2_dma_read_many(xe2, ring, 0, cmd, STATIC_ARRAY_SIZE(cmd));
-            rvvm_addr_t addr_general_state    = xe2_addr_63_12_mask(cmd[ 1], cmd[ 2]);
-            rvvm_addr_t addr_surf_state       = xe2_addr_63_12_mask(cmd[ 4], cmd[ 5]);
-            rvvm_addr_t addr_dynamic_state    = xe2_addr_63_12_mask(cmd[ 6], cmd[ 7]);
-            rvvm_addr_t addr_indirect_object  = xe2_addr_63_12_mask(cmd[ 8], cmd[ 9]);
-            rvvm_addr_t addr_instr            = xe2_addr_63_12_mask(cmd[10], cmd[11]);
-            rvvm_addr_t addr_bindless_surface = xe2_addr_63_12_mask(cmd[16], cmd[17]);
-            rvvm_addr_t addr_bindless_sampler = xe2_addr_63_12_mask(cmd[19], cmd[20]);
-            rvvm_info("General State Base Address:     0x%lx", addr_general_state);
-            rvvm_info("Surface State Base Address:     0x%lx", addr_surf_state);
-            rvvm_info("Dynamic State Base Address:     0x%lx", addr_dynamic_state);
-            rvvm_info("Indirect Object Base Address:   0x%lx", addr_indirect_object);
-            rvvm_info("Instruction Base Address:       0x%lx", addr_instr);
-            rvvm_info("Bindless Surface Base Address:  0x%lx", addr_bindless_surface);
-            rvvm_info("Bindless Sampler Base Address:  0x%lx", addr_bindless_sampler);
+            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+            ctx->addr_general_state    = xe2_addr_63_12_mask(cmd[ 1], cmd[ 2]);
+            ctx->addr_surf_state       = xe2_addr_63_12_mask(cmd[ 4], cmd[ 5]);
+            ctx->addr_dynamic_state    = xe2_addr_63_12_mask(cmd[ 6], cmd[ 7]);
+            ctx->addr_indirect_object  = xe2_addr_63_12_mask(cmd[ 8], cmd[ 9]);
+            ctx->addr_instr            = xe2_addr_63_12_mask(cmd[10], cmd[11]);
+            ctx->addr_bindless_surface = xe2_addr_63_12_mask(cmd[16], cmd[17]);
+            ctx->addr_bindless_sampler = xe2_addr_63_12_mask(cmd[19], cmd[20]);
             break;
         }
         case XE2_GFXPIPE_CMD_3DSTATE_PS: {
             uint32_t cmd[10] = {0};
-            xe2_dma_read_many(xe2, ring, 0, cmd, STATIC_ARRAY_SIZE(cmd));
+            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
             rvvm_addr_t addr_kernel_0 = xe2_addr_63_6_mask(cmd[1], cmd[2]);
             rvvm_addr_t addr_kernel_1 = xe2_addr_63_6_mask(cmd[8], cmd[9]);
-            rvvm_info("Kernel Start Address 0:     0x%lx", addr_kernel_0);
-            rvvm_info("Kernel Start Address 1:     0x%lx", addr_kernel_1);
+            rvvm_info("(PS) Kernel Start Address 0: 0x%lx, 0x%lx", addr_kernel_0, ctx->addr_instr + addr_kernel_0);
+            rvvm_info("(PS) Kernel Start Address 1: 0x%lx, 0x%lx", addr_kernel_1, ctx->addr_instr + addr_kernel_1);
+
+            xe2_dma_addr_t kernel_dma_0 = xe2_ppgtt_translate(xe2, pdp4, addr_kernel_0);
+            xe2_print_decompiled_shader(xe2, kernel_dma_0);
+            break;
+        }
+        case XE2_GFXPIPE_CMD_3DSTATE_VS: {
+            uint32_t cmd[7] = {0};
+            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+            rvvm_addr_t addr_kernel_0 = xe2_addr_63_6_mask(cmd[1], cmd[2]);
+            rvvm_info("(VS) Kernel Start Address 0: 0x%lx", addr_kernel_0);
+
+            xe2_dma_addr_t kernel_dma_0 = xe2_ppgtt_translate(xe2, pdp4, addr_kernel_0);
+            xe2_print_decompiled_shader(xe2, kernel_dma_0);
             break;
         }
         default:
@@ -2274,6 +2410,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_dma_addr_t ring,
 
 static uint32_t xe2_ring_cmd(
     xe2_dev_t *xe2,
+    xe2_submit_ctx_t *ctx,
     xe2_dma_addr_t ring,
     rvvm_addr_t pdp4,
     uint32_t op,
@@ -2281,10 +2418,10 @@ static uint32_t xe2_ring_cmd(
 ) {
     switch (XE2_INSTR_TYPE(op)) {
         case XE2_INSTR_TYPE_MI:
-            return xe2_mi_cmd(xe2, ring, pdp4, op, user_int);
+            return xe2_mi_cmd(xe2, ctx, ring, pdp4, op, user_int);
             break;
         case XE2_INSTR_TYPE_GFXPIPE:
-            return xe2_ring_gfxpipe_cmd(xe2, ring, pdp4, op);
+            return xe2_ring_gfxpipe_cmd(xe2, ctx, ring, pdp4, op);
             break;
         case XE2_INSTR_TYPE_GSC:
             return (op & 0xFF) + 2;
@@ -2337,7 +2474,7 @@ static bool xe2_ring_replay(xe2_dev_t *xe2, uint32_t context_idx)
 
         // How many bytes was consumed by incoming command. That far we
         // will go over the buffer in the next iteration.
-        uint32_t len = xe2_ring_cmd(xe2, xe2_dma_offset(ring, i * 4), pdp4, op, &user_int);
+        uint32_t len = xe2_ring_cmd(xe2, ctx, xe2_dma_offset(ring, i * 4), pdp4, op, &user_int);
 
         i = (i + len) % ring_dw;
     }
