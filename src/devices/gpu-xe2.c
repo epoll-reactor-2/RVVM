@@ -11,6 +11,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_pci.h>
 #include <rvvm/rvvm_fb.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -1788,7 +1789,7 @@ static inline uint32_t xe2_dma_read_32(xe2_dev_t *xe2, xe2_dma_addr_t dma, size_
     }
 }
 
-static inline void xe2_dma_read_many(xe2_dev_t *xe2, xe2_dma_addr_t dma, uint32_t *out, uint32_t n)
+static inline void xe2_dma_read_many(xe2_dev_t *xe2, xe2_dma_addr_t dma, void *out, uint32_t n)
 {
     uint32_t total = n * sizeof(uint32_t);
 
@@ -2415,6 +2416,819 @@ static void xe2_guc_g2h_event(xe2_dev_t *xe2, uint32_t action,
 
 
 // -----------------------------------------------------------
+// Intel BRW assembly
+// -----------------------------------------------------------
+
+
+
+// Hardware 7-bit opcodes from [6:0] of each instruction.
+// Opcodes GFX12+/Xe2-compliant.
+#define XE2_BRW_OP_ILLEGAL                  0
+#define XE2_BRW_OP_SYNC                     1
+#define XE2_BRW_OP_MOV                      97
+#define XE2_BRW_OP_SEL                      98
+#define XE2_BRW_OP_MOVI                     99
+#define XE2_BRW_OP_NOT                      100
+#define XE2_BRW_OP_AND                      101
+#define XE2_BRW_OP_OR                       102
+#define XE2_BRW_OP_XOR                      103
+#define XE2_BRW_OP_SHR                      104
+#define XE2_BRW_OP_SHL                      105
+#define XE2_BRW_OP_SMOV                     106
+#define XE2_BRW_OP_BFN                      107
+#define XE2_BRW_OP_ASR                      108
+#define XE2_BRW_OP_ROR                      110
+#define XE2_BRW_OP_ROL                      111
+#define XE2_BRW_OP_CMP                      112
+#define XE2_BRW_OP_CMPN                     113
+#define XE2_BRW_OP_CSEL                     114
+#define XE2_BRW_OP_BFREV                    119
+#define XE2_BRW_OP_BFE                      120
+#define XE2_BRW_OP_BFI1                     121
+#define XE2_BRW_OP_BFI2                     122
+#define XE2_BRW_OP_JMPI                     32
+#define XE2_BRW_OP_BRD                      33
+#define XE2_BRW_OP_IF                       34
+#define XE2_BRW_OP_BRC                      35
+#define XE2_BRW_OP_ELSE                     36
+#define XE2_BRW_OP_ENDIF                    37
+#define XE2_BRW_OP_WHILE                    39
+#define XE2_BRW_OP_BREAK                    40
+#define XE2_BRW_OP_CONT                     41
+#define XE2_BRW_OP_HALT                     42
+#define XE2_BRW_OP_CALLA                    43
+#define XE2_BRW_OP_CALL                     44
+#define XE2_BRW_OP_RET                      45
+#define XE2_BRW_OP_GOTO                     46
+#define XE2_BRW_OP_JOIN                     47
+#define XE2_BRW_OP_SEND                     49
+#define XE2_BRW_OP_SENDC                    50
+#define XE2_BRW_OP_SENDS                    51
+#define XE2_BRW_OP_SENDSC                   52
+#define XE2_BRW_OP_MATH                     56
+#define XE2_BRW_OP_ADD                      64
+#define XE2_BRW_OP_MUL                      65
+#define XE2_BRW_OP_AVG                      66
+#define XE2_BRW_OP_FRC                      67
+#define XE2_BRW_OP_RNDU                     68
+#define XE2_BRW_OP_RNDD                     69
+#define XE2_BRW_OP_RNDE                     70
+#define XE2_BRW_OP_RNDZ                     71
+#define XE2_BRW_OP_MAC                      72
+#define XE2_BRW_OP_MACH                     73
+#define XE2_BRW_OP_LZD                      74
+#define XE2_BRW_OP_FBH                      75
+#define XE2_BRW_OP_FBL                      76
+#define XE2_BRW_OP_CBIT                     77
+#define XE2_BRW_OP_ADDC                     78
+#define XE2_BRW_OP_SUBB                     79
+#define XE2_BRW_OP_ADD3                     82
+#define XE2_BRW_OP_MACL                     83
+#define XE2_BRW_OP_SRND                     84
+#define XE2_BRW_OP_DP4A                     88
+#define XE2_BRW_OP_DPAS                     89
+#define XE2_BRW_OP_MAD                      91
+#define XE2_BRW_OP_MADM                     93
+#define XE2_BRW_OP_NOP                      96
+
+#define XE2_BRW_HW_OPCODE_HI                6
+#define XE2_BRW_HW_OPCODE_LO                0
+#define XE2_BRW_CMPT_CONTROL_BIT            29
+
+// Generic (0/1/2-source) native instructions fields.
+#define XE2_BRW_EXEC_SIZE_HI                20
+#define XE2_BRW_EXEC_SIZE_LO                18
+#define XE2_BRW_PRED_INV_BIT                28
+#define XE2_BRW_PRED_CONTROL_HI             27
+#define XE2_BRW_PRED_CONTROL_LO             26
+#define XE2_BRW_QTR_CONTROL_HI              25
+#define XE2_BRW_QTR_CONTROL_LO              24
+#define XE2_BRW_MASK_CONTROL_BIT            31
+#define XE2_BRW_SATURATE_BIT                34
+#define XE2_BRW_DEBUG_CONTROL_BIT           30
+#define XE2_BRW_COND_MODIFIER_HI            95
+#define XE2_BRW_COND_MODIFIER_LO            92
+#define XE2_BRW_SWSB_HI                     17
+#define XE2_BRW_SWSB_LO                     8
+#define XE2_BRW_FLAG_SUBREG_BIT             21
+#define XE2_BRW_FLAG_REG_HI                 23
+#define XE2_BRW_FLAG_REG_LO                 22
+#define XE2_BRW_DST_REG_FILE_BIT            50
+#define XE2_BRW_DST_HWTYPE_HI               39
+#define XE2_BRW_DST_HWTYPE_LO               36
+#define XE2_BRW_DST_REG_NR_HI               63
+#define XE2_BRW_DST_REG_NR_LO               56
+#define XE2_BRW_DST_SUBREG_HI               55
+#define XE2_BRW_DST_SUBREG_LO               51
+#define XE2_BRW_DST_SUBREG_LSB_BIT          33
+#define XE2_BRW_DST_HSTRIDE_HI              49
+#define XE2_BRW_DST_HSTRIDE_LO              48
+#define XE2_BRW_DST_ADDRESS_MODE_BIT        35
+
+#define XE2_BRW_SRC0_REG_FILE_BIT           66
+#define XE2_BRW_SRC0_IS_IMM_BIT             46
+#define XE2_BRW_SRC0_HWTYPE_HI              43
+#define XE2_BRW_SRC0_HWTYPE_LO              40
+#define XE2_BRW_SRC0_REG_NR_HI              79
+#define XE2_BRW_SRC0_REG_NR_LO              72
+#define XE2_BRW_SRC0_DA1_SUBREG_HI          71
+#define XE2_BRW_SRC0_DA1_SUBREG_LO          67
+#define XE2_BRW_SRC0_IA_SUBREG_HI           79
+#define XE2_BRW_SRC0_IA_SUBREG_LO           76
+#define XE2_BRW_SRC0_SUBREG_LSB_BIT         87
+#define XE2_BRW_SRC0_VSTRIDE_HI             86
+#define XE2_BRW_SRC0_VSTRIDE_LO             84
+#define XE2_BRW_SRC0_WIDTH_HI               83
+#define XE2_BRW_SRC0_WIDTH_LO               81
+#define XE2_BRW_SRC0_HSTRIDE_HI             65
+#define XE2_BRW_SRC0_HSTRIDE_LO             64
+#define XE2_BRW_SRC0_ADDRESS_MODE_BIT       80
+#define XE2_BRW_SRC0_NEGATE_BIT             45
+#define XE2_BRW_SRC0_ABS_BIT                44
+
+#define XE2_BRW_SRC1_IS_IMM_BIT             47
+#define XE2_BRW_SRC1_HWTYPE_HI              91
+#define XE2_BRW_SRC1_HWTYPE_LO              88
+#define XE2_BRW_SRC1_DA_REG_NR_HI           111
+#define XE2_BRW_SRC1_DA_REG_NR_LO           104
+#define XE2_BRW_SRC1_DA1_SUBREG_HI          103
+#define XE2_BRW_SRC1_DA1_SUBREG_LO          99
+#define XE2_BRW_SRC1_IA_SUBREG_HI           111
+#define XE2_BRW_SRC1_IA_SUBREG_LO           108
+#define XE2_BRW_SRC1_HSTRIDE_HI             97
+#define XE2_BRW_SRC1_HSTRIDE_LO             96
+#define XE2_BRW_SRC1_NEGATE_BIT             121
+#define XE2_BRW_SRC1_ABS_BIT                120
+#define XE2_BRW_SRC1_VSTRIDE_HI             118
+#define XE2_BRW_SRC1_VSTRIDE_LO             116
+#define XE2_BRW_SRC1_WIDTH_HI               115
+#define XE2_BRW_SRC1_WIDTH_LO               113
+#define XE2_BRW_SRC1_ADDRESS_MODE_BIT       112
+
+// 3-source (align1, "mad"-style) native instruction fields.
+#define XE2_BRW_A3_EXEC_TYPE_BIT            39
+#define XE2_BRW_A3_DST_REG_FILE_BIT         50
+#define XE2_BRW_A3_DST_HWTYPE_HI            38
+#define XE2_BRW_A3_DST_HWTYPE_LO            36
+#define XE2_BRW_A3_DST_REG_NR_HI            63
+#define XE2_BRW_A3_DST_REG_NR_LO            56
+#define XE2_BRW_A3_DST_SUBREG_HI            55
+#define XE2_BRW_A3_DST_SUBREG_LO            51
+#define XE2_BRW_A3_DST_HSTRIDE_BIT          48
+
+#define XE2_BRW_A3_SRC0_REG_FILE_BIT        66
+#define XE2_BRW_A3_SRC0_IS_IMM_BIT          46
+#define XE2_BRW_A3_SRC0_HWTYPE_HI           42
+#define XE2_BRW_A3_SRC0_HWTYPE_LO           40
+#define XE2_BRW_A3_SRC0_REG_NR_HI           79
+#define XE2_BRW_A3_SRC0_REG_NR_LO           72
+#define XE2_BRW_A3_SRC0_SUBREG_HI           71
+#define XE2_BRW_A3_SRC0_SUBREG_LO           67
+#define XE2_BRW_A3_SRC0_HSTRIDE_HI          65
+#define XE2_BRW_A3_SRC0_HSTRIDE_LO          64
+#define XE2_BRW_A3_SRC0_NEGATE_BIT          45
+#define XE2_BRW_A3_SRC0_ABS_BIT             44
+
+#define XE2_BRW_A3_SRC1_REG_NR_HI           111
+#define XE2_BRW_A3_SRC1_REG_NR_LO           104
+#define XE2_BRW_A3_SRC1_SUBREG_HI           103
+#define XE2_BRW_A3_SRC1_SUBREG_LO           99
+#define XE2_BRW_A3_SRC1_REG_FILE_BIT        98
+#define XE2_BRW_A3_SRC1_HSTRIDE_HI          97
+#define XE2_BRW_A3_SRC1_HSTRIDE_LO          96
+#define XE2_BRW_A3_SRC1_HWTYPE_HI           90
+#define XE2_BRW_A3_SRC1_HWTYPE_LO           88
+#define XE2_BRW_A3_SRC1_NEGATE_BIT          87
+#define XE2_BRW_A3_SRC1_ABS_BIT             86
+
+#define XE2_BRW_A3_SRC2_REG_NR_HI           127
+#define XE2_BRW_A3_SRC2_REG_NR_LO           120
+#define XE2_BRW_A3_SRC2_SUBREG_HI           119
+#define XE2_BRW_A3_SRC2_SUBREG_LO           115
+#define XE2_BRW_A3_SRC2_REG_FILE_BIT        114
+#define XE2_BRW_A3_SRC2_HSTRIDE_HI          113
+#define XE2_BRW_A3_SRC2_HSTRIDE_LO          112
+#define XE2_BRW_A3_SRC2_NEGATE_BIT          85
+#define XE2_BRW_A3_SRC2_ABS_BIT             84
+#define XE2_BRW_A3_SRC2_HWTYPE_HI           82
+#define XE2_BRW_A3_SRC2_HWTYPE_LO           80
+
+// SEND/SENDC native instruction fields.
+#define XE2_BRW_SEND_SRC1_REG_NR_HI         111
+#define XE2_BRW_SEND_SRC1_REG_NR_LO         104
+#define XE2_BRW_SEND_SRC1_LEN_HI            103
+#define XE2_BRW_SEND_SRC1_LEN_LO            99
+#define XE2_BRW_SEND_SRC1_REG_FILE_BIT      98
+#define XE2_BRW_SEND_SFID_HI                95
+#define XE2_BRW_SEND_SFID_LO                92
+#define XE2_BRW_SEND_EX_DESC_IA_SUBREG_HI   42
+#define XE2_BRW_SEND_EX_DESC_IA_SUBREG_LO   40
+#define XE2_BRW_SEND_EX_BSO_BIT             39
+#define XE2_BRW_SEND_SEL_REG32_DESC_BIT     48
+#define XE2_BRW_SEND_SEL_REG32_EX_DESC_BIT  49
+#define XE2_BRW_SEND_DST_REG_FILE_BIT       50
+#define XE2_BRW_SEND_EOT_BIT                34
+
+// Compacted (8-byte) instructions
+#define XE2_BRW_C_CONTROL_INDEX_HI          22
+#define XE2_BRW_C_CONTROL_INDEX_LO          18
+#define XE2_BRW_C_DATATYPE_LO_HI            28
+#define XE2_BRW_C_DATATYPE_LO_LO            26
+#define XE2_BRW_C_DATATYPE_HI_HI            31
+#define XE2_BRW_C_DATATYPE_HI_LO            30
+#define XE2_BRW_C_SUBREG_INDEX_HI           51
+#define XE2_BRW_C_SUBREG_INDEX_LO           48
+#define XE2_BRW_C_SRC0_INDEX_HI             25
+#define XE2_BRW_C_SRC0_INDEX_LO             23
+#define XE2_BRW_C_SRC1_INDEX_HI             55
+#define XE2_BRW_C_SRC1_INDEX_LO             52
+#define XE2_BRW_C_DST_REG_NR_HI             39
+#define XE2_BRW_C_DST_REG_NR_LO             32
+#define XE2_BRW_C_DST_HSTRIDE_HI            49
+#define XE2_BRW_C_DST_HSTRIDE_LO            48
+#define XE2_BRW_C_SRC0_REG_NR_HI            47
+#define XE2_BRW_C_SRC0_REG_NR_LO            40
+#define XE2_BRW_C_SRC1_REG_NR_HI            63
+#define XE2_BRW_C_SRC1_REG_NR_LO            56
+#define XE2_BRW_C_SWSB_HI                   17
+#define XE2_BRW_C_SWSB_LO                   8
+#define XE2_BRW_C_DEBUG_CONTROL_BIT         7
+
+// Compacted (8-byte) instruction, 3-source form.
+#define XE2_BRW_C3_DST_REG_NR_HI            39
+#define XE2_BRW_C3_DST_REG_NR_LO            32
+#define XE2_BRW_C3_SRC_INDEX_HI             25
+#define XE2_BRW_C3_SRC_INDEX_LO             22
+#define XE2_BRW_C3_CONTROL_INDEX_HI         21
+#define XE2_BRW_C3_CONTROL_INDEX_LO         18
+#define XE2_BRW_C3_SWSB_HI                  17
+#define XE2_BRW_C3_SWSB_LO                  8
+
+typedef struct {
+    uint64_t lo;
+    uint64_t hi;
+} xe2_qword_t;
+
+// Pull bits [hi:lo] (inclusive) out of a 128-bit instruction word.
+static inline uint64_t xe2_brw_mask(const xe2_qword_t *w, int mask_lo, int mask_hi)
+{
+    if (mask_hi < 0 || mask_lo < 0 || mask_hi < mask_lo) {
+        return 0;
+    }
+
+    int width = mask_hi - mask_lo + 1;
+    if (width > 64) {
+        width = 64;
+    }
+
+    uint64_t mask = (width == 64) ? ~0ULL : ((1ULL << width) - 1);
+
+    if (mask_lo >= 64) {
+        return (w->hi >> (mask_lo - 64)) & mask;
+    }
+    if (mask_hi < 64) {
+        return (w->lo >> mask_lo) & mask;
+    }
+
+    uint64_t lo = w->lo >> mask_lo;
+    uint64_t hi = w->hi << (64 - mask_lo);
+    return (lo | hi) & mask;
+}
+
+static int xe2_brw_op_nsrc(unsigned op)
+{
+    switch (op) {
+        case XE2_BRW_OP_MOV:
+        case XE2_BRW_OP_NOT:
+        case XE2_BRW_OP_FRC:
+        case XE2_BRW_OP_RNDU:
+        case XE2_BRW_OP_RNDD:
+        case XE2_BRW_OP_RNDE:
+        case XE2_BRW_OP_RNDZ:
+        case XE2_BRW_OP_LZD:
+        case XE2_BRW_OP_FBH:
+        case XE2_BRW_OP_FBL:
+        case XE2_BRW_OP_CBIT:
+        case XE2_BRW_OP_BFREV:
+        case XE2_BRW_OP_SYNC:
+            return 1;
+        case XE2_BRW_OP_SEL:
+        case XE2_BRW_OP_AND:
+        case XE2_BRW_OP_OR:
+        case XE2_BRW_OP_XOR:
+        case XE2_BRW_OP_SHR:
+        case XE2_BRW_OP_SHL:
+        case XE2_BRW_OP_ASR:
+        case XE2_BRW_OP_ROR:
+        case XE2_BRW_OP_ROL:
+        case XE2_BRW_OP_CMP:
+        case XE2_BRW_OP_CMPN:
+        case XE2_BRW_OP_BFI1:
+        case XE2_BRW_OP_MATH:
+        case XE2_BRW_OP_ADD:
+        case XE2_BRW_OP_MUL:
+        case XE2_BRW_OP_AVG:
+        case XE2_BRW_OP_MAC:
+        case XE2_BRW_OP_MACH:
+        case XE2_BRW_OP_ADDC:
+        case XE2_BRW_OP_SUBB:
+        case XE2_BRW_OP_MACL:
+        case XE2_BRW_OP_SRND:
+        case XE2_BRW_OP_SEND:
+        case XE2_BRW_OP_SENDC:
+            return 2;
+        case XE2_BRW_OP_BFN:
+        case XE2_BRW_OP_CSEL:
+        case XE2_BRW_OP_BFE:
+        case XE2_BRW_OP_BFI2:
+        case XE2_BRW_OP_ADD3:
+        case XE2_BRW_OP_DP4A:
+        case XE2_BRW_OP_DPAS:
+        case XE2_BRW_OP_MAD:
+        case XE2_BRW_OP_MADM:
+            return 3;
+        default:
+            return 0;
+    }
+}
+
+static inline bool xe2_brw_op_send(uint32_t op)
+{
+    return op == XE2_BRW_OP_SEND || op == XE2_BRW_OP_SENDC;
+}
+
+static inline bool xe2_brw_op_3_src(uint32_t op)
+{
+    return xe2_brw_op_nsrc(op) == 3 && !xe2_brw_op_send(op);
+}
+
+static inline uint32_t xe2_brw_op_type_size(uint32_t hw_type)
+{
+    // 0 -> 1
+    // 1 -> 2
+    // 2 -> 4
+    // 3 -> 8
+    return 1U << (hw_type & 0x3);
+}
+
+static const char *xe2_brw_op_name(unsigned op)
+{
+    switch (op) {
+        case XE2_BRW_OP_ILLEGAL: return "illegal";
+        case XE2_BRW_OP_SYNC: return "sync";
+        case XE2_BRW_OP_MOV: return "mov";
+        case XE2_BRW_OP_SEL: return "sel";
+        case XE2_BRW_OP_MOVI: return "movi";
+        case XE2_BRW_OP_NOT: return "not";
+        case XE2_BRW_OP_AND: return "and";
+        case XE2_BRW_OP_OR: return "or";
+        case XE2_BRW_OP_XOR: return "xor";
+        case XE2_BRW_OP_BFN: return "bfn";
+        case XE2_BRW_OP_SHR: return "shr";
+        case XE2_BRW_OP_SHL: return "shl";
+        case XE2_BRW_OP_SMOV: return "smov";
+        case XE2_BRW_OP_ASR: return "asr";
+        case XE2_BRW_OP_ROR: return "ror";
+        case XE2_BRW_OP_ROL: return "rol";
+        case XE2_BRW_OP_CMP: return "cmp";
+        case XE2_BRW_OP_CMPN: return "cmpn";
+        case XE2_BRW_OP_CSEL: return "csel";
+        case XE2_BRW_OP_BFREV: return "bfrev";
+        case XE2_BRW_OP_BFE: return "bfe";
+        case XE2_BRW_OP_BFI1: return "bfi1";
+        case XE2_BRW_OP_BFI2: return "bfi2";
+        case XE2_BRW_OP_JMPI: return "jmpi";
+        case XE2_BRW_OP_BRD: return "brd";
+        case XE2_BRW_OP_IF: return "if";
+        case XE2_BRW_OP_BRC: return "brc";
+        case XE2_BRW_OP_ELSE: return "else";
+        case XE2_BRW_OP_ENDIF: return "endif";
+        case XE2_BRW_OP_WHILE: return "while";
+        case XE2_BRW_OP_BREAK: return "break";
+        case XE2_BRW_OP_CONT: return "cont";
+        case XE2_BRW_OP_HALT: return "halt";
+        case XE2_BRW_OP_CALLA: return "calla";
+        case XE2_BRW_OP_CALL: return "call";
+        case XE2_BRW_OP_RET: return "ret";
+        case XE2_BRW_OP_GOTO: return "goto";
+        case XE2_BRW_OP_JOIN: return "join";
+        case XE2_BRW_OP_SEND: return "send";
+        case XE2_BRW_OP_SENDC: return "sendc";
+        case XE2_BRW_OP_MATH: return "math";
+        case XE2_BRW_OP_ADD: return "add";
+        case XE2_BRW_OP_MUL: return "mul";
+        case XE2_BRW_OP_AVG: return "avg";
+        case XE2_BRW_OP_FRC: return "frc";
+        case XE2_BRW_OP_RNDU: return "rndu";
+        case XE2_BRW_OP_RNDD: return "rndd";
+        case XE2_BRW_OP_RNDE: return "rnde";
+        case XE2_BRW_OP_RNDZ: return "rndz";
+        case XE2_BRW_OP_MAC: return "mac";
+        case XE2_BRW_OP_MACH: return "mach";
+        case XE2_BRW_OP_LZD: return "lzd";
+        case XE2_BRW_OP_FBH: return "fbh";
+        case XE2_BRW_OP_FBL: return "fbl";
+        case XE2_BRW_OP_CBIT: return "cbit";
+        case XE2_BRW_OP_ADDC: return "addc";
+        case XE2_BRW_OP_SUBB: return "subb";
+        case XE2_BRW_OP_ADD3: return "add3";
+        case XE2_BRW_OP_MACL: return "macl";
+        case XE2_BRW_OP_SRND: return "srnd";
+        case XE2_BRW_OP_DP4A: return "dp4a";
+        case XE2_BRW_OP_DPAS: return "dpas";
+        case XE2_BRW_OP_MAD: return "mad";
+        case XE2_BRW_OP_MADM: return "madm";
+        case XE2_BRW_OP_NOP: return "nop";
+        default: return "???";
+    }
+}
+
+// Instruction operand expansion tables. Compact
+// EU instructions does not contain full payload regioning fields,
+// instead, they contain small indicies to these tables. Values in
+// these tables has exact format of uncompacted 128-bit instruction.
+static const uint16_t xe2_subreg_table[16] = {
+    0b000000000000, // .0 .0
+    0b000010000000, // .0 .4
+    0b000000000100, // .4 .0
+    0b010000000000, // .0 .32
+    0b001000000000, // .0 .16
+    0b000000001000, // .8 .0
+    0b000100000000, // .0 .8
+    0b010100000000, // .0 .40
+    0b011000000000, // .0 .48
+    0b000110000000, // .0 .12
+    0b000000010000, // .16 .0
+    0b011010000000, // .0 .52
+    0b001100000000, // .0 .24
+    0b011100000000, // .0 .56
+    0b010110000000, // .0 .44
+    0b010010000000, // .0 .36
+};
+
+static const uint16_t xe2_src0_index_table[8] = {
+    0b00100000000, //  r<1;1,0>
+    0b00000000000, //  r<0;1,0>
+    0b01000000000, //  r<2;1,0>
+    0b00100000010, // -r<1;1,0>
+    0b01100000000, //  r<4;1,0>
+    0b00100000001, //  (abs)r<1;1,0>
+    0b00000000010, // -r<0;1,0>
+    0b01001000000, //  r<2;4,0>
+};
+
+static const uint16_t xe2_src1_index_table[16] = {
+    0b0000100000000000, //  r<1;1,0>.0
+    0b0000000000000000, //  r<0;1,0>.0
+    0b1000100000000000, // -r<1;1,0>.0
+    0b0000000000010000, //  r<0;1,0>.8
+    0b0000000000001000, //  r<0;1,0>.4
+    0b0000000000011000, //  r<0;1,0>.12
+    0b0000000001010000, //  r<0;1,0>.40
+    0b0000000001000000, //  r<0;1,0>.32
+    0b0000000000100000, //  r<0;1,0>.16
+    0b0000000001111000, //  r<0;1,0>.60
+    0b0000000000111000, //  r<0;1,0>.28
+    0b0000000000101000, //  r<0;1,0>.20
+    0b0000000001011000, //  r<0;1,0>.44
+    0b0000000001001000, //  r<0;1,0>.36
+    0b0000000001110000, //  r<0;1,0>.56
+    0b0000000000110000, //  r<0;1,0>.24
+};
+
+static const uint32_t xe2_brw_hstride_decode[4] = {
+    0, 1, 2, 4
+};
+
+static const uint32_t xe2_brw_width_decode[8] = {
+    1, 2, 4, 8, 16, 32, 0, 0
+};
+
+static const uint32_t xe2_brw_vstride_decode[8] = {
+    0, 1, 2, 4, 8, 16, 32, 64
+};
+
+static void xe2_brw_decode_compact(const xe2_qword_t *qw, uint32_t op)
+{
+    uint32_t debug_control = xe2_brw_mask(qw, XE2_BRW_C_DEBUG_CONTROL_BIT, XE2_BRW_C_DEBUG_CONTROL_BIT);
+    uint32_t swsb          = xe2_brw_mask(qw, XE2_BRW_C_SWSB_LO, XE2_BRW_C_SWSB_HI);
+
+    if (xe2_brw_op_3_src(op)) {
+        uint32_t dst_reg_nr = xe2_brw_mask(qw, XE2_BRW_C3_DST_REG_NR_LO, XE2_BRW_C3_DST_REG_NR_HI);
+        uint32_t src_idx    = xe2_brw_mask(qw, XE2_BRW_C3_SRC_INDEX_LO, XE2_BRW_C3_SRC_INDEX_HI);
+        uint32_t ctrl_idx   = xe2_brw_mask(qw, XE2_BRW_C3_CONTROL_INDEX_LO, XE2_BRW_C3_CONTROL_INDEX_HI);
+
+        rvvm_info("op:(c) %s <compact 3src>: dst=r%u src=r%u ctrl=%u",
+            xe2_brw_op_name(op), dst_reg_nr, src_idx, ctrl_idx
+        );
+    } else {
+        uint32_t exec_size    =  xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
+        uint32_t pred_inv     =  xe2_brw_mask(qw, XE2_BRW_PRED_INV_BIT, XE2_BRW_PRED_INV_BIT);
+        uint32_t pred_control =  xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI);
+        uint32_t ctrl_idx     =  xe2_brw_mask(qw, XE2_BRW_C_CONTROL_INDEX_LO, XE2_BRW_C_CONTROL_INDEX_HI);
+        uint32_t dt_idx       =  xe2_brw_mask(qw, XE2_BRW_C_DATATYPE_LO_LO, XE2_BRW_C_DATATYPE_LO_HI)
+                              | (xe2_brw_mask(qw, XE2_BRW_C_DATATYPE_HI_LO, XE2_BRW_C_DATATYPE_HI_HI) << 3);
+        uint32_t subreg_idx   =  xe2_brw_mask(qw, XE2_BRW_C_SUBREG_INDEX_LO, XE2_BRW_C_SUBREG_INDEX_HI);
+        uint32_t src0_idx     =  xe2_brw_mask(qw, XE2_BRW_C_SRC0_INDEX_LO, XE2_BRW_C_SRC0_INDEX_HI);
+        uint32_t src1_idx     =  xe2_brw_mask(qw, XE2_BRW_C_SRC1_INDEX_LO, XE2_BRW_C_SRC1_INDEX_HI);
+        uint32_t dst_reg      =  xe2_brw_mask(qw, XE2_BRW_C_DST_REG_NR_LO, XE2_BRW_C_DST_REG_NR_HI);
+        uint32_t dst_hstride  =  xe2_brw_mask(qw, XE2_BRW_C_DST_HSTRIDE_LO, XE2_BRW_C_DST_HSTRIDE_HI);
+        uint32_t src0_reg     =  xe2_brw_mask(qw, XE2_BRW_C_SRC0_REG_NR_LO, XE2_BRW_C_SRC0_REG_NR_HI);
+        uint32_t src1_reg     =  xe2_brw_mask(qw, XE2_BRW_C_SRC1_REG_NR_LO, XE2_BRW_C_SRC1_REG_NR_HI);
+
+        uint16_t subreg       = xe2_subreg_table[subreg_idx];
+        uint16_t src0_desc    = xe2_src0_index_table[src0_idx];
+        uint16_t src1_desc    = xe2_src1_index_table[src1_idx];
+        uint32_t dst_subreg   = (subreg >> 0) & 0x1F;
+
+        uint32_t src0_subreg  = (subreg >> 7) & 0x1F;
+        uint32_t src0_hstride = xe2_brw_hstride_decode[(src0_desc >> 0) & 0x3];
+        uint32_t src0_width   = xe2_brw_width_decode  [(src0_desc >> 5) & 0x7];
+        uint32_t src0_vstride = xe2_brw_vstride_decode[(src0_desc >> 8) & 0x7];
+        uint32_t src0_abs     = (src0_desc >>  1) & 1;
+        uint32_t src0_neg     = (src0_desc >> 10) & 1;
+        uint32_t src1_subreg  = (src1_desc >>  3) & 0x1F;
+        uint32_t src1_hstride = (src1_desc >>  0) & 0x3;
+        uint32_t src1_width   = (src1_desc >>  5) & 0x7;
+        uint32_t src1_vstride = (src1_desc >>  8) & 0x7;
+        uint32_t src1_abs     = (src1_desc >> 11) & 1;
+        uint32_t src1_neg     = (src1_desc >> 15) & 1;
+
+        rvvm_info("op:(c) %s (%02u|%02u)\tr%u.%u<%u>\tr%u.%u<%u.%u.%u>\t\tr%u.%u<%u.%u.%u>",
+            xe2_brw_op_name(op),
+            1 << exec_size, pred_control,
+            dst_reg, dst_subreg, dst_hstride,
+            src0_reg, src0_subreg, src0_vstride, src0_width, src0_hstride,
+            src1_reg, src1_subreg, src1_vstride, src1_width, src1_hstride
+        );
+    }
+}
+
+static void xe2_brw_decode_3_src_native(const xe2_qword_t *qw, uint32_t op)
+{
+    uint32_t exec_size      = xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
+    uint32_t pred_inv       = xe2_brw_mask(qw, XE2_BRW_PRED_INV_BIT, XE2_BRW_PRED_INV_BIT);
+    uint32_t pred_control   = xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI);
+    uint32_t qtr_control    = xe2_brw_mask(qw, XE2_BRW_QTR_CONTROL_LO, XE2_BRW_QTR_CONTROL_HI);
+    uint32_t mask_control   = xe2_brw_mask(qw, XE2_BRW_MASK_CONTROL_BIT, XE2_BRW_MASK_CONTROL_BIT);
+    uint32_t saturate       = xe2_brw_mask(qw, XE2_BRW_SATURATE_BIT, XE2_BRW_SATURATE_BIT);
+    uint32_t cond_modifier  = xe2_brw_mask(qw, XE2_BRW_COND_MODIFIER_LO, XE2_BRW_COND_MODIFIER_HI);
+    uint32_t swsb           = xe2_brw_mask(qw, XE2_BRW_SWSB_LO, XE2_BRW_SWSB_HI);
+    uint32_t exec_type      = xe2_brw_mask(qw, XE2_BRW_A3_EXEC_TYPE_BIT, XE2_BRW_A3_EXEC_TYPE_BIT);
+
+    uint32_t dst_file       = xe2_brw_mask(qw, XE2_BRW_A3_DST_REG_FILE_BIT, XE2_BRW_A3_DST_REG_FILE_BIT);
+    uint32_t dst_type       = xe2_brw_mask(qw, XE2_BRW_A3_DST_HWTYPE_LO, XE2_BRW_A3_DST_HWTYPE_HI);
+    uint32_t dst_reg        = xe2_brw_mask(qw, XE2_BRW_A3_DST_REG_NR_LO, XE2_BRW_A3_DST_REG_NR_HI);
+    uint32_t dst_subreg     = xe2_brw_mask(qw, XE2_BRW_A3_DST_SUBREG_LO, XE2_BRW_A3_DST_SUBREG_HI);
+    uint32_t dst_hstride    = xe2_brw_mask(qw, XE2_BRW_A3_DST_HSTRIDE_BIT, XE2_BRW_A3_DST_HSTRIDE_BIT);
+
+    uint32_t s0_file        = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_REG_FILE_BIT, XE2_BRW_A3_SRC0_REG_FILE_BIT);
+    uint32_t s0_imm         = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_IS_IMM_BIT, XE2_BRW_A3_SRC0_IS_IMM_BIT);
+    uint32_t s0_type        = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HWTYPE_LO, XE2_BRW_A3_SRC0_HWTYPE_HI);
+    uint32_t s0_reg         = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_REG_NR_LO, XE2_BRW_A3_SRC0_REG_NR_HI);
+    uint32_t s0_hstride     = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HSTRIDE_LO, XE2_BRW_A3_SRC0_HSTRIDE_HI);
+    uint32_t s0_sub         = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_SUBREG_LO, XE2_BRW_A3_SRC0_SUBREG_HI);
+    uint32_t s0_neg         = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_NEGATE_BIT, XE2_BRW_A3_SRC0_NEGATE_BIT);
+    uint32_t s0_abs         = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_ABS_BIT, XE2_BRW_A3_SRC0_ABS_BIT);
+
+    uint32_t s1_file        = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_REG_FILE_BIT, XE2_BRW_A3_SRC1_REG_FILE_BIT);
+    uint32_t s1_type        = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HWTYPE_LO, XE2_BRW_A3_SRC1_HWTYPE_HI);
+    uint32_t s1_reg         = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_REG_NR_LO, XE2_BRW_A3_SRC1_REG_NR_HI);
+    uint32_t s1_sub         = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_SUBREG_LO, XE2_BRW_A3_SRC1_SUBREG_HI);
+    uint32_t s1_hstride     = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HSTRIDE_LO, XE2_BRW_A3_SRC1_HSTRIDE_HI);
+    uint32_t s1_neg         = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_NEGATE_BIT, XE2_BRW_A3_SRC1_NEGATE_BIT);
+    uint32_t s1_abs         = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_ABS_BIT, XE2_BRW_A3_SRC1_ABS_BIT);
+
+    uint32_t s2_file        = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_REG_FILE_BIT, XE2_BRW_A3_SRC2_REG_FILE_BIT);
+    uint32_t s2_type        = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HWTYPE_LO, XE2_BRW_A3_SRC2_HWTYPE_HI);
+    uint32_t s2_reg         = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_REG_NR_LO, XE2_BRW_A3_SRC2_REG_NR_HI);
+    uint32_t s2_sub         = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_SUBREG_LO, XE2_BRW_A3_SRC2_SUBREG_HI);
+    uint32_t s2_hstride     = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HSTRIDE_LO, XE2_BRW_A3_SRC2_HSTRIDE_HI);
+    uint32_t s2_neg         = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_NEGATE_BIT, XE2_BRW_A3_SRC2_NEGATE_BIT);
+    uint32_t s2_abs         = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_ABS_BIT, XE2_BRW_A3_SRC2_ABS_BIT);
+
+    rvvm_info("op:    %s (%02u|%02u)\tr%u.%u<%u>:%u\tr%u.%u<%u>:%u\t\tr%u.%u<%u>:%u\tr%u.%u<%u>:%u",
+        xe2_brw_op_name(op),
+        1 << exec_size, pred_control,
+        dst_reg, dst_subreg, dst_hstride, dst_type,
+        s0_reg,  s0_sub, s0_hstride, s0_type,
+        s1_reg,  s1_sub, s1_hstride, s1_type,
+        s2_reg,  s2_sub, s2_hstride, s2_type
+    );
+}
+
+static void xe2_brw_decode_generic_native(const xe2_qword_t *qw, uint32_t op)
+{
+    if (op == XE2_BRW_OP_ILLEGAL) {
+        rvvm_warn("Illegal operation!");
+        return;
+    }
+
+    uint32_t exec_size       = xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
+    uint32_t pred_inv        = xe2_brw_mask(qw, XE2_BRW_PRED_INV_BIT, XE2_BRW_PRED_INV_BIT);
+    uint32_t pred_control    = xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI);
+    uint32_t qtr_control     = xe2_brw_mask(qw, XE2_BRW_QTR_CONTROL_LO, XE2_BRW_QTR_CONTROL_HI);
+    uint32_t mask_control    = xe2_brw_mask(qw, XE2_BRW_MASK_CONTROL_BIT, XE2_BRW_MASK_CONTROL_BIT);
+    uint32_t saturate        = xe2_brw_mask(qw, XE2_BRW_SATURATE_BIT, XE2_BRW_SATURATE_BIT);
+    uint32_t cond_modifier   = xe2_brw_mask(qw, XE2_BRW_COND_MODIFIER_LO, XE2_BRW_COND_MODIFIER_HI);
+    uint32_t swsb            = xe2_brw_mask(qw, XE2_BRW_SWSB_LO, XE2_BRW_SWSB_HI);
+    uint32_t flag_reg        = xe2_brw_mask(qw, XE2_BRW_FLAG_REG_LO, XE2_BRW_FLAG_REG_HI);
+    uint32_t flag_subreg     = xe2_brw_mask(qw, XE2_BRW_FLAG_SUBREG_BIT, XE2_BRW_FLAG_SUBREG_BIT);
+
+    uint32_t dst_file        = xe2_brw_mask(qw, XE2_BRW_DST_REG_FILE_BIT, XE2_BRW_DST_REG_FILE_BIT);
+    uint32_t dst_mode        = xe2_brw_mask(qw, XE2_BRW_DST_ADDRESS_MODE_BIT, XE2_BRW_DST_ADDRESS_MODE_BIT);
+    uint32_t dst_type        = xe2_brw_mask(qw, XE2_BRW_DST_HWTYPE_LO, XE2_BRW_DST_HWTYPE_HI);
+    // Todo: Correct dst subreg semantics?
+    uint32_t dst_reg         = xe2_brw_mask(qw, XE2_BRW_DST_REG_NR_LO, XE2_BRW_DST_REG_NR_HI);
+    uint32_t dst_subreg      = xe2_brw_mask(qw, XE2_BRW_DST_SUBREG_LO, XE2_BRW_DST_SUBREG_HI);
+    uint32_t dst_hstride     = xe2_brw_mask(qw, XE2_BRW_DST_HSTRIDE_LO, XE2_BRW_DST_HSTRIDE_HI);
+
+    uint32_t s0_file         = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_FILE_BIT, XE2_BRW_SRC0_REG_FILE_BIT);
+    uint32_t s0_mode         = xe2_brw_mask(qw, XE2_BRW_SRC0_ADDRESS_MODE_BIT, XE2_BRW_SRC0_ADDRESS_MODE_BIT);
+    uint32_t s0_imm          = xe2_brw_mask(qw, XE2_BRW_SRC0_IS_IMM_BIT, XE2_BRW_SRC0_IS_IMM_BIT);
+    uint32_t s0_type         = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
+    uint32_t s0_reg          = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
+    uint32_t s0_subreg_hi    = s0_mode
+                             ? xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI)
+                             : xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI);
+    uint32_t s0_subreg_lsb   = xe2_brw_mask(qw, XE2_BRW_SRC0_SUBREG_LSB_BIT, XE2_BRW_SRC0_SUBREG_LSB_BIT);
+    uint32_t s0_subreg_bytes = (s0_subreg_hi << 1) | s0_subreg_lsb;
+    uint32_t s0_subreg       = s0_subreg_bytes / xe2_brw_op_type_size(s0_type);
+    uint32_t s0_vstride      = xe2_brw_mask(qw, XE2_BRW_SRC0_VSTRIDE_LO, XE2_BRW_SRC0_VSTRIDE_HI);
+    uint32_t s0_hstride      = xe2_brw_mask(qw, XE2_BRW_SRC0_HSTRIDE_LO, XE2_BRW_SRC0_HSTRIDE_HI);
+    uint32_t s0_width        = xe2_brw_mask(qw, XE2_BRW_SRC0_WIDTH_LO, XE2_BRW_SRC0_WIDTH_HI);
+    uint32_t s0_neg          = xe2_brw_mask(qw, XE2_BRW_SRC0_NEGATE_BIT, XE2_BRW_SRC0_NEGATE_BIT);
+    uint32_t s0_abs          = xe2_brw_mask(qw, XE2_BRW_SRC0_ABS_BIT, XE2_BRW_SRC0_ABS_BIT);
+
+    uint32_t s1_imm          = xe2_brw_mask(qw, XE2_BRW_SRC1_IS_IMM_BIT, XE2_BRW_SRC1_IS_IMM_BIT);
+    uint32_t s1_mode         = xe2_brw_mask(qw, XE2_BRW_SRC1_ADDRESS_MODE_BIT, XE2_BRW_SRC1_ADDRESS_MODE_BIT);
+    uint32_t s1_type         = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
+    uint32_t s1_reg          = xe2_brw_mask(qw, XE2_BRW_SRC1_DA_REG_NR_LO, XE2_BRW_SRC1_DA_REG_NR_HI);
+    uint32_t s1_subreg_hi    = s1_mode
+                             ? xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI)
+                             : xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI);
+    uint32_t s1_subreg_bytes = (s1_subreg_hi << 1);
+    uint32_t s1_subreg       = s1_subreg_bytes / xe2_brw_op_type_size(s1_type);
+    uint32_t s1_vstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_VSTRIDE_LO, XE2_BRW_SRC1_VSTRIDE_HI);
+    uint32_t s1_width        = xe2_brw_mask(qw, XE2_BRW_SRC1_WIDTH_LO, XE2_BRW_SRC1_WIDTH_HI);
+    uint32_t s1_hstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_HSTRIDE_LO, XE2_BRW_SRC1_HSTRIDE_HI);
+    uint32_t s1_neg          = xe2_brw_mask(qw, XE2_BRW_SRC1_NEGATE_BIT, XE2_BRW_SRC1_NEGATE_BIT);
+    uint32_t s1_abs          = xe2_brw_mask(qw, XE2_BRW_SRC1_ABS_BIT, XE2_BRW_SRC1_ABS_BIT);
+
+    char fmt_s0[128] = {0};
+    char fmt_s1[128] = {0};
+
+    // Note that immediate bitmask is shared between src0/src1. This means,
+    // at most one immediate could be specified in the instruction.
+    if (s0_imm) {
+        uint64_t imm = xe2_brw_mask(qw, 96, 127);
+        sprintf(fmt_s0, "imm=%lu (0x%lx)", imm, imm);
+    } else {
+        sprintf(fmt_s0, "r%u.%u<%u>:%u", s0_reg, s0_subreg, s0_hstride, s0_type);
+    }
+
+    // BUG: s1 subreg is multiplied by two.
+    //      RVVM: op:    mad (16|00)   r23.0<0>:2   r20.0<  1>:2  r8.0<  1>:2  r3.2<0>:2
+    //      Mesa: op:    mad (16|M0)   r23.0<1>:f   r20.0<8;1>:f  r8.0<8;1>:f  r3.1<0>:f
+    //----
+    //      RVVM: op:    mad (16|00)   r24.0<0>:2   r21.0<  1>:2  r8.0<  1>:2  r3.4<0>:2
+    //      Mesa: op:    mad (16|M0)   r24.0<1>:f   r21.0<8;1>:f  r8.0<8;1>:f  r3.2<0>:f
+    if (s1_imm) {
+        uint64_t imm = xe2_brw_mask(qw, 96, 127);
+        sprintf(fmt_s1, "imm=%lu (0x%lx)", imm, imm);
+    } else {
+        sprintf(fmt_s1, "r%u.%u<%u>:%u", s1_reg, s1_subreg, s1_hstride, s1_type);
+    }
+
+    rvvm_info("op:    %s (%02u|%02u)\tr%u.%u<%u>:%u\t%s\t\t%s",
+        xe2_brw_op_name(op),
+        1 << exec_size, pred_control,
+        dst_reg, dst_subreg, dst_hstride, dst_type,
+        fmt_s0, fmt_s1
+    );
+}
+
+// intel-gfx-prm-osrc-dg1-vol02a-commandreference-instructions.pdf
+// Page 1167: send - Send Message
+static void xe2_brw_decode_send(const xe2_qword_t *qw, uint32_t op, bool *eot)
+{
+    uint32_t exec_size         = xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
+    uint32_t pred_control      = xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI);
+    uint32_t src1_reg          = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_REG_NR_LO, XE2_BRW_SEND_SRC1_REG_NR_HI);
+    uint32_t src1_len          = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_LEN_LO, XE2_BRW_SEND_SRC1_LEN_HI);
+    uint32_t sfid              = xe2_brw_mask(qw, XE2_BRW_SEND_SFID_LO, XE2_BRW_SEND_SFID_HI);
+    uint32_t ex_desc_ia_subreg = xe2_brw_mask(qw, XE2_BRW_SEND_EX_DESC_IA_SUBREG_LO, XE2_BRW_SEND_EX_DESC_IA_SUBREG_HI);
+    uint32_t desc_is_reg32     = xe2_brw_mask(qw, XE2_BRW_SEND_SEL_REG32_DESC_BIT, XE2_BRW_SEND_SEL_REG32_DESC_BIT);
+    uint32_t ex_desc_is_reg32  = xe2_brw_mask(qw, XE2_BRW_SEND_SEL_REG32_EX_DESC_BIT, XE2_BRW_SEND_SEL_REG32_EX_DESC_BIT);
+    uint32_t src1_file         = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_REG_FILE_BIT, XE2_BRW_SEND_SRC1_REG_FILE_BIT);
+    uint32_t dst_file          = xe2_brw_mask(qw, XE2_BRW_SEND_DST_REG_FILE_BIT, XE2_BRW_SEND_DST_REG_FILE_BIT);
+    *eot                       = xe2_brw_mask(qw, XE2_BRW_SEND_EOT_BIT, XE2_BRW_SEND_EOT_BIT);
+
+    // Send command has common S0/S1 operands encoding
+    // along with generic instruction.
+    uint32_t s0_imm            = xe2_brw_mask(qw, XE2_BRW_SRC0_IS_IMM_BIT, XE2_BRW_SRC0_IS_IMM_BIT);
+    uint32_t s0_type           = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
+    uint32_t s0_reg            = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
+    uint32_t s0_mode           = xe2_brw_mask(qw, XE2_BRW_SRC0_ADDRESS_MODE_BIT, XE2_BRW_SRC0_ADDRESS_MODE_BIT);
+    uint32_t s0_hstride        = xe2_brw_mask(qw, XE2_BRW_SRC0_HSTRIDE_LO, XE2_BRW_SRC0_HSTRIDE_HI);
+    uint32_t s0_subreg_hi      = s0_mode
+                               ? xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI)
+                               : xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI);
+    uint32_t s0_subreg_lsb     = xe2_brw_mask(qw, XE2_BRW_SRC0_SUBREG_LSB_BIT, XE2_BRW_SRC0_SUBREG_LSB_BIT);
+    uint32_t s0_subreg_bytes   = (s0_subreg_hi << 1) | s0_subreg_lsb;
+    uint32_t s0_subreg         = s0_subreg_bytes / xe2_brw_op_type_size(s0_type);
+
+    uint32_t s1_imm          = xe2_brw_mask(qw, XE2_BRW_SRC1_IS_IMM_BIT, XE2_BRW_SRC1_IS_IMM_BIT);
+    uint32_t s1_mode         = xe2_brw_mask(qw, XE2_BRW_SRC1_ADDRESS_MODE_BIT, XE2_BRW_SRC1_ADDRESS_MODE_BIT);
+    uint32_t s1_type         = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
+    uint32_t s1_reg          = xe2_brw_mask(qw, XE2_BRW_SRC1_DA_REG_NR_LO, XE2_BRW_SRC1_DA_REG_NR_HI);
+    uint32_t s1_subreg_hi    = s1_mode
+                             ? xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI)
+                             : xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI);
+    uint32_t s1_subreg_bytes = (s1_subreg_hi << 1);
+    uint32_t s1_subreg       = s1_subreg_bytes / xe2_brw_op_type_size(s1_type);
+    uint32_t s1_vstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_VSTRIDE_LO, XE2_BRW_SRC1_VSTRIDE_HI);
+    uint32_t s1_width        = xe2_brw_mask(qw, XE2_BRW_SRC1_WIDTH_LO, XE2_BRW_SRC1_WIDTH_HI);
+    uint32_t s1_hstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_HSTRIDE_LO, XE2_BRW_SRC1_HSTRIDE_HI);
+    uint32_t s1_neg          = xe2_brw_mask(qw, XE2_BRW_SRC1_NEGATE_BIT, XE2_BRW_SRC1_NEGATE_BIT);
+    uint32_t s1_abs          = xe2_brw_mask(qw, XE2_BRW_SRC1_ABS_BIT, XE2_BRW_SRC1_ABS_BIT);
+
+    char fmt_s0[128] = {0};
+
+    // Note that immediate bitmask is shared between src0/src1. This means,
+    // at most one immediate could be specified in the instruction.
+    if (s0_imm) {
+        uint64_t imm = xe2_brw_mask(qw, 96, 127);
+        sprintf(fmt_s0, "imm=%lu (0x%lx)", imm, imm);
+    } else {
+        sprintf(fmt_s0, "r%u.%u<%u>:%u", s0_reg, s0_subreg, s0_hstride, s0_type);
+    }
+
+    rvvm_info(
+        "op:    %s (%02u|%u)\t%s\tr%u:%u\t%s",
+        xe2_brw_op_name(op),
+        1U << exec_size, pred_control,
+        fmt_s0,
+        src1_reg, src1_len,
+        *eot ? "<EOT>" : ""
+    );
+}
+
+static uint32_t xe2_brw_decode_one(const xe2_qword_t *qw, bool *eot)
+{
+    bool     cmpt = (qw->lo >> XE2_BRW_CMPT_CONTROL_BIT) & 1;
+    uint8_t  op   =  qw->lo & 0x7F;
+    uint32_t size = cmpt ? 8 : 16;
+
+    if (cmpt) {
+        xe2_brw_decode_compact(qw, op);
+    } else if (xe2_brw_op_send(op)) {
+        xe2_brw_decode_send(qw, op, eot);
+    } else if (xe2_brw_op_3_src(op)) {
+        xe2_brw_decode_3_src_native(qw, op);
+    } else {
+        xe2_brw_decode_generic_native(qw, op);
+    }
+
+    return size;
+}
+
+// Decode and print BRW assembly reported under kernel address.
+// When decoding stage will be passed, this branch of emulator
+// needs to be extended by cross-compiling to Vulkan shaders.
+static void xe2_brw_decode(xe2_dev_t *xe2, xe2_dma_addr_t dma)
+{
+    if (dma.addr == 0U) {
+        return;
+    }
+
+    static const uint32_t limit = 4096;
+    uint32_t len = 0U;
+    uint32_t zeros = 0U;
+    size_t off = 0ULL;
+
+    for (uint32_t i = 0; i < limit; ++i) {
+        xe2_qword_t qw = {0};
+        xe2_dma_read_many(xe2, xe2_dma_offset(dma, off), &qw, sizeof(qw) / sizeof(uint32_t));
+        if (qw.hi == 0U) {
+            if (++zeros >= 4 && len > 0) {
+                break;
+            }
+        } else {
+            zeros = 0;
+            len = i + 1;
+        }
+        bool eot = 0;
+        off += xe2_brw_decode_one(&qw, &eot);
+        if (eot) {
+            break;
+        }
+    }
+}
+
+
+
+// -----------------------------------------------------------
 // Logical Ring Context (LRC), GPU commands processing
 // -----------------------------------------------------------
 
@@ -2663,6 +3477,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ct
 
             xe2_dma_addr_t kernel_dma_0 = xe2_ppgtt_translate(xe2, pdp4, addr_kernel_0);
             xe2_print_decompiled_shader(xe2, kernel_dma_0);
+            xe2_brw_decode(xe2, kernel_dma_0);
             break;
         }
         case XE2_GFXPIPE_CMD_3DSTATE_VS: {
@@ -2671,8 +3486,9 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ct
             rvvm_addr_t addr_kernel_0 = xe2_addr_63_6_mask(cmd[1], cmd[2]);
             rvvm_info("(VS) Kernel Start Address 0: 0x%lx", addr_kernel_0);
 
-            xe2_dma_addr_t kernel_dma_0 = xe2_ppgtt_translate(xe2, pdp4, addr_kernel_0);
+            xe2_dma_addr_t kernel_dma_0 = xe2_dma_offset(xe2_ppgtt_translate(xe2, pdp4, addr_kernel_0), ctx->addr_instr);
             xe2_print_decompiled_shader(xe2, kernel_dma_0);
+            xe2_brw_decode(xe2, kernel_dma_0);
             break;
         }
         default:
