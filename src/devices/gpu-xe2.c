@@ -29,97 +29,31 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Current status:
 // Fetched shaders coded in some Intel ISA (probably BRW assembly).
 //
-// (VS) Kernel Start Address 0:     0xfffef000, 0xfffef000
-// PTE page: 0x700000
-// dumped 155 dwords (620 bytes) → decompiled.xe2
-// 00000000: 4100 8020 1303 0409 4100 1000 a00a 0514  A.. ....A.......
-// 00000010: 5403 000a 0509 4600 4100 8020 1503 0c09  T.....F.A.. ....
-// 00000020: 6100 0080 6046 0533 0000 0000 abaa 2a3f  a...`F.3......*?
-// 00000030: 4100 8020 2702 0405 4100 1000 a00a 0528  A.. '...A......(
-// 00000040: 5402 000a 0505 4600 4100 8020 2902 0c05  T.....F.A.. )...
-// 00000050: 4100 1000 a00a 052a 7402 000a 0505 4600  A......*t.....F.
-// 00000060: 6100 1000 2042 050b 0000 0000 003c 003c  a... B.......<.<
-// 00000070: 6100 8064 0c00 0000 6100 8064 0d00 0000  a..d....a..d....
-// 00000080: 6100 8064 0e00 0000 5b17 1000 a80a 0416  a..d....[.......
-// 00000090: 0513 0a0a 0508 0403 5b17 1000 a80a 0417  ........[.......
-// 000000a0: 0514 0a0a 0508 1403 5b17 1000 a80a 0418  ........[.......
-// 000000b0: 0515 0a0a 0508 2403 5b17 1000 a80a 042b  ......$.[......+
-// 000000c0: 0527 0a0a 0504 0402 5b17 1000 a80a 042c  .'......[......,
-// 000000d0: 0528 0a0a 0504 1402 5b17 1000 a80a 042d  .(......[......-
-// 000000e0: 0529 0a0a 0504 2402 5b17 1000 a80a 042e  .)....$.[.......
-// 000000f0: 052a 0a0a 0504 3402 5b17 1000 a80a 0419  .*....4.[.......
-// 00000100: 0516 0a0a 050a 8403 5b17 1000 a80a 041a  ........[.......
-// 00000110: 0517 0a0a 050a 9403 5b17 1000 a80a 041b  ........[.......
-// 00000120: 0518 0a0a 050a a403 5b17 1000 a80a 042f  ........[....../
-// 00000130: 052b 0a0a 0506 8402 5b17 1000 a80a 0430  .+......[......0
-// 00000140: 052c 0a0a 0506 9402 5b17 1000 a80a 0431  .,......[......1
-// 00000150: 052d 0a0a 0506 a402 5b17 1000 a80a 0432  .-......[......2
-// 00000160: 052e 0a0a 0506 b402 4017 1000 a00a 051c  ........@.......
-// 00000170: 0519 460a c403 0000 4017 1000 a00a 051d  ..F.....@.......
-// 00000180: 051a 460a d403 0000 4017 0020 1e1b e003  ..F.....@.. ....
-// 00000190: 4017 1000 a00a 050f 052f 460a c402 0000  @......../F.....
-// 000001a0: 4017 1000 a00a 0510 0530 460a d402 0000  @........0F.....
-// 000001b0: 4017 0020 1131 e002 4017 0020 1232 9002  @.. .1..@.. .2..
-// 000001c0: 4016 0020 221c 001d 4116 0020 1f1e 001e  @.. "...A.. ....
-// 000001d0: 4100 1000 a08a 0523 051e 460a abaa aa3e  A......#..F....>
-// 000001e0: 5b12 1000 a80a 0420 051f 0a0a 051d 051d  [...... ........
-// 000001f0: 010a 0080 0000 0000 0000 0000 0000 0000  ................
-// 00000200: 5b00 1000 a80a 0424 0523 0a0a 0522 0433  [......$.#...".3
-// 00000210: 5b12 1000 a80a 0421 0520 0a0a 051c 051c  [......!. ......
-// 00000220: 3811 1000 a00a 0525 0521 465a 0100 4600  8......%.!FZ..F.
-// 00000230: 4109 0020 2625 0024 6211 1430 7b26 0000  A.. &%.$b..0{&..
-// 00000240: 3120 1100 0000 0000 0c01 086a 440b 9000  1 .........jD...
-// 00000250: 61a0 002c 7f01 1000 3109 1000 0402 0000  a..,....1.......
-// 00000260: 0c7f 086a 247b 8c00 6000 0020            ...j${..`.. 
-// byte offset 0x268: warning: unexpected padding at end of kernel
-// L0:
-//         mul (16|M0)              r19.0<1>:f    r3.4<0;1,0>:f     r9.0<1;1,0>:f    {Compacted}
-//         mul (16|M0)              r20.0<1>:f    r3.5<0;1,0>:f     r9.0<8;8,1>:f
-//         mul (16|M0)              r21.0<1>:f    r3.6<0;1,0>:f     r9.0<1;1,0>:f    {Compacted}
-// (W)     mov (1|M0)               r51.0<1>:d    1059760811:d
-//         mul (16|M0)              r39.0<1>:f    r2.4<0;1,0>:f     r5.0<1;1,0>:f    {Compacted}
-//         mul (16|M0)              r40.0<1>:f    r2.5<0;1,0>:f     r5.0<8;8,1>:f
-//         mul (16|M0)              r41.0<1>:f    r2.6<0;1,0>:f     r5.0<1;1,0>:f    {Compacted}
-//         mul (16|M0)              r42.0<1>:f    r2.7<0;1,0>:f     r5.0<8;8,1>:f
-//         mov (16|M0)              r11.0<1>:ud   0x3C003C00:ud
-//         mov (16|M0)              r12.0<1>:ud   0x0:ud                              {Compacted}
-//         mov (16|M0)              r13.0<1>:ud   0x0:ud                              {Compacted}
-//         mov (16|M0)              r14.0<1>:ud   0x0:ud                              {Compacted}
-//         mad (16|M0)              r22.0<1>:f    r19.0<8;1>:f      r8.0<8;1>:f       r3.0<0>:f        {F@7}
-//         mad (16|M0)              r23.0<1>:f    r20.0<8;1>:f      r8.0<8;1>:f       r3.1<0>:f        {F@7}
-//         mad (16|M0)              r24.0<1>:f    r21.0<8;1>:f      r8.0<8;1>:f       r3.2<0>:f        {F@7}
-//         mad (16|M0)              r43.0<1>:f    r39.0<8;1>:f      r4.0<8;1>:f       r2.0<0>:f        {F@7}
-//         mad (16|M0)              r44.0<1>:f    r40.0<8;1>:f      r4.0<8;1>:f       r2.1<0>:f        {F@7}
-//         mad (16|M0)              r45.0<1>:f    r41.0<8;1>:f      r4.0<8;1>:f       r2.2<0>:f        {F@7}
-//         mad (16|M0)              r46.0<1>:f    r42.0<8;1>:f      r4.0<8;1>:f       r2.3<0>:f        {F@7}
-//         mad (16|M0)              r25.0<1>:f    r22.0<8;1>:f      r10.0<8;1>:f      r3.8<0>:f        {F@7}
-//         mad (16|M0)              r26.0<1>:f    r23.0<8;1>:f      r10.0<8;1>:f      r3.9<0>:f        {F@7}
-//         mad (16|M0)              r27.0<1>:f    r24.0<8;1>:f      r10.0<8;1>:f      r3.10<0>:f       {F@7}
-//         mad (16|M0)              r47.0<1>:f    r43.0<8;1>:f      r6.0<8;1>:f       r2.8<0>:f        {F@7}
-//         mad (16|M0)              r48.0<1>:f    r44.0<8;1>:f      r6.0<8;1>:f       r2.9<0>:f        {F@7}
-//         mad (16|M0)              r49.0<1>:f    r45.0<8;1>:f      r6.0<8;1>:f       r2.10<0>:f       {F@7}
-//         mad (16|M0)              r50.0<1>:f    r46.0<8;1>:f      r6.0<8;1>:f       r2.11<0>:f       {F@7}
-//         add (16|M0)              r28.0<1>:f    r25.0<8;8,1>:f    r3.12<0;1,0>:f   {F@7}
-//         add (16|M0)              r29.0<1>:f    r26.0<8;8,1>:f    r3.13<0;1,0>:f   {F@7}
-//         add (16|M0)              r30.0<1>:f    r27.0<1;1,0>:f    r3.14<0;1,0>:f   {Compacted,F@7}
-//         add (16|M0)              r15.0<1>:f    r47.0<8;8,1>:f    r2.12<0;1,0>:f   {F@7}
-//         add (16|M0)              r16.0<1>:f    r48.0<8;8,1>:f    r2.13<0;1,0>:f   {F@7}
-//         add (16|M0)              r17.0<1>:f    r49.0<1;1,0>:f    r2.14<0;1,0>:f   {Compacted,F@7}
-//         add (16|M0)              r18.0<1>:f    r50.0<1;1,0>:f    r2.15<0;1,0>:f   {Compacted,F@7}
-//         add (16|M0)              r34.0<1>:f    r28.0<1;1,0>:f    r29.0<1;1,0>:f   {Compacted,F@6}
-//         mul (16|M0)              r31.0<1>:f    r30.0<1;1,0>:f    r30.0<1;1,0>:f   {Compacted,F@6}
-//         mul (16|M0)              r35.0<1>:f    r30.0<8;8,1>:f    0x3EAAAAAB:f
-//         mad (16|M0)              r32.0<1>:f    r31.0<8;1>:f      r29.0<8;1>:f      r29.0<1>:f       {F@2}
-// (W)     sync.nop                             null                             {A@2}
-//         mad (16|M0)              r36.0<1>:f    r35.0<8;1>:f      r34.0<8;1>:f      r51.0<0>:f
-//         mad (16|M0)              r33.0<1>:f    r32.0<8;1>:f      r28.0<8;1>:f      r28.0<1>:f       {F@2}
-//         math.rsqt (16|M0)        r37.0<1>:f    r33.0<8;8,1>:f                   {F@1}
-//         mul (16|M0)              r38.0<1>:f    r37.0<1;1,0>:f    r36.0<1;1,0>:f   {Compacted,A@1}
-//         sel (16|M0)   (ge)f0.0   r123.0<1>:f   r38.0<1;1,0>:f    0.0:f               {Compacted,F@1}
-//         send.urb (16|M0)         null     r1  r11:8  0x0            0x02024504           {A@1,$0} // wr:1+8, rd:0; store.urb.d32x8.a32.uc.uc
-//         mov (16|M0)              r127.0<1>:ud  r1.0<1;1,0>:ud                   {Compacted,$0.src}
-//         send.urb (16|M0)         null     r127  r123:4  0x20000            0x02023504           {EOT,A@1} // wr:1+4, rd:0; store.urb.d32x4.a32.uc.uc.flat[A+0x20]
-// L616:
+// mul(16)         g19<1>F         g3.4<0,1,0>F    g9<1,1,0>F      { align1 1H compacted };
+// mul(16)         g20<1>F         g3.5<0,1,0>F    g9<8,8,1>F      { align1 1H };
+// mul(16)         g21<1>F         g3.6<0,1,0>F    g9<1,1,0>F      { align1 1H compacted };
+// mov(1)          g51<1>D         1059760811D                     { align1 WE_all 1N };
+// ...
+// sel.ge(16)      g123<1>F        g38<1,1,0>F     0x0F  /* 0F */  { align1 1H F@1 compacted };
+// send(16)        nullUD          g1UD            g11UD           0x02024504                0x00000200
+//                 urb MsgDesc: ( store, a32, d32, V8, L1UC_L3UC dst_len = 0, src0_len = 1, src1_len = 8 flat )  base_offset 0  { align1 1H A@1 $0 };
+// mov(16)         g127<1>UD       g1<1,1,0>UD                     { align1 1H $0.src compacted };
+// send(16)        nullUD          g127UD          g123UD          0x02023504                0x00020100
+//                 urb MsgDesc: ( store, a32, d32, V4, L1UC_L3UC dst_len = 0, src0_len = 1, src1_len = 4 flat )  base_offset 32  { align1 1H A@1 EOT };
+//
+// ... Note that OpenGL dump (INTEL_DEBUG=bat) and iga64 dump shows exactly the same
+//     assembly but with different address prefixes (r/g).
+//
+// mul (16|M0)              r19.0<1>:f    r3.4<0;1,0>:f     r9.0<1;1,0>:f    {Compacted}
+// mul (16|M0)              r20.0<1>:f    r3.5<0;1,0>:f     r9.0<8;8,1>:f
+// mul (16|M0)              r21.0<1>:f    r3.6<0;1,0>:f     r9.0<1;1,0>:f    {Compacted}
+// mov (1|M0)               r51.0<1>:d    1059760811:d
+// ...
+// sel (16|M0)   (ge)f0.0   r123.0<1>:f   r38.0<1;1,0>:f    0.0:f               {Compacted,F@1}
+// send.urb (16|M0)         null     r1  r11:8  0x0            0x02024504           {A@1,$0} // wr:1+8, rd:0; store.urb.d32x8.a32.uc.uc
+// mov (16|M0)              r127.0<1>:ud  r1.0<1;1,0>:ud                   {Compacted,$0.src}
+// send.urb (16|M0)         null     r127  r123:4  0x20000            0x02023504           {EOT,A@1} // wr:1+4, rd:0; store.urb.d32x4.a32.uc.uc.flat[A+0x20]
+
 
 /*
 XDG setup:
@@ -1073,8 +1007,8 @@ INTEL_DEBUG=bat glmark2-es2-drm
 #define XE2_GFXPIPE_CMD_3DSTATE_MULTISAMPLE                XE2_GFXPIPE_CMD_3D(0x0, 0x0D)
 #define XE2_GFXPIPE_CMD_3DSTATE_CC_STATE_POINTERS          XE2_GFXPIPE_CMD_3D(0x0, 0x0E)
 #define XE2_GFXPIPE_CMD_3DSTATE_SCISSOR_STATE_POINTERS     XE2_GFXPIPE_CMD_3D(0x0, 0x0F)
-#define XE2_GFXPIPE_CMD_3DSTATE_VS                         XE2_GFXPIPE_CMD_3D(0x0, 0x10)
-#define XE2_GFXPIPE_CMD_3DSTATE_GS                         XE2_GFXPIPE_CMD_3D(0x0, 0x11)
+#define XE2_GFXPIPE_CMD_3DSTATE_VS                         XE2_GFXPIPE_CMD_3D(0x0, 0x10) // Vertex shader
+#define XE2_GFXPIPE_CMD_3DSTATE_GS                         XE2_GFXPIPE_CMD_3D(0x0, 0x11) // Geometry shader
 #define XE2_GFXPIPE_CMD_3DSTATE_CLIP                       XE2_GFXPIPE_CMD_3D(0x0, 0x12)
 #define XE2_GFXPIPE_CMD_3DSTATE_SF                         XE2_GFXPIPE_CMD_3D(0x0, 0x13)
 #define XE2_GFXPIPE_CMD_3DSTATE_WM                         XE2_GFXPIPE_CMD_3D(0x0, 0x14)
@@ -1084,12 +1018,12 @@ INTEL_DEBUG=bat glmark2-es2-drm
 #define XE2_GFXPIPE_CMD_3DSTATE_SAMPLE_MASK                XE2_GFXPIPE_CMD_3D(0x0, 0x18)
 #define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_HS                XE2_GFXPIPE_CMD_3D(0x0, 0x19)
 #define XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_DS                XE2_GFXPIPE_CMD_3D(0x0, 0x1A)
-#define XE2_GFXPIPE_CMD_3DSTATE_HS                         XE2_GFXPIPE_CMD_3D(0x0, 0x1B)
+#define XE2_GFXPIPE_CMD_3DSTATE_HS                         XE2_GFXPIPE_CMD_3D(0x0, 0x1B) // Hull shader
 #define XE2_GFXPIPE_CMD_3DSTATE_TE                         XE2_GFXPIPE_CMD_3D(0x0, 0x1C)
-#define XE2_GFXPIPE_CMD_3DSTATE_DS                         XE2_GFXPIPE_CMD_3D(0x0, 0x1D)
+#define XE2_GFXPIPE_CMD_3DSTATE_DS                         XE2_GFXPIPE_CMD_3D(0x0, 0x1D) // Domain shader
 #define XE2_GFXPIPE_CMD_3DSTATE_STREAMOUT                  XE2_GFXPIPE_CMD_3D(0x0, 0x1E)
 #define XE2_GFXPIPE_CMD_3DSTATE_SBE                        XE2_GFXPIPE_CMD_3D(0x0, 0x1F)
-#define XE2_GFXPIPE_CMD_3DSTATE_PS                         XE2_GFXPIPE_CMD_3D(0x0, 0x20)
+#define XE2_GFXPIPE_CMD_3DSTATE_PS                         XE2_GFXPIPE_CMD_3D(0x0, 0x20) // Pixel shader
 #define XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP XE2_GFXPIPE_CMD_3D(0x0, 0x21)
 #define XE2_GFXPIPE_CMD_3DSTATE_CPS_POINTERS               XE2_GFXPIPE_CMD_3D(0x0, 0x22)
 #define XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_POINTERS_CC XE2_GFXPIPE_CMD_3D(0x0, 0x23)
@@ -3424,6 +3358,14 @@ static void xe2_print_decompiled_shader(xe2_dev_t *xe2, xe2_dma_addr_t dma)
     }
 }
 
+static void xe2_print_shader(xe2_dev_t *xe2, const char *name, rvvm_addr_t pdp4, rvvm_addr_t addr_kernel, uint64_t addr_instr)
+{
+    rvvm_info("(%s) Kernel start address: 0x%lx", name, addr_kernel);
+    xe2_dma_addr_t kernel_dma = xe2_ppgtt_translate(xe2, pdp4, addr_kernel + addr_instr);
+    xe2_print_decompiled_shader(xe2, kernel_dma);
+    xe2_brw_decode(xe2, kernel_dma);
+}
+
 // The supplied ring DMA address is normalized such that the first dword is the
 // currently processed instruction header (opcode).
 static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ctx, xe2_dma_addr_t ring, rvvm_addr_t pdp4, uint32_t op)
@@ -3468,27 +3410,52 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ct
             break;
         }
         case XE2_GFXPIPE_CMD_3DSTATE_PS: {
-            uint32_t cmd[10] = {0};
+            uint32_t cmd[12] = {0};
             xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
-            rvvm_addr_t addr_kernel_0 = xe2_addr_63_6_mask(cmd[1], cmd[2]);
-            rvvm_addr_t addr_kernel_1 = xe2_addr_63_6_mask(cmd[8], cmd[9]);
-            rvvm_info("(PS) Kernel Start Address 0: 0x%lx, 0x%lx", addr_kernel_0, ctx->addr_instr + addr_kernel_0);
-            rvvm_info("(PS) Kernel Start Address 1: 0x%lx, 0x%lx", addr_kernel_1, ctx->addr_instr + addr_kernel_1);
-
-            xe2_dma_addr_t kernel_dma_0 = xe2_ppgtt_translate(xe2, pdp4, addr_kernel_0);
-            xe2_print_decompiled_shader(xe2, kernel_dma_0);
-            xe2_brw_decode(xe2, kernel_dma_0);
+            rvvm_addr_t addr_kernel[] = {
+                xe2_addr_63_6_mask(cmd[1], cmd[2]),
+                xe2_addr_63_6_mask(cmd[8], cmd[9]),
+            };
+            bool addr_kernel_enable[] = {
+                cmd[0] & 1,
+                cmd[8] & 1
+            };
+            for (size_t i = 0; i < STATIC_ARRAY_SIZE(addr_kernel); ++i) {
+                if (addr_kernel_enable[i]) {
+                    rvvm_info("(PS) Kernel Start Address %lu: 0x%lx, 0x%lx", i, addr_kernel[i], ctx->addr_instr + addr_kernel[i]);
+                    xe2_print_shader(xe2, "VS", pdp4, addr_kernel[i], ctx->addr_instr);
+                }
+            }
             break;
         }
         case XE2_GFXPIPE_CMD_3DSTATE_VS: {
-            uint32_t cmd[7] = {0};
+            uint32_t cmd[9] = {0};
             xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
-            rvvm_addr_t addr_kernel_0 = xe2_addr_63_6_mask(cmd[1], cmd[2]);
-            rvvm_info("(VS) Kernel Start Address 0: 0x%lx", addr_kernel_0);
-
-            xe2_dma_addr_t kernel_dma_0 = xe2_dma_offset(xe2_ppgtt_translate(xe2, pdp4, addr_kernel_0), ctx->addr_instr);
-            xe2_print_decompiled_shader(xe2, kernel_dma_0);
-            xe2_brw_decode(xe2, kernel_dma_0);
+            bool enable = cmd[7] & 1;
+            if (enable) {
+                rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
+                xe2_print_shader(xe2, "VS", pdp4, addr_kernel, ctx->addr_instr);
+            }
+            break;
+        }
+        case XE2_GFXPIPE_CMD_3DSTATE_GS: {
+            uint32_t cmd[10] = {0};
+            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+            bool enable = cmd[7] & 1;
+            if (enable) {
+                rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
+                xe2_print_shader(xe2, "GS", pdp4, addr_kernel, ctx->addr_instr);
+            }
+            break;
+        }
+        case XE2_GFXPIPE_CMD_3DSTATE_HS: {
+            uint32_t cmd[6] = {0};
+            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+            bool enable = (cmd[2] >> 31) & 1;
+            if (enable) {
+                rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[3], cmd[4]);
+                xe2_print_shader(xe2, "HS", pdp4, addr_kernel, ctx->addr_instr);
+            }
             break;
         }
         default:
