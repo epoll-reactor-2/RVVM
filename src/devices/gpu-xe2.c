@@ -2876,9 +2876,9 @@ static void xe2_brw_decode_compact(const xe2_qword_t *qw, uint32_t op)
         uint32_t dst_subreg   = (subreg >> 0) & 0x1F;
 
         uint32_t src0_subreg  = (subreg >> 7) & 0x1F;
-        uint32_t src0_hstride = xe2_brw_hstride_decode[(src0_desc >> 0) & 0x3];
-        uint32_t src0_width   = xe2_brw_width_decode  [(src0_desc >> 5) & 0x7];
         uint32_t src0_vstride = xe2_brw_vstride_decode[(src0_desc >> 8) & 0x7];
+        uint32_t src0_width   = xe2_brw_width_decode  [(src0_desc >> 5) & 0x7];
+        uint32_t src0_hstride = xe2_brw_hstride_decode[(src0_desc >> 0) & 0x3];
         uint32_t src0_abs     = (src0_desc >>  1) & 1;
         uint32_t src0_neg     = (src0_desc >> 10) & 1;
         uint32_t src1_subreg  = (src1_desc >>  3) & 0x1F;
@@ -2941,7 +2941,7 @@ static void xe2_brw_decode_3_src_native(const xe2_qword_t *qw, uint32_t op)
     uint32_t s2_neg         = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_NEGATE_BIT, XE2_BRW_A3_SRC2_NEGATE_BIT);
     uint32_t s2_abs         = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_ABS_BIT, XE2_BRW_A3_SRC2_ABS_BIT);
 
-    rvvm_info("op:    %s (%02u|%02u)\tr%u.%u<%u>:%u\tr%u.%u<%u>:%u\t\tr%u.%u<%u>:%u\tr%u.%u<%u>:%u",
+    rvvm_info("op:(3) %s (%02u|%02u)\tr%u.%u<%u>:%u\tr%u.%u<%u>:%u\t\tr%u.%u<%u>:%u\tr%u.%u<%u>:%u",
         xe2_brw_op_name(op),
         1 << exec_size, pred_control,
         dst_reg, dst_subreg, dst_hstride, dst_type,
@@ -2983,8 +2983,8 @@ static void xe2_brw_decode_generic_native(const xe2_qword_t *qw, uint32_t op)
     uint32_t s0_type         = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
     uint32_t s0_reg          = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
     uint32_t s0_subreg_hi    = s0_mode
-                             ? xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI)
-                             : xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI);
+                             ? xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI)
+                             : xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI);
     uint32_t s0_subreg_lsb   = xe2_brw_mask(qw, XE2_BRW_SRC0_SUBREG_LSB_BIT, XE2_BRW_SRC0_SUBREG_LSB_BIT);
     uint32_t s0_subreg_bytes = (s0_subreg_hi << 1) | s0_subreg_lsb;
     uint32_t s0_subreg       = s0_subreg_bytes / xe2_brw_op_type_size(s0_type);
@@ -2999,13 +2999,13 @@ static void xe2_brw_decode_generic_native(const xe2_qword_t *qw, uint32_t op)
     uint32_t s1_type         = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
     uint32_t s1_reg          = xe2_brw_mask(qw, XE2_BRW_SRC1_DA_REG_NR_LO, XE2_BRW_SRC1_DA_REG_NR_HI);
     uint32_t s1_subreg_hi    = s1_mode
-                             ? xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI)
-                             : xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI);
+                             ? xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI)
+                             : xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI);
     uint32_t s1_subreg_bytes = (s1_subreg_hi << 1);
     uint32_t s1_subreg       = s1_subreg_bytes / xe2_brw_op_type_size(s1_type);
     uint32_t s1_vstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_VSTRIDE_LO, XE2_BRW_SRC1_VSTRIDE_HI);
-    uint32_t s1_width        = xe2_brw_mask(qw, XE2_BRW_SRC1_WIDTH_LO, XE2_BRW_SRC1_WIDTH_HI);
     uint32_t s1_hstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_HSTRIDE_LO, XE2_BRW_SRC1_HSTRIDE_HI);
+    uint32_t s1_width        = xe2_brw_mask(qw, XE2_BRW_SRC1_WIDTH_LO, XE2_BRW_SRC1_WIDTH_HI);
     uint32_t s1_neg          = xe2_brw_mask(qw, XE2_BRW_SRC1_NEGATE_BIT, XE2_BRW_SRC1_NEGATE_BIT);
     uint32_t s1_abs          = xe2_brw_mask(qw, XE2_BRW_SRC1_ABS_BIT, XE2_BRW_SRC1_ABS_BIT);
 
@@ -3018,7 +3018,7 @@ static void xe2_brw_decode_generic_native(const xe2_qword_t *qw, uint32_t op)
         uint64_t imm = xe2_brw_mask(qw, 96, 127);
         sprintf(fmt_s0, "imm=%lu (0x%lx)", imm, imm);
     } else {
-        sprintf(fmt_s0, "r%u.%u<%u>:%u", s0_reg, s0_subreg, s0_hstride, s0_type);
+        sprintf(fmt_s0, "r%u.%u<%u.%u.%u>:%u", s0_reg, s0_subreg, s0_vstride, s0_width, s0_hstride, s0_type);
     }
 
     // BUG: s1 subreg is multiplied by two.
@@ -3031,7 +3031,7 @@ static void xe2_brw_decode_generic_native(const xe2_qword_t *qw, uint32_t op)
         uint64_t imm = xe2_brw_mask(qw, 96, 127);
         sprintf(fmt_s1, "imm=%lu (0x%lx)", imm, imm);
     } else {
-        sprintf(fmt_s1, "r%u.%u<%u>:%u", s1_reg, s1_subreg, s1_hstride, s1_type);
+        sprintf(fmt_s1, "r%u.%u<%u.%u.%u>:%u", s1_reg, s1_subreg, s1_vstride, s1_width, s1_hstride, s1_type);
     }
 
     rvvm_info("op:    %s (%02u|%02u)\tr%u.%u<%u>:%u\t%s\t\t%s",
@@ -3060,25 +3060,27 @@ static void xe2_brw_decode_send(const xe2_qword_t *qw, uint32_t op, bool *eot)
 
     // Send command has common S0/S1 operands encoding
     // along with generic instruction.
-    uint32_t s0_imm            = xe2_brw_mask(qw, XE2_BRW_SRC0_IS_IMM_BIT, XE2_BRW_SRC0_IS_IMM_BIT);
-    uint32_t s0_type           = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
-    uint32_t s0_reg            = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
-    uint32_t s0_mode           = xe2_brw_mask(qw, XE2_BRW_SRC0_ADDRESS_MODE_BIT, XE2_BRW_SRC0_ADDRESS_MODE_BIT);
-    uint32_t s0_hstride        = xe2_brw_mask(qw, XE2_BRW_SRC0_HSTRIDE_LO, XE2_BRW_SRC0_HSTRIDE_HI);
-    uint32_t s0_subreg_hi      = s0_mode
-                               ? xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI)
-                               : xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI);
-    uint32_t s0_subreg_lsb     = xe2_brw_mask(qw, XE2_BRW_SRC0_SUBREG_LSB_BIT, XE2_BRW_SRC0_SUBREG_LSB_BIT);
-    uint32_t s0_subreg_bytes   = (s0_subreg_hi << 1) | s0_subreg_lsb;
-    uint32_t s0_subreg         = s0_subreg_bytes / xe2_brw_op_type_size(s0_type);
+    uint32_t s0_imm          = xe2_brw_mask(qw, XE2_BRW_SRC0_IS_IMM_BIT, XE2_BRW_SRC0_IS_IMM_BIT);
+    uint32_t s0_type         = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
+    uint32_t s0_reg          = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
+    uint32_t s0_mode         = xe2_brw_mask(qw, XE2_BRW_SRC0_ADDRESS_MODE_BIT, XE2_BRW_SRC0_ADDRESS_MODE_BIT);
+    uint32_t s0_vstride      = xe2_brw_mask(qw, XE2_BRW_SRC0_VSTRIDE_LO, XE2_BRW_SRC0_VSTRIDE_HI);
+    uint32_t s0_hstride      = xe2_brw_mask(qw, XE2_BRW_SRC0_HSTRIDE_LO, XE2_BRW_SRC0_HSTRIDE_HI);
+    uint32_t s0_width        = xe2_brw_mask(qw, XE2_BRW_SRC0_WIDTH_LO, XE2_BRW_SRC0_WIDTH_HI);
+    uint32_t s0_subreg_hi    = s0_mode
+                             ? xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI)
+                             : xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI);
+    uint32_t s0_subreg_lsb   = xe2_brw_mask(qw, XE2_BRW_SRC0_SUBREG_LSB_BIT, XE2_BRW_SRC0_SUBREG_LSB_BIT);
+    uint32_t s0_subreg_bytes = (s0_subreg_hi << 1) | s0_subreg_lsb;
+    uint32_t s0_subreg       = s0_subreg_bytes / xe2_brw_op_type_size(s0_type);
 
     uint32_t s1_imm          = xe2_brw_mask(qw, XE2_BRW_SRC1_IS_IMM_BIT, XE2_BRW_SRC1_IS_IMM_BIT);
     uint32_t s1_mode         = xe2_brw_mask(qw, XE2_BRW_SRC1_ADDRESS_MODE_BIT, XE2_BRW_SRC1_ADDRESS_MODE_BIT);
     uint32_t s1_type         = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
     uint32_t s1_reg          = xe2_brw_mask(qw, XE2_BRW_SRC1_DA_REG_NR_LO, XE2_BRW_SRC1_DA_REG_NR_HI);
     uint32_t s1_subreg_hi    = s1_mode
-                             ? xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI)
-                             : xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI);
+                             ? xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI)
+                             : xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI);
     uint32_t s1_subreg_bytes = (s1_subreg_hi << 1);
     uint32_t s1_subreg       = s1_subreg_bytes / xe2_brw_op_type_size(s1_type);
     uint32_t s1_vstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_VSTRIDE_LO, XE2_BRW_SRC1_VSTRIDE_HI);
@@ -3095,7 +3097,7 @@ static void xe2_brw_decode_send(const xe2_qword_t *qw, uint32_t op, bool *eot)
         uint64_t imm = xe2_brw_mask(qw, 96, 127);
         sprintf(fmt_s0, "imm=%lu (0x%lx)", imm, imm);
     } else {
-        sprintf(fmt_s0, "r%u.%u<%u>:%u", s0_reg, s0_subreg, s0_hstride, s0_type);
+        sprintf(fmt_s0, "r%u.%u<%u:%u:%u>:%u", s0_reg, s0_subreg, s0_vstride, s0_width, s0_hstride, s0_type);
     }
 
     rvvm_info(
