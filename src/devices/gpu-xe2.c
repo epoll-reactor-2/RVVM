@@ -15,6 +15,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include "gpu-vulkan.h"
 #include "mem_ops.h"
 #include "spinlock.h"
 #include "utils.h"
@@ -1396,6 +1397,8 @@ typedef struct {
 
     uint8_t     *vram;
 
+    gpu_vulkan_ctx_t *vulkan_ctx;
+
     // The DMC loader writes a per-firmware list of (register, value) pairs and
     // later verifies the registers read back those values. Shadow the two DMC
     // register windows so those writes stick. These hold no other state.
@@ -1551,19 +1554,31 @@ static uint8_t *xe2_scanout_page_dma(xe2_dev_t *xe2, rvvm_addr_t ggtt, size_t *a
     }
 
     uint64_t pte = xe2->ggtt_pte[page];
-    if (!(pte & 1)) { // Not present
+    if (!(pte & 1)) { // Not present.
         return NULL;
     }
 
     uint64_t addr = (pte & 0x0000FFFFFFFFF000ULL) + off;
-    if (pte & 2) { // Local (VRAM) memory
+    if (pte & 2) { // Local (VRAM) memory.
         if (unlikely(addr + *avail > XE2_VRAM_SIZE)) {
             return NULL;
         }
         return xe2->vram + addr;
     }
-    // System memory, reachable through the guest's DMA window
+    // System memory, reachable through the guest's DMA window.
     return rvvm_pci_get_dma(xe2->pci_func, addr, *avail);
+}
+
+// Raw copy XRGB888 image, respecting the guest's real stride
+// (which may be wider than width * bpp) and target pixel format.
+static void xe2_blit_shader_output(uint8_t *dst, uint32_t stride,
+                                    const uint8_t *pixels, size_t row_pitch,
+                                    uint32_t width, uint32_t height)
+{
+    // We able to match Vulkan <-> RVVM graphics API color formats, so
+    // bare copy will satisfy both sides.
+    const size_t bpp = 4;
+    memcpy(dst + stride, pixels + row_pitch, width * height * bpp);
 }
 
 // Present pipe-A plane 1 onto the host window. The driver programs a linear
@@ -1614,19 +1629,32 @@ static void xe2_scanout(xe2_dev_t *xe2)
         return;
     }
 
-    uint64_t surf   = xe2->display.plane_surf & ~0xFFFULL;
-    size_t   copied = 0;
-    while (copied < needed) {
-        size_t   avail = 0;
-        uint8_t *dma   = xe2_scanout_page_dma(xe2, surf + copied, &avail);
-        size_t   chunk = (avail < needed - copied) ? avail : needed - copied;
-        if (dma) {
-            memcpy(dst + copied, dma, chunk);
-        } else {
-            memset(dst + copied, 0, chunk);
+    // As Vulkan is still WIP, we could set this static flag to test it.
+    // When set to true, hardcoded Vulkan shader is rendered. The whole
+    // process takes way too much time and RVVM freezes heavily.
+    bool rendering = true;
+
+    if (rendering) {
+        const uint8_t *pixels    = NULL;
+        size_t         row_pitch = 0;
+        if (xe2->vulkan_ctx && gpu_vulkan_render_frame(xe2->vulkan_ctx, width, height, &pixels, &row_pitch)) {
+            xe2_blit_shader_output(dst, stride, pixels, row_pitch, width, height);
         }
-        copied += chunk;
-        rvvm_pci_end_dma(xe2->pci_func, dma);
+    } else {
+        uint64_t surf   = xe2->display.plane_surf & ~0xFFFULL;
+        size_t   copied = 0;
+        while (copied < needed) {
+            size_t   avail = 0;
+            uint8_t *dma   = xe2_scanout_page_dma(xe2, surf + copied, &avail);
+            size_t   chunk = (avail < needed - copied) ? avail : needed - copied;
+            if (dma) {
+                memcpy(dst + copied, dma, chunk);
+            } else {
+                memset(dst + copied, 0, chunk);
+            }
+            copied += chunk;
+            rvvm_pci_end_dma(xe2->pci_func, dma);
+        }
     }
 
     rvvm_fb_t fb = {
@@ -4967,6 +4995,7 @@ RVVM_PUBLIC rvvm_pci_func_t* rvvm_gpu_xe2_init(rvvm_machine_t *machine, rvvm_fbd
     xe2->ggtt_pte = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint64_t), VMA_RDWR);
     xe2->ggtt_lo_addrs = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(uint32_t), VMA_RDWR);
     xe2->ggtt_pte_valid = vma_alloc(NULL, XE2_GGTT_PAGES * sizeof(bool), VMA_RDWR);
+    xe2->vulkan_ctx = gpu_vulkan_create();
 
     rvvm_reg_desc_t xe2_mmio_desc = {
         .size           = 0x1000000,
