@@ -10,17 +10,18 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_pci.h>
 #include <rvvm/rvvm_fb.h>
+#include <devices/gpu-vulkan.h>
+#include <util/compiler.h>
+#include <util/mem_ops.h>
+#include <util/spinlock.h>
+#include <util/utils.h>
+#include <util/bit_ops.h>
+#include <util/vma_ops.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include "gpu-vulkan.h"
-#include "mem_ops.h"
-#include "spinlock.h"
-#include "utils.h"
-#include "bit_ops.h"
-#include "vma_ops.h"
 
 // Basic DRM programs and weston works with following
 // boot arguments:
@@ -1569,18 +1570,6 @@ static uint8_t *xe2_scanout_page_dma(xe2_dev_t *xe2, rvvm_addr_t ggtt, size_t *a
     return rvvm_pci_get_dma(xe2->pci_func, addr, *avail);
 }
 
-// Raw copy XRGB888 image, respecting the guest's real stride
-// (which may be wider than width * bpp) and target pixel format.
-static void xe2_blit_shader_output(uint8_t *dst, uint32_t stride,
-                                    const uint8_t *pixels, size_t row_pitch,
-                                    uint32_t width, uint32_t height)
-{
-    // We able to match Vulkan <-> RVVM graphics API color formats, so
-    // bare copy will satisfy both sides.
-    const size_t bpp = 4;
-    memcpy(dst + stride, pixels + row_pitch, width * height * bpp);
-}
-
 // Present pipe-A plane 1 onto the host window. The driver programs a linear
 // XRGB8888 framebuffer (fbcon) into a GPU buffer object whose surface address is
 // a GGTT offset; resolve it page by page and blit it into the window's VRAM,
@@ -1635,10 +1624,23 @@ static void xe2_scanout(xe2_dev_t *xe2)
     bool rendering = true;
 
     if (rendering) {
-        const uint8_t *pixels    = NULL;
-        size_t         row_pitch = 0;
-        if (xe2->vulkan_ctx && gpu_vulkan_render_frame(xe2->vulkan_ctx, width, height, &pixels, &row_pitch)) {
-            xe2_blit_shader_output(dst, stride, pixels, row_pitch, width, height);
+        uint32_t   out_width = 0U;
+        uint32_t   out_height = 0U;
+        uint32_t   out_stride = 0U;
+        rvvm_rgb_t out_format = {0};
+        if (xe2->vulkan_ctx &&
+            gpu_vulkan_render_frame(xe2->vulkan_ctx, width, height,
+                                     dst, vram_size, stride, format,
+                                     &out_width, &out_height, &out_stride, &out_format)) {
+            rvvm_fb_t fb = {
+                .buffer = dst,
+                .width  = out_width,
+                .height = out_height,
+                .stride = out_stride,
+                .format = out_format,
+            };
+            rvvm_fbdev_set_scanout(xe2->fbdev, &fb);
+
         }
     } else {
         uint64_t surf   = xe2->display.plane_surf & ~0xFFFULL;
@@ -1655,16 +1657,16 @@ static void xe2_scanout(xe2_dev_t *xe2)
             copied += chunk;
             rvvm_pci_end_dma(xe2->pci_func, dma);
         }
-    }
 
-    rvvm_fb_t fb = {
-        .buffer = dst,
-        .width  = width,
-        .height = height,
-        .stride = stride,
-        .format = format,
-    };
-    rvvm_fbdev_set_scanout(xe2->fbdev, &fb);
+        rvvm_fb_t fb = {
+            .buffer = dst,
+            .width  = width,
+            .height = height,
+            .stride = stride,
+            .format = format,
+        };
+        rvvm_fbdev_set_scanout(xe2->fbdev, &fb);
+    }
 }
 
 // Periodic display refresh callback, invoked by RVVM at roughly 60 Hz. For

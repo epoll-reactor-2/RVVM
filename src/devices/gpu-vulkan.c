@@ -10,14 +10,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "gpu-vulkan.h"
 #include "__vulkan_snippet_frag.h"
 #include "__vulkan_snippet_vert.h"
-#include "utils.h"
+#include <rvvm/rvvm_fb.h>
+#include <util/atomics.h>
+#include <util/compiler.h>
+#include <util/utils.h>
+#include <util/threading.h>
 
+#include <stdint.h>
 #include <vulkan/vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define XE2_VK_COLOR_FORMAT VK_FORMAT_B8G8R8A8_UNORM
 
 // Log-and-bail helper. Every Vulkan call site uses this instead of
 // aborting the process - a broken GPU driver should not take the whole
@@ -45,9 +48,14 @@ struct gpu_vulkan_ctx_t {
     VkCommandBuffer  command_buffer;
     VkFence          fence;
 
-    // Per-resolution resources; recreated only when width/height change.
+    // Per-resolution resources; recreated when width/height/format change.
+    // Owned exclusively by the render task thread.
     uint32_t         cur_width;
     uint32_t         cur_height;
+    uint32_t         cur_stride;      // only meaningful when zero_copy
+    VkFormat         cur_vk_format;   // format color_image/render_pass/pipeline are built for
+    VkDeviceSize     cur_buf_size;    // readback buffer's actual allocated size
+    bool             zero_copy;       // true: GPU output already matches the guest's byte layout
     VkImage          color_image;
     VkDeviceMemory   color_memory;
     VkImageView      color_view;
@@ -57,6 +65,32 @@ struct gpu_vulkan_ctx_t {
     void            *readback_mapped;
 
     uint64_t         frame_index;
+
+    // Async page-flip state. The worker does the render AND the CPU-side
+    // format conversion/blit, writing straight into the guest's own vram
+    // buffer. Scanout never touches a pixel - it just asks what's
+    // currently resident in that buffer.
+    bool             render_in_progress;
+    bool             shutting_down;
+    uint32_t         requested_width;
+    uint32_t         requested_height;
+
+    // Blit target for the *next* task to pick up - published by scanout
+    // every call, read once by the worker at the top of its task. This
+    // is the guest's real vram (rvvm_fbdev_get_vram()), not an internal
+    // Vulkan buffer.
+    uint8_t         *requested_dst;
+    size_t           requested_dst_size;
+    uint32_t         requested_stride;
+    rvvm_rgb_t       requested_format;
+
+    // Describes whatever the worker most recently finished writing into
+    // requested_dst - i.e. what's actually safe to hand to
+    // rvvm_fbdev_set_scanout() right now.
+    uint32_t         front_width;
+    uint32_t         front_height;
+    uint32_t         front_stride;
+    rvvm_rgb_t       front_format;
 };
 
 
@@ -87,14 +121,14 @@ static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t *ctx)
         rvvm_warn("No Vulkan devices available\n");
         goto fail;
     }
-    VkPhysicalDevice *devices = safe_malloc(sizeof(VkPhysicalDevice) * dev_count);
+    VkPhysicalDevice *devices = safe_calloc(sizeof(VkPhysicalDevice), dev_count);
     vkEnumeratePhysicalDevices(ctx->instance, &dev_count, devices);
 
     int graphics_family = -1;
     for (uint32_t i = 0; i < dev_count && graphics_family < 0; i++) {
         uint32_t q_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &q_count, NULL);
-        VkQueueFamilyProperties *q_props = malloc(sizeof(VkQueueFamilyProperties) * q_count);
+        VkQueueFamilyProperties *q_props = safe_calloc(sizeof(VkQueueFamilyProperties), q_count);
         vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &q_count, q_props);
         for (uint32_t q = 0; q < q_count; q++) {
             if (q_props[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
@@ -134,10 +168,52 @@ fail:
     return false;
 }
 
-static bool gpu_vulkan_create_render_pass(gpu_vulkan_ctx_t *ctx)
+// Maps a guest pixel format onto the Vulkan format whose memory byte
+// layout matches it exactly - Vulkan's *8*8*8*8_UNORM formats list
+// components in the same order as their bytes in memory, so these are
+// direct matches, not approximations:
+//   RVVM_RGB_XRGB8888    -> bytes R,G,B,X -> VK_FORMAT_R8G8B8A8_UNORM
+//   RVVM_RGB_XBGR8888    -> bytes B,G,R,X -> VK_FORMAT_B8G8R8A8_UNORM
+//   RVVM_RGB_RGB565      -> bits R:G:B = 5:6:5, MSB-first -> VK_FORMAT_R5G6B5_UNORM_PACK16
+//   RVVM_RGB_XRGB2101010 -> bits X:R:G:B = 2:10:10:10     -> VK_FORMAT_A2R10G10B10_UNORM_PACK32
+// Verify these against your actual rvvm_rgb_t byte-order definition -
+// same caveat as the CPU conversion table below, which this mirrors.
+forceinline static VkFormat gpu_vulkan_native_format_for_guest(rvvm_rgb_t format)
+{
+    switch (format) {
+        case RVVM_RGB_RGB565:
+            return VK_FORMAT_R5G6B5_UNORM_PACK16;
+
+        case RVVM_RGB_XRGB2101010:
+            return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+
+        case RVVM_RGB_XBGR8888:
+            return VK_FORMAT_B8G8R8A8_UNORM;
+
+        case RVVM_RGB_XRGB8888:
+        default:
+            return VK_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+// R8G8B8A8/B8G8R8A8 color-attachment support is mandatory in the Vulkan
+// spec; R5G6B5/A2R10G10B10 are not, so this has to be a runtime check.
+static bool gpu_vulkan_format_usable(VkPhysicalDevice phys, VkFormat fmt)
+{
+    VkFormatProperties props = {0};
+    vkGetPhysicalDeviceFormatProperties(phys, fmt, &props);
+    return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+}
+
+static size_t gpu_vulkan_vk_format_bpp(VkFormat fmt)
+{
+    return (fmt == VK_FORMAT_R5G6B5_UNORM_PACK16) ? 2 : 4;
+}
+
+static bool gpu_vulkan_create_render_pass(gpu_vulkan_ctx_t *ctx, VkFormat vk_format)
 {
     VkAttachmentDescription color_attachment = {
-        .format         = XE2_VK_COLOR_FORMAT,
+        .format         = vk_format,
         .samples        = VK_SAMPLE_COUNT_1_BIT,
         .loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
@@ -183,8 +259,13 @@ fail:
 // shaders are hardcoded for tests sake. But when guest reports a new
 // shader via Xe2 assembly, we should load/unload shader modules as
 // they arrive or leave.
-static bool gpu_vulkan_create_pipeline(gpu_vulkan_ctx_t *ctx)
+// vk_format isn't used directly (the pipeline is only tied to the
+// render pass, which already carries the format) but is threaded
+// through so the call site reads clearly next to create_render_pass.
+static bool gpu_vulkan_create_pipeline(gpu_vulkan_ctx_t *ctx, VkFormat vk_format)
 {
+    UNUSED(vk_format);
+
     VkShaderModuleCreateInfo vertex_ci = {
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = sizeof(xe2_vert_spv),
@@ -340,15 +421,13 @@ gpu_vulkan_ctx_t *gpu_vulkan_create(void)
     if (!gpu_vulkan_create_instance_and_device(ctx)) {
         goto fail;
     }
-    if (!gpu_vulkan_create_render_pass(ctx)) {
-        goto fail;
-    }
-    if (!gpu_vulkan_create_pipeline(ctx)) {
-        goto fail;
-    }
     if (!gpu_vulkan_create_command_and_sync(ctx)) {
         goto fail;
     }
+    // render_pass/pipeline are built lazily in gpu_vulkan_reconfigure()
+    // once the guest's target pixel format is known, and rebuilt only
+    // when that format actually changes (a real mode-set, not every
+    // frame).
 
     return ctx;
 
@@ -394,9 +473,18 @@ static void gpu_vulkan_destroy_sized_resources(gpu_vulkan_ctx_t *ctx)
 
 void gpu_vulkan_destroy(gpu_vulkan_ctx_t *ctx)
 {
-    if (!ctx) {
+    if (unlikely(!ctx)) {
         return;
     }
+
+    // Stop accepting new work and wait for any in-flight page-flip task.
+    atomic_store_uint8_relax(&ctx->shutting_down, 1);
+    while (atomic_load_uint8_relax(&ctx->render_in_progress)) {
+        // Worker will clear the flag after its fence wait (or immediately
+        // if it sees shutting_down before submit). Short spin is fine;
+        // a single triangle completes in well under a millisecond.
+    }
+
     if (ctx->device) {
         vkDeviceWaitIdle(ctx->device);
     }
@@ -448,9 +536,15 @@ static uint32_t gpu_vulkan_find_memory_type(VkPhysicalDevice phys, uint32_t type
 }
 
 // This optionally re-maps Vulkan framebuffer to CPU-visible memory.
-static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_t h)
+// buf_size is passed in rather than computed here because it depends on
+// whether the caller is in the zero-copy path (buf_size == guest's real
+// stride * height) or the CPU-conversion fallback (tightly packed
+// width * height * bpp) - see gpu_vulkan_reconfigure().
+static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_t h,
+                                       VkFormat vk_format, VkDeviceSize buf_size)
 {
-    if (ctx->framebuffer != VK_NULL_HANDLE && ctx->cur_width == w && ctx->cur_height == h) {
+    if (ctx->framebuffer != VK_NULL_HANDLE && ctx->cur_width == w && ctx->cur_height == h
+        && ctx->cur_vk_format == vk_format && ctx->cur_buf_size == buf_size) {
         return true; // Already sized correctly - typical steady-state case.
     }
 
@@ -460,7 +554,7 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
     VkImageCreateInfo image_ci = {
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType     = VK_IMAGE_TYPE_2D,
-        .format        = XE2_VK_COLOR_FORMAT,
+        .format        = vk_format,
         .extent        = {
             .width  = w,
             .height = h,
@@ -495,7 +589,7 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
         .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image    = ctx->color_image,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format   = XE2_VK_COLOR_FORMAT,
+        .format   = vk_format,
         .subresourceRange = {
             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel   = 0,
@@ -517,8 +611,7 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
     };
     VK_TRY(vkCreateFramebuffer(ctx->device, &framebuffer_ci, NULL, &ctx->framebuffer));
 
-    // Host-visible readback buffer: tightly packed width * height * 4 bytes.
-    VkDeviceSize buf_size = (VkDeviceSize) w * h * 4;
+    // Host-visible readback buffer, sized by the caller (see above).
     VkBufferCreateInfo buf_ci = {
         .size        = buf_size,
         .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -547,6 +640,8 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
 
     ctx->cur_width = w;
     ctx->cur_height = h;
+    ctx->cur_vk_format = vk_format;
+    ctx->cur_buf_size = buf_size;
     return true;
 
 fail:
@@ -554,31 +649,162 @@ fail:
     return false;
 }
 
-bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t *ctx, uint32_t width, uint32_t height,
-                          const uint8_t **out_pixels, size_t *out_row_pitch)
+// Picks the best Vulkan format for the guest's requested pixel format,
+// rebuilds the render pass/pipeline if that format actually changed
+// (rare - a real mode-set), and (re)sizes the offscreen image/readback
+// buffer for the current width/height/stride. Leaves ctx->zero_copy set
+// so the caller knows whether the GPU output already matches the
+// guest's byte layout (straight memcpy) or needs the CPU fallback path.
+static bool gpu_vulkan_reconfigure(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_t h,
+                                    uint32_t stride, rvvm_rgb_t guest_format)
 {
-    if (!ctx || width == 0 || height == 0) {
-        return false;
+    VkFormat native     = gpu_vulkan_native_format_for_guest(guest_format);
+    bool     zero_copy  = gpu_vulkan_format_usable(ctx->physical_device, native);
+    VkFormat vk_format  = zero_copy ? native : VK_FORMAT_B8G8R8A8_UNORM;
+
+    if (vk_format != ctx->cur_vk_format) {
+        // Attachment format changed - pipeline/render pass must be
+        // rebuilt to match; this only happens on a real mode-set.
+        if (ctx->pipeline)        vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
+        if (ctx->pipeline_layout) vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, NULL);
+        if (ctx->render_pass)     vkDestroyRenderPass(ctx->device, ctx->render_pass, NULL);
+        ctx->pipeline = VK_NULL_HANDLE;
+        ctx->pipeline_layout = VK_NULL_HANDLE;
+        ctx->render_pass = VK_NULL_HANDLE;
+
+        if (!gpu_vulkan_create_render_pass(ctx, vk_format)) {
+            return false;
+        }
+        if (!gpu_vulkan_create_pipeline(ctx, vk_format)) {
+            return false;
+        }
     }
-    if (!gpu_vulkan_resize_targets(ctx, width, height)) {
+
+    VkDeviceSize buf_size = zero_copy
+        ? (VkDeviceSize) stride * h // GPU writes guest's exact layout.
+        : (VkDeviceSize) w * h * gpu_vulkan_vk_format_bpp(vk_format); // Tightly packed for CPU fallback.
+
+    if (!gpu_vulkan_resize_targets(ctx, w, h, vk_format, buf_size)) {
         return false;
     }
 
-    // Deterministic "one frame per scanout call" clock, per the prompt's
-    // framing - not tied to wall-clock time.
-    const float dt = 1.0f / 60.0f;
-    const float speed = 1.5f;
-    float time = (float) ctx->frame_index * dt * speed;
+    ctx->zero_copy  = zero_copy;
+    ctx->cur_stride = stride;
+    return true;
+}
+
+// -----------------------------------------------------------
+// CPU-side format conversion, now done on the worker thread
+// -----------------------------------------------------------
+
+forceinline static size_t gpu_vulkan_bytes_per_pixel(rvvm_rgb_t format)
+{
+    switch (format) {
+        case RVVM_RGB_RGB565:
+            return 2;
+
+        default:
+            return 4; // XRGB8888 / XBGR8888 / XRGB2101010
+    }
+}
+
+// Only used by the fallback path, which always renders in
+// VK_FORMAT_B8G8R8A8_UNORM (see gpu_vulkan_reconfigure), so src_bgra is
+// always (B,G,R,A) per pixel here.
+static inline void gpu_vulkan_write_pixel(uint8_t *dst, const uint8_t *src_bgra, rvvm_rgb_t format)
+{
+    uint8_t b = src_bgra[0];
+    uint8_t g = src_bgra[1];
+
+    uint8_t r = src_bgra[2];
+    switch (format) {
+        case RVVM_RGB_RGB565: {
+            uint16_t pixel = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            memcpy(dst, &pixel, sizeof(pixel));
+            break;
+        }
+        case RVVM_RGB_XRGB2101010: {
+            uint32_t r10   = (uint32_t) r * 1023 / 255;
+            uint32_t g10   = (uint32_t) g * 1023 / 255;
+            uint32_t b10   = (uint32_t) b * 1023 / 255;
+            uint32_t pixel = (r10 << 20) | (g10 << 10) | b10;
+            memcpy(dst, &pixel, sizeof(pixel));
+            break;
+        }
+        case RVVM_RGB_XBGR8888:
+            dst[0] = b;
+            dst[1] = g;
+            dst[2] = r;
+            dst[3] = 0xFF;
+            break;
+        case RVVM_RGB_XRGB8888:
+        default:
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
+            dst[3] = 0xFF;
+            break;
+    }
+}
+
+// Converts the tightly-packed BGRA8 render output into dst at the
+// guest's real stride/format. Runs entirely on the worker thread now -
+// this used to be xe2_blit_shader_output() called from xe2_scanout().
+static void gpu_vulkan_blit_to_guest(uint8_t *dst, uint32_t stride,
+                                      const uint8_t *pixels, size_t row_pitch,
+                                      uint32_t width, uint32_t height, rvvm_rgb_t format)
+{
+    size_t bpp = gpu_vulkan_bytes_per_pixel(format);
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t *src_row = pixels + (size_t) y * row_pitch;
+        uint8_t       *dst_row = dst + (size_t) y * stride;
+        for (uint32_t x = 0; x < width; x++) {
+            gpu_vulkan_write_pixel(dst_row + x * bpp, src_row + x * 4, format);
+        }
+    }
+}
+
+// Worker task that performs the actual Vulkan work (resize + draw +
+// readback + fence wait), then does the CPU-side blit directly into the
+// guest's vram buffer. Publishes front_width/height/stride/format
+// describing what's now sitting in that buffer, so the next scanout
+// can page-flip without touching a single pixel.
+//
+// I am drunk while writing this. God forgive me.
+static void *gpu_vulkan_render_task(void *arg)
+{
+    gpu_vulkan_ctx_t *ctx = (gpu_vulkan_ctx_t *) arg;
+    uint32_t   width      = ctx->requested_width;
+    uint32_t   height     = ctx->requested_height;
+    uint32_t   stride     = ctx->requested_stride;
+    rvvm_rgb_t format     = ctx->requested_format;
+    uint8_t   *dst        = ctx->requested_dst;
+    size_t     dst_size   = ctx->requested_dst_size;
+
+    if (atomic_load_uint8_relax(&ctx->shutting_down) || width == 0 || height == 0) {
+        goto done;
+    }
+
+    if (!gpu_vulkan_reconfigure(ctx, width, height, stride, format)) {
+        goto done;
+    }
+
+    // Deterministic frame clock - not wall-clock time.
+    const float dt    = 1.0f / 60.0f;
+    const float speed = 20.0f;
+    float time        = (float) ctx->frame_index * dt * speed;
 
     vkResetCommandBuffer(ctx->command_buffer, 0);
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
     };
-    VK_TRY(vkBeginCommandBuffer(ctx->command_buffer, &begin_info));
+    if (vkBeginCommandBuffer(ctx->command_buffer, &begin_info) != VK_SUCCESS) {
+        goto done;
+    }
 
     VkViewport viewport = {
-        .x        = 0,
-        .y        = 0,
+        .x        = 0.0f,
+        .y        = 0.0f,
         .width    = (float) width,
         .height   = (float) height,
         .minDepth = 0.0f,
@@ -621,23 +847,23 @@ bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t *ctx, uint32_t width, uint32_t hei
     };
     vkCmdBeginRenderPass(ctx->command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->pipeline);
-    // Pass constant to a compiled SPIR-V shader. It would be visible through:
-    //
-    // layout(push_constant) uniform PushConsts {
-    //     float time;
-    // } pc;
-    vkCmdPushConstants(ctx->command_buffer, ctx->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
-                        0, sizeof(float), &time);
-    // Our hardcoded shader sets 3 vertices, so we pass vertexCount=3.
-    // In case of own SPIR-V compiler we need to maintain this kind of
-    // metadata along with the compiled shader itself.
+    // layout(push_constant) uniform PushConsts { float time; } pc;
+    vkCmdPushConstants(ctx->command_buffer, ctx->pipeline_layout,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float), &time);
     vkCmdDraw(ctx->command_buffer, 3, 1, 0, 0);
     vkCmdEndRenderPass(ctx->command_buffer);
-    // renderPass finalLayout already leaves the image in TRANSFER_SRC_OPTIMAL.
+    // finalLayout already leaves the image in TRANSFER_SRC_OPTIMAL.
+
+    // In the zero-copy path, bufferRowLength is the guest's real stride
+    // (in texels of vk_format) - the GPU's copy engine handles any row
+    // padding for us. In the fallback path it's just `width`, tightly
+    // packed, and gpu_vulkan_blit_to_guest() destrides it on the CPU.
+    size_t vk_bpp = gpu_vulkan_vk_format_bpp(ctx->cur_vk_format);
+    uint32_t buffer_row_length = ctx->zero_copy ? (uint32_t)(stride / vk_bpp) : width;
 
     VkBufferImageCopy region = {
         .bufferOffset      = 0,
-        .bufferRowLength   = width,
+        .bufferRowLength   = buffer_row_length,
         .bufferImageHeight = height,
         .imageSubresource  = {
             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -651,29 +877,117 @@ bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t *ctx, uint32_t width, uint32_t hei
             .depth  = 1
         },
     };
-    vkCmdCopyImageToBuffer(ctx->command_buffer, ctx->color_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            ctx->readback_buffer, 1, &region);
+    vkCmdCopyImageToBuffer(ctx->command_buffer, ctx->color_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           ctx->readback_buffer, 1, &region);
 
-    VK_TRY(vkEndCommandBuffer(ctx->command_buffer));
+    if (vkEndCommandBuffer(ctx->command_buffer) != VK_SUCCESS) {
+        goto done;
+    }
 
-    VK_TRY(vkResetFences(ctx->device, 1, &ctx->fence));
+    if (vkResetFences(ctx->device, 1, &ctx->fence) != VK_SUCCESS) {
+        goto done;
+    }
     VkSubmitInfo submit = {
         .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
         .pCommandBuffers    = &ctx->command_buffer,
     };
-    VK_TRY(vkQueueSubmit(ctx->graphics_queue, 1, &submit, ctx->fence));
+    if (vkQueueSubmit(ctx->graphics_queue, 1, &submit, ctx->fence) != VK_SUCCESS) {
+        goto done;
+    }
 
-    // Blocking wait, matching the synchronous style of the existing DMA
-    // copy loop in xe2_scanout(). A single triangle draw completes in
-    // well under a millisecond on any real GPU.
-    VK_TRY(vkWaitForFences(ctx->device, 1, &ctx->fence, VK_TRUE, UINT64_MAX));
+    // Blocking wait lives on the worker thread, never on the scanout path.
+    if (vkWaitForFences(ctx->device, 1, &ctx->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        goto done;
+    }
 
-    *out_pixels = (const uint8_t *) ctx->readback_mapped;
-    *out_row_pitch = (size_t) width * 4;
+    if (atomic_load_uint8_relax(&ctx->shutting_down)) {
+        goto done;
+    }
+
+    // dst/dst_size/stride/format were snapshotted at the top of this
+    // function, alongside width/height.
+    if (dst && stride) {
+        if (ctx->zero_copy) {
+            // The GPU already wrote exactly what the guest needs, at the
+            // guest's real stride - one flat memcpy, no per-pixel work,
+            // no branchy switch. This is the fast path for all four
+            // formats whenever the GPU supports them as attachments.
+            size_t needed = (size_t) stride * height;
+            if (needed <= dst_size) {
+                memcpy(dst, ctx->readback_mapped, needed);
+                ctx->front_width  = width;
+                ctx->front_height = height;
+                ctx->front_stride = stride;
+                ctx->front_format = format;
+            }
+        } else {
+            // Fallback: this GPU can't render natively in the guest's
+            // format (only expected for RGB565/XRGB2101010 on some
+            // drivers) - readback_mapped is tightly-packed B8G8R8A8 here,
+            // matching gpu_vulkan_blit_to_guest()'s assumption.
+            size_t row_pitch = (size_t) width * gpu_vulkan_vk_format_bpp(ctx->cur_vk_format);
+            size_t needed    = (size_t) stride * height;
+            if (needed <= dst_size) {
+                gpu_vulkan_blit_to_guest(dst, stride, ctx->readback_mapped, row_pitch, width, height, format);
+                ctx->front_width  = width;
+                ctx->front_height = height;
+                ctx->front_stride = stride;
+                ctx->front_format = format;
+            }
+        }
+    }
     ctx->frame_index++;
-    return true;
 
-fail:
+done:
+    atomic_store_uint8_relax(&ctx->render_in_progress, 0);
+    return NULL;
+}
+
+// dst/dst_size/stride/format describe the guest's own vram buffer
+// `rvvm_fbdev_get_vram()` - the worker blits directly into it, so
+// nothing here ever touches a pixel. out_width/out_height/out_stride/
+// out_format describe whatever the worker most recently finished
+// writing into dst, which the caller hands straight to
+// rvvm_fbdev_set_scanout() - no per-frame CPU work on this thread.
+bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t *ctx, uint32_t width, uint32_t height,
+                             uint8_t *dst, size_t dst_size, uint32_t stride, rvvm_rgb_t format,
+                             uint32_t *out_width, uint32_t *out_height,
+                             uint32_t *out_stride, rvvm_rgb_t *out_format)
+{
+    if (unlikely(!ctx || width == 0 || height == 0 || atomic_load_uint8_relax(&ctx->shutting_down))) {
+        return false;
+    }
+
+    // Publish what the worker should render/blit next. Cheap field
+    // stores, same as requested_width/height already were.
+    ctx->requested_width     = width;
+    ctx->requested_height    = height;
+    ctx->requested_dst       = dst;
+    ctx->requested_dst_size  = dst_size;
+    ctx->requested_stride    = stride;
+    ctx->requested_format    = format;
+
+    // Queue a new render+blit only when the previous one has finished.
+    // This keeps at most one in-flight task, and guarantees the GUI
+    // thread is never the one doing the work, no matter how slow the
+    // blit is.
+    if (atomic_cas_uint8(&ctx->render_in_progress, 0, 1)) {
+        thread_create_task(gpu_vulkan_render_task, ctx);
+    }
+
+    // Page-flip: hand back whatever the worker last actually wrote into
+    // dst. May lag behind the just-requested width/height if the worker
+    // hasn't caught up yet - that's expected, not a bug; it just shows
+    // the previous frame a little longer instead of blocking or glitching.
+    if (ctx->front_width && ctx->front_height) {
+        *out_width  = ctx->front_width;
+        *out_height = ctx->front_height;
+        *out_stride = ctx->front_stride;
+        *out_format = ctx->front_format;
+        return true;
+    }
+
     return false;
 }

@@ -10,6 +10,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #ifndef RVVM_GPU_VULKAN_H
 #define RVVM_GPU_VULKAN_H
 
+#include "rvvm/rvvm_base.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -20,6 +21,9 @@ gpu_vulkan_ctx_t *gpu_vulkan_create(void);
 
 void gpu_vulkan_destroy(gpu_vulkan_ctx_t *ctx);
 
-bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_t h, const uint8_t **out_pixels, size_t *out_row_pitch);
+bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t *ctx, uint32_t width, uint32_t height,
+                              uint8_t *dst, size_t dst_size, uint32_t stride, rvvm_rgb_t format,
+                              uint32_t *out_width, uint32_t *out_height,
+                              uint32_t *out_stride, rvvm_rgb_t *out_format);
 
 #endif /* RVVM_GPU_VULKAN_H */
