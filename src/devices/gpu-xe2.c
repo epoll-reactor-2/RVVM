@@ -11,6 +11,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_pci.h>
 #include <rvvm/rvvm_fb.h>
 #include <devices/gpu-vulkan.h>
+#include <devices/gpu-vulkan-spirv.h>
 #include <util/compiler.h>
 #include <util/mem_ops.h>
 #include <util/spinlock.h>
@@ -1344,6 +1345,56 @@ typedef struct {
     uint32_t dmc_base;
 } xe2_firmware_t;
 
+typedef enum {
+    XE2_SHADER_VS = 0,
+    XE2_SHADER_HS,
+    XE2_SHADER_DS,
+    XE2_SHADER_GS,
+    XE2_SHADER_PS,
+    XE2_SHADER_CS,
+    XE2_SHADER_STAGE_COUNT
+} xe2_shader_kind_t;
+
+#define XE2_SHADER_MAX_PUSH_DWORDS  32
+#define XE2_SHADER_MAX_BINDINGS     16
+#define XE2_SHADER_MAX_GRF         128
+
+typedef struct {
+    spirv_module_t     mod;
+    xe2_shader_kind_t stage;
+
+    uint32_t fty;  // float32
+    uint32_t v4ty; // vec4 float
+    uint32_t void_ty;
+    uint32_t fn_ty;
+
+    // Per-GRF Function-local float pointer (lazy).
+    uint32_t grf_f32[XE2_SHADER_MAX_GRF];
+
+    uint32_t position_out;  // BuiltIn Position.
+    uint32_t fragcolor_out; // Location 0.
+    uint32_t push_var;
+
+    uint32_t entry_iface[8];
+    size_t   entry_iface_n;
+
+    bool     saw_eot;
+} xe2_spirv_ctx_t;
+
+typedef struct xe2_shader {
+    uint32_t          *spirv;
+    uint32_t           spirv_nwords;
+} xe2_shader_t;
+
+#define XE2_SHADER_CACHE_BUCKETS  64
+
+// Unhandled. Shaders now are generated and printed, then we forget
+// about them.
+typedef struct {
+    xe2_shader_t *bucket[XE2_SHADER_CACHE_BUCKETS];
+    size_t        count;
+} xe2_shader_cache_t;
+
 typedef struct {
     rvvm_pci_func_t *pci_func;
     spinlock_t  lock;
@@ -1399,6 +1450,7 @@ typedef struct {
     uint8_t     *vram;
 
     gpu_vulkan_ctx_t *vulkan_ctx;
+    xe2_spirv_ctx_t   spirv_ctx;
 
     // The DMC loader writes a per-firmware list of (register, value) pairs and
     // later verifies the registers read back those values. Shadow the two DMC
@@ -2872,62 +2924,132 @@ static const uint32_t xe2_brw_vstride_decode[8] = {
     0, 1, 2, 4, 8, 16, 32, 64
 };
 
-static void xe2_brw_decode_compact(const xe2_qword_t *qw, uint32_t op)
+static forceinline uint32_t xe2_spirv_grf(xe2_spirv_ctx_t *ctx, uint32_t grf)
 {
-    uint32_t debug_control = xe2_brw_mask(qw, XE2_BRW_C_DEBUG_CONTROL_BIT, XE2_BRW_C_DEBUG_CONTROL_BIT);
-    uint32_t swsb          = xe2_brw_mask(qw, XE2_BRW_C_SWSB_LO, XE2_BRW_C_SWSB_HI);
-
-    if (xe2_brw_op_3_src(op)) {
-        uint32_t dst_reg_nr = xe2_brw_mask(qw, XE2_BRW_C3_DST_REG_NR_LO, XE2_BRW_C3_DST_REG_NR_HI);
-        uint32_t src_idx    = xe2_brw_mask(qw, XE2_BRW_C3_SRC_INDEX_LO, XE2_BRW_C3_SRC_INDEX_HI);
-        uint32_t ctrl_idx   = xe2_brw_mask(qw, XE2_BRW_C3_CONTROL_INDEX_LO, XE2_BRW_C3_CONTROL_INDEX_HI);
-
-        rvvm_info("op:(c) %s <compact 3src>: dst=r%u src=r%u ctrl=%u",
-            xe2_brw_op_name(op), dst_reg_nr, src_idx, ctrl_idx
-        );
-    } else {
-        uint32_t exec_size       =  xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
-        uint32_t pred_inv        =  xe2_brw_mask(qw, XE2_BRW_PRED_INV_BIT, XE2_BRW_PRED_INV_BIT);
-        uint32_t pred_control    =  xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI);
-        uint32_t ctrl_idx        =  xe2_brw_mask(qw, XE2_BRW_C_CONTROL_INDEX_LO, XE2_BRW_C_CONTROL_INDEX_HI);
-        uint32_t dt_idx          =  xe2_brw_mask(qw, XE2_BRW_C_DATATYPE_LO_LO, XE2_BRW_C_DATATYPE_LO_HI)
-                                 | (xe2_brw_mask(qw, XE2_BRW_C_DATATYPE_HI_LO, XE2_BRW_C_DATATYPE_HI_HI) << 3);
-        uint32_t subreg_idx      =  xe2_brw_mask(qw, XE2_BRW_C_SUBREG_INDEX_LO, XE2_BRW_C_SUBREG_INDEX_HI);
-        uint32_t src0_idx        =  xe2_brw_mask(qw, XE2_BRW_C_SRC0_INDEX_LO, XE2_BRW_C_SRC0_INDEX_HI);
-        uint32_t src1_idx        =  xe2_brw_mask(qw, XE2_BRW_C_SRC1_INDEX_LO, XE2_BRW_C_SRC1_INDEX_HI);
-        uint32_t dst_reg         =  xe2_brw_mask(qw, XE2_BRW_C_DST_REG_NR_LO, XE2_BRW_C_DST_REG_NR_HI);
-        uint32_t dst_hstride_bit =  xe2_brw_mask(qw, XE2_BRW_C_DST_HSTRIDE_LO, XE2_BRW_C_DST_HSTRIDE_HI);
-        uint32_t dst_hstride     =  1 << dst_hstride_bit;
-        uint32_t src0_reg        =  xe2_brw_mask(qw, XE2_BRW_C_SRC0_REG_NR_LO, XE2_BRW_C_SRC0_REG_NR_HI);
-        uint32_t src1_reg        =  xe2_brw_mask(qw, XE2_BRW_C_SRC1_REG_NR_LO, XE2_BRW_C_SRC1_REG_NR_HI);
-
-        uint16_t subreg          = xe2_subreg_table[subreg_idx];
-        uint16_t src0_desc       = xe2_src0_index_table[src0_idx];
-        uint16_t src1_desc       = xe2_src1_index_table[src1_idx];
-        uint32_t dst_subreg      = (subreg >> 0) & 0x1F;
-
-        uint32_t src0_subreg     = (subreg >> 7) & 0x1F;
-        uint32_t src0_abs        = (src0_desc >>  1) & 1;
-        uint32_t src0_neg        = (src0_desc >> 10) & 1;
-        uint32_t src1_subreg     = (src1_desc >>  3) & 0x1F;
-        uint32_t src1_abs        = (src1_desc >> 11) & 1;
-        uint32_t src1_neg        = (src1_desc >> 15) & 1;
-        // BUG: Wrong decoding.
-        uint32_t src0_vstride    = xe2_brw_vstride_decode[(src0_desc >> 8) & 0x7];
-        uint32_t src0_width      = xe2_brw_width_decode  [(src0_desc >> 5) & 0x7];
-        uint32_t src0_hstride    = xe2_brw_hstride_decode[(src0_desc >> 0) & 0x3];
-        uint32_t src1_vstride    = xe2_brw_vstride_decode[(src1_desc >> 8) & 0x7];
-        uint32_t src1_width      = xe2_brw_width_decode  [(src1_desc >> 5) & 0x7];
-        uint32_t src1_hstride    = xe2_brw_hstride_decode[(src1_desc >> 0) & 0x3];
-
-        rvvm_info("op:(c) %s (%02u|%02u)\tr%u.%u<%u>\tr%u.%u<%u.%u.%u>\t\tr%u.%u<%u.%u.%u>",
-            xe2_brw_op_name(op),
-            1 << exec_size, pred_control,
-            dst_reg, dst_subreg, dst_hstride,
-            src0_reg, src0_subreg, src0_vstride, src0_width, src0_hstride,
-            src1_reg, src1_subreg, src1_vstride, src1_width, src1_hstride
-        );
+    if (grf >= XE2_SHADER_MAX_GRF) {
+        grf = 0;
     }
+    if (!ctx->grf_f32[grf]) {
+        uint32_t pty = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_FUNCTION, ctx->fty);
+        ctx->grf_f32[grf] = spirv_local_var(&ctx->mod, pty);
+    }
+    return ctx->grf_f32[grf];
+}
+
+static forceinline uint32_t xe2_spirv_load_grf(xe2_spirv_ctx_t *ctx, uint32_t grf, bool neg, bool abs)
+{
+    uint32_t id = spirv_op_load(&ctx->mod, ctx->fty, xe2_spirv_grf(ctx, grf));
+    if (abs) {
+        id = spirv_ext_inst1(&ctx->mod, ctx->fty, SPIRV_GLSL_STD450_FABS, id);
+    }
+    if (neg) {
+        id = spirv_op_fneg(&ctx->mod, ctx->fty, id);
+    }
+    return id;
+}
+
+static forceinline void
+xe2_spirv_store_grf(xe2_spirv_ctx_t *ctx, uint32_t grf, uint32_t val)
+{
+    spirv_op_store(&ctx->mod, xe2_spirv_grf(ctx, grf), val);
+}
+
+// Decoded operand used by the emitter (register number + modifiers).
+typedef struct {
+    uint32_t reg;
+    uint32_t subreg;
+    bool     neg;
+    bool     abs;
+    bool     is_imm;
+    bool     mode;
+    uint32_t imm_u32;
+    uint8_t  hstride;
+    uint8_t  vstride;
+    uint8_t  width;
+} xe2_brw_operand_t;
+
+static forceinline xe2_brw_operand_t xe2_brw_parse_src0(const xe2_qword_t *qw)
+{
+    xe2_brw_operand_t o = {0};
+    if (xe2_brw_mask(qw, XE2_BRW_SRC0_IS_IMM_BIT, XE2_BRW_SRC0_IS_IMM_BIT)) {
+        o.is_imm = true;
+        o.imm_u32 = xe2_brw_mask(qw, 96, 127);
+        return o;
+    }
+    o.neg     = xe2_brw_mask(qw, XE2_BRW_SRC0_NEGATE_BIT, XE2_BRW_SRC0_NEGATE_BIT);
+    o.abs     = xe2_brw_mask(qw, XE2_BRW_SRC0_ABS_BIT, XE2_BRW_SRC0_ABS_BIT);
+    o.mode    = xe2_brw_mask(qw, XE2_BRW_SRC0_ADDRESS_MODE_BIT, XE2_BRW_SRC0_ADDRESS_MODE_BIT);
+    o.reg     = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
+
+    uint32_t type = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
+    uint32_t subreg_idx = o.mode
+              ? xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI)
+              : xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI);
+
+    uint32_t   s0_subreg_lsb   = xe2_brw_mask(qw, XE2_BRW_SRC0_SUBREG_LSB_BIT, XE2_BRW_SRC0_SUBREG_LSB_BIT);
+    uint32_t   s0_subreg_bytes = (subreg_idx << 1) | s0_subreg_lsb;
+    o.subreg = s0_subreg_bytes / xe2_brw_op_type_size(type);
+
+    uint32_t vstride = xe2_brw_mask(qw, XE2_BRW_SRC0_VSTRIDE_LO, XE2_BRW_SRC0_VSTRIDE_HI);
+    uint32_t hstride = xe2_brw_mask(qw, XE2_BRW_SRC0_HSTRIDE_LO, XE2_BRW_SRC0_HSTRIDE_HI);
+    uint32_t width   = xe2_brw_mask(qw, XE2_BRW_SRC0_WIDTH_LO, XE2_BRW_SRC0_WIDTH_HI);
+
+    o.vstride = xe2_brw_vstride_decode[vstride];
+    o.hstride = xe2_brw_hstride_decode[hstride];
+    o.width   = xe2_brw_width_decode[width];
+
+    return o;
+}
+
+static forceinline xe2_brw_operand_t xe2_brw_parse_src1(const xe2_qword_t *qw)
+{
+    xe2_brw_operand_t o = {0};
+    if (xe2_brw_mask(qw, XE2_BRW_SRC1_IS_IMM_BIT, XE2_BRW_SRC1_IS_IMM_BIT)) {
+        o.is_imm = true;
+        o.imm_u32 = xe2_brw_mask(qw, 96, 127);
+        return o;
+    }
+    o.neg     = xe2_brw_mask(qw, XE2_BRW_SRC1_NEGATE_BIT, XE2_BRW_SRC1_NEGATE_BIT);
+    o.abs     = xe2_brw_mask(qw, XE2_BRW_SRC1_ABS_BIT, XE2_BRW_SRC1_ABS_BIT);
+    o.mode    = xe2_brw_mask(qw, XE2_BRW_SRC1_ADDRESS_MODE_BIT, XE2_BRW_SRC1_ADDRESS_MODE_BIT);
+    o.reg     = xe2_brw_mask(qw, XE2_BRW_SRC1_DA_REG_NR_LO, XE2_BRW_SRC1_DA_REG_NR_HI);
+
+    uint32_t type = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
+    uint32_t subreg_idx = o.mode
+              ? xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI)
+              : xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI);
+
+    uint32_t   s0_subreg_bytes = subreg_idx << 1;
+    o.subreg = s0_subreg_bytes / xe2_brw_op_type_size(type);
+
+    uint32_t vstride = xe2_brw_mask(qw, XE2_BRW_SRC1_VSTRIDE_LO, XE2_BRW_SRC1_VSTRIDE_HI);
+    uint32_t hstride = xe2_brw_mask(qw, XE2_BRW_SRC1_HSTRIDE_LO, XE2_BRW_SRC1_HSTRIDE_HI);
+    uint32_t width   = xe2_brw_mask(qw, XE2_BRW_SRC1_WIDTH_LO, XE2_BRW_SRC1_WIDTH_HI);
+
+    o.vstride = xe2_brw_vstride_decode[vstride];
+    o.hstride = xe2_brw_hstride_decode[hstride];
+    o.width   = xe2_brw_width_decode[width];
+
+    return o;
+}
+
+static forceinline uint32_t xe2_brw_parse_dst(const xe2_qword_t *qw)
+{
+    return xe2_brw_mask(qw, XE2_BRW_DST_REG_NR_LO, XE2_BRW_DST_REG_NR_HI);
+}
+
+static forceinline uint32_t xe2_spirv_load_operand(xe2_spirv_ctx_t *ctx, const xe2_brw_operand_t *op)
+{
+    if (op->is_imm) {
+        float f;
+        memcpy(&f, &op->imm_u32, 4);
+        uint32_t id = spirv_type_const_float32(&ctx->mod, f);
+        if (op->neg) {
+            id = spirv_op_fneg(&ctx->mod, ctx->fty, id);
+        }
+        return id;
+    }
+    return xe2_spirv_load_grf(ctx, op->reg, op->neg, op->abs);
 }
 
 // No width field in align1 3-src. Width is architecturally fixed at 8;
@@ -2937,282 +3059,333 @@ static uint32_t xe2_brw_3_src_vstride(uint32_t hstride)
     return hstride ? hstride * 8 : 0;
 }
 
-static void xe2_brw_decode_3_src_native(const xe2_qword_t *qw, uint32_t op)
+/* MATH function control sits in the low bits of the conditional modifier /
+ * shared control field on Xe2; fall back to bits of dword0 when needed. */
+static inline uint32_t xe2_brw_math_fc(const xe2_qword_t *qw)
 {
-    uint32_t exec_size       = xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
-    uint32_t pred_inv        = xe2_brw_mask(qw, XE2_BRW_PRED_INV_BIT, XE2_BRW_PRED_INV_BIT);
-    uint32_t pred_control    = xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI);
-    uint32_t qtr_control     = xe2_brw_mask(qw, XE2_BRW_QTR_CONTROL_LO, XE2_BRW_QTR_CONTROL_HI);
-    uint32_t mask_control    = xe2_brw_mask(qw, XE2_BRW_MASK_CONTROL_BIT, XE2_BRW_MASK_CONTROL_BIT);
-    uint32_t saturate        = xe2_brw_mask(qw, XE2_BRW_SATURATE_BIT, XE2_BRW_SATURATE_BIT);
-    uint32_t cond_modifier   = xe2_brw_mask(qw, XE2_BRW_COND_MODIFIER_LO, XE2_BRW_COND_MODIFIER_HI);
-    uint32_t swsb            = xe2_brw_mask(qw, XE2_BRW_SWSB_LO, XE2_BRW_SWSB_HI);
-    uint32_t exec_type       = xe2_brw_mask(qw, XE2_BRW_A3_EXEC_TYPE_BIT, XE2_BRW_A3_EXEC_TYPE_BIT);
-
-    uint32_t dst_file        = xe2_brw_mask(qw, XE2_BRW_A3_DST_REG_FILE_BIT, XE2_BRW_A3_DST_REG_FILE_BIT);
-    uint32_t dst_type        = xe2_brw_mask(qw, XE2_BRW_A3_DST_HWTYPE_LO, XE2_BRW_A3_DST_HWTYPE_HI);
-    uint32_t dst_reg         = xe2_brw_mask(qw, XE2_BRW_A3_DST_REG_NR_LO, XE2_BRW_A3_DST_REG_NR_HI);
-    uint32_t dst_subreg_idx  = xe2_brw_mask(qw, XE2_BRW_A3_DST_SUBREG_LO, XE2_BRW_A3_DST_SUBREG_HI);
-    uint32_t dst_subreg      = dst_subreg_idx / xe2_brw_op_type_size(dst_type);
-    uint32_t dst_hstride_bit = xe2_brw_mask(qw, XE2_BRW_A3_DST_HSTRIDE_BIT, XE2_BRW_A3_DST_HSTRIDE_BIT);
-    uint32_t dst_hstride     = 1 << dst_hstride_bit;
-
-    uint32_t s0_file         = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_REG_FILE_BIT, XE2_BRW_A3_SRC0_REG_FILE_BIT);
-    uint32_t s0_imm          = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_IS_IMM_BIT, XE2_BRW_A3_SRC0_IS_IMM_BIT);
-    uint32_t s0_type         = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HWTYPE_LO, XE2_BRW_A3_SRC0_HWTYPE_HI);
-    uint32_t s0_reg          = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_REG_NR_LO, XE2_BRW_A3_SRC0_REG_NR_HI);
-    uint32_t s0_hstride      = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HSTRIDE_LO, XE2_BRW_A3_SRC0_HSTRIDE_HI);
-    uint32_t s0_vstride      = xe2_brw_3_src_vstride(s0_hstride);
-    uint32_t s0_sub          = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_SUBREG_LO, XE2_BRW_A3_SRC0_SUBREG_HI);
-    uint32_t s0_neg          = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_NEGATE_BIT, XE2_BRW_A3_SRC0_NEGATE_BIT);
-    uint32_t s0_abs          = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_ABS_BIT, XE2_BRW_A3_SRC0_ABS_BIT);
-
-    uint32_t s1_file         = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_REG_FILE_BIT, XE2_BRW_A3_SRC1_REG_FILE_BIT);
-    uint32_t s1_type         = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HWTYPE_LO, XE2_BRW_A3_SRC1_HWTYPE_HI);
-    uint32_t s1_reg          = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_REG_NR_LO, XE2_BRW_A3_SRC1_REG_NR_HI);
-    uint32_t s1_sub          = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_SUBREG_LO, XE2_BRW_A3_SRC1_SUBREG_HI);
-    uint32_t s1_hstride      = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HSTRIDE_LO, XE2_BRW_A3_SRC1_HSTRIDE_HI);
-    uint32_t s1_vstride      = xe2_brw_3_src_vstride(s1_hstride);
-    uint32_t s1_neg          = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_NEGATE_BIT, XE2_BRW_A3_SRC1_NEGATE_BIT);
-    uint32_t s1_abs          = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_ABS_BIT, XE2_BRW_A3_SRC1_ABS_BIT);
-
-    uint32_t s2_file         = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_REG_FILE_BIT, XE2_BRW_A3_SRC2_REG_FILE_BIT);
-    uint32_t s2_type         = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HWTYPE_LO, XE2_BRW_A3_SRC2_HWTYPE_HI);
-    uint32_t s2_reg          = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_REG_NR_LO, XE2_BRW_A3_SRC2_REG_NR_HI);
-    uint32_t s2_sub          = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_SUBREG_LO, XE2_BRW_A3_SRC2_SUBREG_HI);
-    uint32_t s2_hstride      = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HSTRIDE_LO, XE2_BRW_A3_SRC2_HSTRIDE_HI);
-    uint32_t s2_vstride      = xe2_brw_3_src_vstride(s2_hstride);
-    uint32_t s2_neg          = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_NEGATE_BIT, XE2_BRW_A3_SRC2_NEGATE_BIT);
-    uint32_t s2_abs          = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_ABS_BIT, XE2_BRW_A3_SRC2_ABS_BIT);
-
-    char fmt_s0[32] = {0};
-    char fmt_s1[32] = {0};
-    char fmt_s2[32] = {0};
-
-    // Broadcast/scalar sources (hstride==0) print as <0>; regular sources as <vstride;hstride>.
-    if (s0_hstride) {
-        sprintf(fmt_s0, "<%u;%u>", s0_vstride, s0_hstride);
-    } else {
-        sprintf(fmt_s0, "<0>");
+    // Cond modifier [95:92] often carries FC for MATH.
+    uint32_t fc = xe2_brw_mask(qw, 92, 95);
+    if (fc == 0) {
+        fc = (qw->lo >> 24) & 0xF;
     }
-    if (s1_hstride) {
-        sprintf(fmt_s1, "<%u;%u>", s1_vstride, s1_hstride);
-    } else {
-        sprintf(fmt_s1, "<0>");
-    }
-    if (s2_hstride) {
-        sprintf(fmt_s2, "<%u;%u>", s2_vstride, s2_hstride);
-    } else {
-        sprintf(fmt_s2, "<0>");
-    }
-
-    rvvm_info("op:(3) %s (%02u|%02u)\tr%u.%u<%u>:%u\tr%u.%u%s:%u\t\tr%u.%u%s:%u\tr%u.%u%s:%u",
-        xe2_brw_op_name(op),
-        1 << exec_size, pred_control,
-        dst_reg, dst_subreg, dst_hstride, dst_type,
-        s0_reg,  s0_sub, fmt_s0, s0_type,
-        s1_reg,  s1_sub, fmt_s1, s1_type,
-        s2_reg,  s2_sub, fmt_s2, s2_type
-    );
+    return fc;
 }
 
-static void xe2_brw_decode_generic_native(const xe2_qword_t *qw, uint32_t op)
+static forceinline void xe2_brw_emit_send(xe2_spirv_ctx_t *spirv_ctx,
+                               const xe2_brw_operand_t *s0,
+                               const xe2_brw_operand_t *s1)
 {
-    if (op == XE2_BRW_OP_ILLEGAL) {
-        rvvm_warn("Illegal operation!");
-        return;
+    uint32_t base = s0->reg ? s0->reg : s1->reg;
+    if (spirv_ctx->stage == XE2_SHADER_VS && spirv_ctx->position_out) {
+        uint32_t x   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 0));
+        uint32_t y   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 1));
+        uint32_t z   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 2));
+        uint32_t ww  = spirv_type_const_float32(&spirv_ctx->mod, 1.0f);
+        uint32_t pos = spirv_composite_construct4(&spirv_ctx->mod, spirv_ctx->v4ty, x, y, z, ww);
+        spirv_op_store(&spirv_ctx->mod, spirv_ctx->position_out, pos);
+    } else if (spirv_ctx->stage == XE2_SHADER_PS && spirv_ctx->fragcolor_out) {
+        uint32_t r = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 0));
+        uint32_t g = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 1));
+        uint32_t b = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 2));
+        uint32_t a = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 3));
+        uint32_t col = spirv_composite_construct4(&spirv_ctx->mod, spirv_ctx->v4ty, r, g, b, a);
+        spirv_op_store(&spirv_ctx->mod, spirv_ctx->fragcolor_out, col);
     }
+}
 
-    uint32_t exec_size       = xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
-    uint32_t pred_inv        = xe2_brw_mask(qw, XE2_BRW_PRED_INV_BIT, XE2_BRW_PRED_INV_BIT);
-    uint32_t pred_control    = xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI);
-    uint32_t qtr_control     = xe2_brw_mask(qw, XE2_BRW_QTR_CONTROL_LO, XE2_BRW_QTR_CONTROL_HI);
-    uint32_t mask_control    = xe2_brw_mask(qw, XE2_BRW_MASK_CONTROL_BIT, XE2_BRW_MASK_CONTROL_BIT);
-    uint32_t saturate        = xe2_brw_mask(qw, XE2_BRW_SATURATE_BIT, XE2_BRW_SATURATE_BIT);
-    uint32_t cond_modifier   = xe2_brw_mask(qw, XE2_BRW_COND_MODIFIER_LO, XE2_BRW_COND_MODIFIER_HI);
-    uint32_t swsb            = xe2_brw_mask(qw, XE2_BRW_SWSB_LO, XE2_BRW_SWSB_HI);
-    uint32_t flag_reg        = xe2_brw_mask(qw, XE2_BRW_FLAG_REG_LO, XE2_BRW_FLAG_REG_HI);
-    uint32_t flag_subreg     = xe2_brw_mask(qw, XE2_BRW_FLAG_SUBREG_BIT, XE2_BRW_FLAG_SUBREG_BIT);
+static forceinline void xe2_brw_emit_spirv(xe2_spirv_ctx_t *spirv_ctx,
+                               const xe2_qword_t *qw, uint32_t op,
+                               const xe2_brw_operand_t *dst,
+                               const xe2_brw_operand_t *s0,
+                               const xe2_brw_operand_t *s1,
+                               const xe2_brw_operand_t *s2)
+{
+    switch (op) {
+        case XE2_BRW_OP_MOV:
+        case XE2_BRW_OP_SEL:
+        case XE2_BRW_OP_FRC:
+        case XE2_BRW_OP_RNDU:
+        case XE2_BRW_OP_RNDD:
+        case XE2_BRW_OP_RNDE:
+        case XE2_BRW_OP_RNDZ: {
+            uint32_t v = xe2_spirv_load_operand(spirv_ctx, s0);
+            if (op == XE2_BRW_OP_FRC) {
+                // frac(x) = x - floor(x); approximate with x for now.
+            }
+            xe2_spirv_store_grf(spirv_ctx, dst->reg, v);
+            break;
+        }
+        case XE2_BRW_OP_ADD:
+        case XE2_BRW_OP_AVG: {
+            uint32_t a = xe2_spirv_load_operand(spirv_ctx, s0);
+            uint32_t b = xe2_spirv_load_operand(spirv_ctx, s1);
+            xe2_spirv_store_grf(spirv_ctx, dst->reg, spirv_op_fadd(&spirv_ctx->mod, spirv_ctx->fty, a, b));
+            break;
+        }
+        case XE2_BRW_OP_MUL: {
+            uint32_t a = xe2_spirv_load_operand(spirv_ctx, s0);
+            uint32_t b = xe2_spirv_load_operand(spirv_ctx, s1);
+            xe2_spirv_store_grf(spirv_ctx, dst->reg, spirv_op_fmul(&spirv_ctx->mod, spirv_ctx->fty, a, b));
+            break;
+        }
+        case XE2_BRW_OP_MAD:
+        case XE2_BRW_OP_MAC:
+        case XE2_BRW_OP_ADD3: {
+            uint32_t a = xe2_spirv_load_operand(spirv_ctx, s0);
+            uint32_t b = xe2_spirv_load_operand(spirv_ctx, s1);
+            uint32_t c = xe2_spirv_load_operand(spirv_ctx, s2);
+            if (op == XE2_BRW_OP_ADD3) {
+                uint32_t t = spirv_op_fadd(&spirv_ctx->mod, spirv_ctx->fty, a, b);
+                xe2_spirv_store_grf(spirv_ctx, dst->reg, spirv_op_fadd(&spirv_ctx->mod, spirv_ctx->fty, t, c));
+            } else {
+                // mad: a*b + c
+                uint32_t t = spirv_op_fmul(&spirv_ctx->mod, spirv_ctx->fty, a, b);
+                xe2_spirv_store_grf(spirv_ctx, dst->reg, spirv_op_fadd(&spirv_ctx->mod, spirv_ctx->fty, t, c));
+            }
+            break;
+        }
+        case XE2_BRW_OP_AND:
+        case XE2_BRW_OP_OR:
+        case XE2_BRW_OP_XOR:
+        case XE2_BRW_OP_SHR:
+        case XE2_BRW_OP_SHL: {
+            uint32_t u32 = spirv_type_uint32(&spirv_ctx->mod);
+            uint32_t fa  = xe2_spirv_load_operand(spirv_ctx, s0);
+            uint32_t fb  = xe2_spirv_load_operand(spirv_ctx, s1);
+            uint32_t ia  = spirv_op_bitcast(&spirv_ctx->mod, u32, fa);
+            uint32_t ib  = spirv_op_bitcast(&spirv_ctx->mod, u32, fb);
+            uint32_t r;
+            switch (op) {
+                case XE2_BRW_OP_AND: r = spirv_op_bit_and(&spirv_ctx->mod, u32, ia, ib); break;
+                case XE2_BRW_OP_OR:  r = spirv_op_bit_or (&spirv_ctx->mod, u32, ia, ib); break;
+                case XE2_BRW_OP_XOR: r = spirv_op_bit_xor(&spirv_ctx->mod, u32, ia, ib); break;
+                case XE2_BRW_OP_SHR: r = spirv_op_shr    (&spirv_ctx->mod, u32, ia, ib); break;
+                default:             r = spirv_op_shl    (&spirv_ctx->mod, u32, ia, ib); break;
+            }
+            xe2_spirv_store_grf(spirv_ctx, dst->reg, spirv_op_bitcast(&spirv_ctx->mod, spirv_ctx->fty, r));
+            break;
+        }
+        case XE2_BRW_OP_MATH: {
+            uint32_t a = xe2_spirv_load_operand(spirv_ctx, s0);
+            uint32_t v = a;
+            switch (xe2_brw_math_fc(qw)) {
+                case 1: // INV
+                    v = spirv_op_fdiv(&spirv_ctx->mod, spirv_ctx->fty,
+                            spirv_type_const_float32(&spirv_ctx->mod, 1.0f), a);
+                    break;
+                case 2: v = spirv_ext_inst1(&spirv_ctx->mod, spirv_ctx->fty, SPIRV_GLSL_STD450_LOG, a); break;
+                case 3: v = spirv_ext_inst1(&spirv_ctx->mod, spirv_ctx->fty, SPIRV_GLSL_STD450_EXP, a); break;
+                case 4: v = spirv_ext_inst1(&spirv_ctx->mod, spirv_ctx->fty, SPIRV_GLSL_STD450_SQRT, a); break;
+                case 5: v = spirv_ext_inst1(&spirv_ctx->mod, spirv_ctx->fty, SPIRV_GLSL_STD450_INVERSE_SQRT, a); break;
+                case 6: v = spirv_ext_inst1(&spirv_ctx->mod, spirv_ctx->fty, SPIRV_GLSL_STD450_SIN, a); break;
+                case 7: v = spirv_ext_inst1(&spirv_ctx->mod, spirv_ctx->fty, SPIRV_GLSL_STD450_COS, a); break;
+                default: break;
+            }
+            xe2_spirv_store_grf(spirv_ctx, dst->reg, v);
+            break;
+        }
+        case XE2_BRW_OP_NOP:
+        case XE2_BRW_OP_SYNC:
+            break;
+        default:
+            // Unhandled opcode: skip without failing the whole shader.
+            break;
+    }
+}
 
-    uint32_t dst_file        = xe2_brw_mask(qw, XE2_BRW_DST_REG_FILE_BIT, XE2_BRW_DST_REG_FILE_BIT);
-    uint32_t dst_mode        = xe2_brw_mask(qw, XE2_BRW_DST_ADDRESS_MODE_BIT, XE2_BRW_DST_ADDRESS_MODE_BIT);
-    uint32_t dst_type        = xe2_brw_mask(qw, XE2_BRW_DST_HWTYPE_LO, XE2_BRW_DST_HWTYPE_HI);
-    // Todo: Correct dst subreg semantics?
-    uint32_t dst_reg         = xe2_brw_mask(qw, XE2_BRW_DST_REG_NR_LO, XE2_BRW_DST_REG_NR_HI);
-    uint32_t dst_subreg      = xe2_brw_mask(qw, XE2_BRW_DST_SUBREG_LO, XE2_BRW_DST_SUBREG_HI);
-    uint32_t dst_hstride     = xe2_brw_mask(qw, XE2_BRW_DST_HSTRIDE_LO, XE2_BRW_DST_HSTRIDE_HI);
-
-    uint32_t s0_file         = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_FILE_BIT, XE2_BRW_SRC0_REG_FILE_BIT);
-    uint32_t s0_mode         = xe2_brw_mask(qw, XE2_BRW_SRC0_ADDRESS_MODE_BIT, XE2_BRW_SRC0_ADDRESS_MODE_BIT);
-    uint32_t s0_imm          = xe2_brw_mask(qw, XE2_BRW_SRC0_IS_IMM_BIT, XE2_BRW_SRC0_IS_IMM_BIT);
-    uint32_t s0_type         = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
-    uint32_t s0_reg          = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
-    uint32_t s0_subreg_hi    = s0_mode
-                             ? xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI)
-                             : xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI);
-    uint32_t s0_subreg_lsb   = xe2_brw_mask(qw, XE2_BRW_SRC0_SUBREG_LSB_BIT, XE2_BRW_SRC0_SUBREG_LSB_BIT);
-    uint32_t s0_subreg_bytes = (s0_subreg_hi << 1) | s0_subreg_lsb;
-    uint32_t s0_subreg       = s0_subreg_bytes / xe2_brw_op_type_size(s0_type);
-    uint32_t s0_vstride_idx  = xe2_brw_mask(qw, XE2_BRW_SRC0_VSTRIDE_LO, XE2_BRW_SRC0_VSTRIDE_HI);
-    uint32_t s0_hstride_idx  = xe2_brw_mask(qw, XE2_BRW_SRC0_HSTRIDE_LO, XE2_BRW_SRC0_HSTRIDE_HI);
-    uint32_t s0_width_idx    = xe2_brw_mask(qw, XE2_BRW_SRC0_WIDTH_LO, XE2_BRW_SRC0_WIDTH_HI);
-    uint32_t s0_neg          = xe2_brw_mask(qw, XE2_BRW_SRC0_NEGATE_BIT, XE2_BRW_SRC0_NEGATE_BIT);
-    uint32_t s0_abs          = xe2_brw_mask(qw, XE2_BRW_SRC0_ABS_BIT, XE2_BRW_SRC0_ABS_BIT);
-    uint32_t s0_hstride      = xe2_brw_hstride_decode[s0_hstride_idx];
-    uint32_t s0_width        = xe2_brw_width_decode[s0_width_idx];
-    uint32_t s0_vstride      = xe2_brw_vstride_decode[s0_vstride_idx];
-
-    uint32_t s1_imm          = xe2_brw_mask(qw, XE2_BRW_SRC1_IS_IMM_BIT, XE2_BRW_SRC1_IS_IMM_BIT);
-    uint32_t s1_mode         = xe2_brw_mask(qw, XE2_BRW_SRC1_ADDRESS_MODE_BIT, XE2_BRW_SRC1_ADDRESS_MODE_BIT);
-    uint32_t s1_type         = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
-    uint32_t s1_reg          = xe2_brw_mask(qw, XE2_BRW_SRC1_DA_REG_NR_LO, XE2_BRW_SRC1_DA_REG_NR_HI);
-    uint32_t s1_subreg_hi    = s1_mode
-                             ? xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI)
-                             : xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI);
-    uint32_t s1_subreg_bytes = (s1_subreg_hi << 1);
-    uint32_t s1_subreg       = s1_subreg_bytes / xe2_brw_op_type_size(s1_type);
-    uint32_t s1_vstride_idx  = xe2_brw_mask(qw, XE2_BRW_SRC1_VSTRIDE_LO, XE2_BRW_SRC1_VSTRIDE_HI);
-    uint32_t s1_hstride_idx  = xe2_brw_mask(qw, XE2_BRW_SRC1_HSTRIDE_LO, XE2_BRW_SRC1_HSTRIDE_HI);
-    uint32_t s1_width_idx    = xe2_brw_mask(qw, XE2_BRW_SRC1_WIDTH_LO, XE2_BRW_SRC1_WIDTH_HI);
-    uint32_t s1_neg          = xe2_brw_mask(qw, XE2_BRW_SRC1_NEGATE_BIT, XE2_BRW_SRC1_NEGATE_BIT);
-    uint32_t s1_abs          = xe2_brw_mask(qw, XE2_BRW_SRC1_ABS_BIT, XE2_BRW_SRC1_ABS_BIT);
-    uint32_t s1_hstride      = xe2_brw_hstride_decode[s1_hstride_idx];
-    uint32_t s1_width        = xe2_brw_width_decode[s1_width_idx];
-    uint32_t s1_vstride      = xe2_brw_vstride_decode[s1_vstride_idx];
-
+static void xe2_brw_print(const xe2_qword_t *qw, uint32_t op,
+                          const xe2_brw_operand_t *dst,
+                          const xe2_brw_operand_t *s0,
+                          const xe2_brw_operand_t *s1)
+{
     char fmt_s0[128] = {0};
-    char fmt_s1[128] = {0};
-
-    // Note that immediate bitmask is shared between src0/src1. This means,
-    // at most one immediate could be specified in the instruction.
-    if (s0_imm) {
+    if (s0->is_imm) {
         uint64_t imm = xe2_brw_mask(qw, 96, 127);
         sprintf(fmt_s0, "imm=%lu (0x%lx)", imm, imm);
     } else {
-        sprintf(fmt_s0, "r%u.%u<%u.%u.%u>:%u", s0_reg, s0_subreg, s0_vstride, s0_width, s0_hstride, s0_type);
+        sprintf(fmt_s0, "r%u.%u<%u:%u:%u>", s0->reg, s0->subreg, s0->vstride, s0->width, s0->hstride);
     }
-
-    // BUG: s1 subreg is multiplied by two.
-    //      RVVM: op:    mad (16|00)   r23.0<0>:2   r20.0<  1>:2  r8.0<  1>:2  r3.2<0>:2
-    //      Mesa: op:    mad (16|M0)   r23.0<1>:f   r20.0<8;1>:f  r8.0<8;1>:f  r3.1<0>:f
-    //----
-    //      RVVM: op:    mad (16|00)   r24.0<0>:2   r21.0<  1>:2  r8.0<  1>:2  r3.4<0>:2
-    //      Mesa: op:    mad (16|M0)   r24.0<1>:f   r21.0<8;1>:f  r8.0<8;1>:f  r3.2<0>:f
-    if (s1_imm) {
+    char fmt_s1[128] = {0};
+    if (s1->is_imm) {
         uint64_t imm = xe2_brw_mask(qw, 96, 127);
         sprintf(fmt_s1, "imm=%lu (0x%lx)", imm, imm);
     } else {
-        sprintf(fmt_s1, "r%u.%u<%u.%u.%u>:%u", s1_reg, s1_subreg, s1_vstride, s1_width, s1_hstride, s1_type);
+        sprintf(fmt_s1, "r%u.%u<%u:%u:%u>", s1->reg, s1->subreg, s1->vstride, s1->width, s1->hstride);
     }
 
-    rvvm_info("op:    %s (%02u|%02u)\tr%u.%u<%u>:%u\t%s\t\t%s",
+    rvvm_info("op:    %s r%u.%u<%u> %s %s",
         xe2_brw_op_name(op),
-        1 << exec_size, pred_control,
-        dst_reg, dst_subreg, dst_hstride, dst_type,
+        dst->reg, dst->subreg, dst->hstride,
         fmt_s0, fmt_s1
     );
 }
 
-// intel-gfx-prm-osrc-dg1-vol02a-commandreference-instructions.pdf
-// Page 1167: send - Send Message
-static void xe2_brw_decode_send(const xe2_qword_t *qw, uint32_t op, bool *eot)
-{
-    uint32_t exec_size         = xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
-    uint32_t pred_control      = xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI);
-    uint32_t src1_reg          = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_REG_NR_LO, XE2_BRW_SEND_SRC1_REG_NR_HI);
-    uint32_t src1_len          = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_LEN_LO, XE2_BRW_SEND_SRC1_LEN_HI);
-    uint32_t sfid              = xe2_brw_mask(qw, XE2_BRW_SEND_SFID_LO, XE2_BRW_SEND_SFID_HI);
-    uint32_t ex_desc_ia_subreg = xe2_brw_mask(qw, XE2_BRW_SEND_EX_DESC_IA_SUBREG_LO, XE2_BRW_SEND_EX_DESC_IA_SUBREG_HI);
-    uint32_t desc_is_reg32     = xe2_brw_mask(qw, XE2_BRW_SEND_SEL_REG32_DESC_BIT, XE2_BRW_SEND_SEL_REG32_DESC_BIT);
-    uint32_t ex_desc_is_reg32  = xe2_brw_mask(qw, XE2_BRW_SEND_SEL_REG32_EX_DESC_BIT, XE2_BRW_SEND_SEL_REG32_EX_DESC_BIT);
-    uint32_t src1_file         = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_REG_FILE_BIT, XE2_BRW_SEND_SRC1_REG_FILE_BIT);
-    uint32_t dst_file          = xe2_brw_mask(qw, XE2_BRW_SEND_DST_REG_FILE_BIT, XE2_BRW_SEND_DST_REG_FILE_BIT);
-    *eot                       = xe2_brw_mask(qw, XE2_BRW_SEND_EOT_BIT, XE2_BRW_SEND_EOT_BIT);
-
-    // Send command has common S0/S1 operands encoding
-    // along with generic instruction.
-    uint32_t s0_imm          = xe2_brw_mask(qw, XE2_BRW_SRC0_IS_IMM_BIT, XE2_BRW_SRC0_IS_IMM_BIT);
-    uint32_t s0_type         = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
-    uint32_t s0_reg          = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
-    uint32_t s0_mode         = xe2_brw_mask(qw, XE2_BRW_SRC0_ADDRESS_MODE_BIT, XE2_BRW_SRC0_ADDRESS_MODE_BIT);
-    uint32_t s0_vstride      = xe2_brw_mask(qw, XE2_BRW_SRC0_VSTRIDE_LO, XE2_BRW_SRC0_VSTRIDE_HI);
-    uint32_t s0_hstride      = xe2_brw_mask(qw, XE2_BRW_SRC0_HSTRIDE_LO, XE2_BRW_SRC0_HSTRIDE_HI);
-    uint32_t s0_width        = xe2_brw_mask(qw, XE2_BRW_SRC0_WIDTH_LO, XE2_BRW_SRC0_WIDTH_HI);
-    uint32_t s0_subreg_hi    = s0_mode
-                             ? xe2_brw_mask(qw, XE2_BRW_SRC0_IA_SUBREG_LO, XE2_BRW_SRC0_IA_SUBREG_HI)
-                             : xe2_brw_mask(qw, XE2_BRW_SRC0_DA1_SUBREG_LO, XE2_BRW_SRC0_DA1_SUBREG_HI);
-    uint32_t s0_subreg_lsb   = xe2_brw_mask(qw, XE2_BRW_SRC0_SUBREG_LSB_BIT, XE2_BRW_SRC0_SUBREG_LSB_BIT);
-    uint32_t s0_subreg_bytes = (s0_subreg_hi << 1) | s0_subreg_lsb;
-    uint32_t s0_subreg       = s0_subreg_bytes / xe2_brw_op_type_size(s0_type);
-
-    uint32_t s1_imm          = xe2_brw_mask(qw, XE2_BRW_SRC1_IS_IMM_BIT, XE2_BRW_SRC1_IS_IMM_BIT);
-    uint32_t s1_mode         = xe2_brw_mask(qw, XE2_BRW_SRC1_ADDRESS_MODE_BIT, XE2_BRW_SRC1_ADDRESS_MODE_BIT);
-    uint32_t s1_type         = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
-    uint32_t s1_reg          = xe2_brw_mask(qw, XE2_BRW_SRC1_DA_REG_NR_LO, XE2_BRW_SRC1_DA_REG_NR_HI);
-    uint32_t s1_subreg_hi    = s1_mode
-                             ? xe2_brw_mask(qw, XE2_BRW_SRC1_IA_SUBREG_LO, XE2_BRW_SRC1_IA_SUBREG_HI)
-                             : xe2_brw_mask(qw, XE2_BRW_SRC1_DA1_SUBREG_LO, XE2_BRW_SRC1_DA1_SUBREG_HI);
-    uint32_t s1_subreg_bytes = (s1_subreg_hi << 1);
-    uint32_t s1_subreg       = s1_subreg_bytes / xe2_brw_op_type_size(s1_type);
-    uint32_t s1_vstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_VSTRIDE_LO, XE2_BRW_SRC1_VSTRIDE_HI);
-    uint32_t s1_width        = xe2_brw_mask(qw, XE2_BRW_SRC1_WIDTH_LO, XE2_BRW_SRC1_WIDTH_HI);
-    uint32_t s1_hstride      = xe2_brw_mask(qw, XE2_BRW_SRC1_HSTRIDE_LO, XE2_BRW_SRC1_HSTRIDE_HI);
-    uint32_t s1_neg          = xe2_brw_mask(qw, XE2_BRW_SRC1_NEGATE_BIT, XE2_BRW_SRC1_NEGATE_BIT);
-    uint32_t s1_abs          = xe2_brw_mask(qw, XE2_BRW_SRC1_ABS_BIT, XE2_BRW_SRC1_ABS_BIT);
-
-    char fmt_s0[128] = {0};
-
-    // Note that immediate bitmask is shared between src0/src1. This means,
-    // at most one immediate could be specified in the instruction.
-    if (s0_imm) {
-        uint64_t imm = xe2_brw_mask(qw, 96, 127);
-        sprintf(fmt_s0, "imm=%lu (0x%lx)", imm, imm);
-    } else {
-        sprintf(fmt_s0, "r%u.%u<%u:%u:%u>:%u", s0_reg, s0_subreg, s0_vstride, s0_width, s0_hstride, s0_type);
-    }
-
-    rvvm_info(
-        "op:    %s (%02u|%u)\t%s\tr%u:%u\t%s",
-        xe2_brw_op_name(op),
-        1U << exec_size, pred_control,
-        fmt_s0,
-        src1_reg, src1_len,
-        *eot ? "<EOT>" : ""
-    );
-}
-
-static uint32_t xe2_brw_decode_one(const xe2_qword_t *qw, bool *eot)
+static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t *spirv_ctx, const xe2_qword_t *qw, bool *eot)
 {
     bool     cmpt = (qw->lo >> XE2_BRW_CMPT_CONTROL_BIT) & 1;
     uint8_t  op   =  qw->lo & 0x7F;
     uint32_t size = cmpt ? 8 : 16;
 
+    xe2_brw_operand_t dst = {0};
+    xe2_brw_operand_t s0 = {0};
+    xe2_brw_operand_t s1 = {0};
+    xe2_brw_operand_t s2 = {0};
+
     if (cmpt) {
-        xe2_brw_decode_compact(qw, op);
+        // Compact 1/2-src: register numbers + modifiers from index tables.
+        if (xe2_brw_op_3_src(op)) {
+            dst.reg = xe2_brw_mask(qw, XE2_BRW_C3_DST_REG_NR_LO, XE2_BRW_C3_DST_REG_NR_HI);
+            dst.hstride = 1 << xe2_brw_mask(qw, XE2_BRW_C_DST_HSTRIDE_LO, XE2_BRW_C_DST_HSTRIDE_HI);
+            return size;
+        }
+        dst.reg          = xe2_brw_mask(qw, XE2_BRW_C_DST_REG_NR_LO, XE2_BRW_C_DST_REG_NR_HI);
+        dst.subreg       = xe2_brw_mask(qw, XE2_BRW_DST_SUBREG_LO, XE2_BRW_DST_SUBREG_HI);
+        s0.reg           = xe2_brw_mask(qw, XE2_BRW_C_SRC0_REG_NR_LO, XE2_BRW_C_SRC0_REG_NR_HI);
+        s1.reg           = xe2_brw_mask(qw, XE2_BRW_C_SRC1_REG_NR_LO, XE2_BRW_C_SRC1_REG_NR_HI);
+        uint32_t s0_idx  = xe2_brw_mask(qw, XE2_BRW_C_SRC0_INDEX_LO, XE2_BRW_C_SRC0_INDEX_HI);
+        uint32_t s1_idx  = xe2_brw_mask(qw, XE2_BRW_C_SRC1_INDEX_LO, XE2_BRW_C_SRC1_INDEX_HI);
+        uint32_t sub_idx = xe2_brw_mask(qw, XE2_BRW_C_SUBREG_INDEX_LO, XE2_BRW_C_SUBREG_INDEX_HI);
+        uint16_t s0_desc = xe2_src0_index_table[s0_idx &  7];
+        uint16_t s1_desc = xe2_src1_index_table[s1_idx & 15];
+        s0.abs = (s0_desc >> 0) & 1;
+        s0.neg = (s0_desc >> 1) & 1;
+        if (s0_idx == 3 || s0_idx == 6) {
+            s0.neg = true;
+        }
+        if (s0_idx == 5) {
+            s0.abs = true;
+        }
+        s1.neg = (s1_desc >> 15) & 1;
+        s1.abs = (s1_desc >> 11) & 1;
+
+        uint16_t subreg          = xe2_subreg_table[sub_idx];
+        uint16_t src0_desc       = xe2_src0_index_table[s0_idx];
+        uint16_t src1_desc       = xe2_src1_index_table[s1_idx];
+
+        dst.subreg = (subreg    >>  0) & 0x1F;
+        s0.subreg  = (subreg    >>  7) & 0x1F;
+        s0.abs     = (src0_desc >>  1) & 1;
+        s0.neg     = (src0_desc >> 10) & 1;
+        s0.vstride = xe2_brw_vstride_decode[(src0_desc >> 8) & 0x7];
+        s0.hstride = xe2_brw_hstride_decode[(src0_desc >> 0) & 0x3];
+        s0.width   = xe2_brw_width_decode  [(src0_desc >> 5) & 0x7];
+
+        s1.subreg  = (src1_desc >>  3) & 0x1F;
+        s1.abs     = (src1_desc >> 11) & 1;
+        s1.neg     = (src1_desc >> 15) & 1;
+        s1.vstride = xe2_brw_vstride_decode[(src1_desc >> 8) & 0x7];
+        s1.hstride = xe2_brw_hstride_decode[(src1_desc >> 0) & 0x3];
+        s1.width   = xe2_brw_width_decode  [(src1_desc >> 5) & 0x7];
     } else if (xe2_brw_op_send(op)) {
-        xe2_brw_decode_send(qw, op, eot);
+        s0            = xe2_brw_parse_src0(qw);
+        s1.reg        = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_REG_NR_LO, XE2_BRW_SEND_SRC1_REG_NR_HI);
+        uint32_t sfid = xe2_brw_mask(qw, XE2_BRW_SEND_SFID_LO, XE2_BRW_SEND_SFID_HI);
+        *eot          = xe2_brw_mask(qw, XE2_BRW_SEND_EOT_BIT, XE2_BRW_SEND_EOT_BIT);
+        if (*eot) {
+            spirv_ctx->saw_eot = true;
+        }
+
+        // URB SFID is 6 on recent gens. Payload starts at s0.reg (or s1).
+        if (sfid == 6) {
+            xe2_brw_emit_send(spirv_ctx, &s0, &s1);
+        }
+        xe2_brw_print(qw, op, &dst, &s0, &s1);
+        return size;
     } else if (xe2_brw_op_3_src(op)) {
-        xe2_brw_decode_3_src_native(qw, op);
+        dst.reg = xe2_brw_mask(qw, XE2_BRW_A3_DST_REG_NR_LO, XE2_BRW_A3_DST_REG_NR_HI);
+        uint32_t dst_type        = xe2_brw_mask(qw, XE2_BRW_A3_DST_HWTYPE_LO, XE2_BRW_A3_DST_HWTYPE_HI);
+        uint32_t dst_subreg_idx  = xe2_brw_mask(qw, XE2_BRW_A3_DST_SUBREG_LO, XE2_BRW_A3_DST_SUBREG_HI);
+        uint32_t dst_hstride_bit = xe2_brw_mask(qw, XE2_BRW_A3_DST_HSTRIDE_BIT, XE2_BRW_A3_DST_HSTRIDE_BIT);
+        dst.subreg  = dst_subreg_idx / xe2_brw_op_type_size(dst_type);
+        dst.hstride = 1 << dst_hstride_bit;
+
+        s0.reg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_REG_NR_LO, XE2_BRW_A3_SRC0_REG_NR_HI);
+        s0.subreg  = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_SUBREG_LO, XE2_BRW_A3_SRC0_SUBREG_HI);
+        s0.neg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_NEGATE_BIT, XE2_BRW_A3_SRC0_NEGATE_BIT);
+        s0.abs     = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_ABS_BIT, XE2_BRW_A3_SRC0_ABS_BIT);
+        s0.hstride = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HSTRIDE_LO, XE2_BRW_A3_SRC0_HSTRIDE_HI);
+        s0.vstride = xe2_brw_3_src_vstride(s0.hstride);
+
+        s1.reg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_REG_NR_LO, XE2_BRW_A3_SRC1_REG_NR_HI);
+        s1.subreg  = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_SUBREG_LO, XE2_BRW_A3_SRC1_SUBREG_HI);
+        s1.neg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_NEGATE_BIT, XE2_BRW_A3_SRC1_NEGATE_BIT);
+        s1.abs     = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_ABS_BIT, XE2_BRW_A3_SRC1_ABS_BIT);
+        s1.hstride = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HSTRIDE_LO, XE2_BRW_A3_SRC1_HSTRIDE_HI);
+        s1.vstride = xe2_brw_3_src_vstride(s1.hstride);
+
+        s2.reg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_REG_NR_LO, XE2_BRW_A3_SRC2_REG_NR_HI);
+        s2.neg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_NEGATE_BIT, XE2_BRW_A3_SRC2_NEGATE_BIT);
+        s2.abs     = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_ABS_BIT, XE2_BRW_A3_SRC2_ABS_BIT);
+        s2.hstride = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HSTRIDE_LO, XE2_BRW_A3_SRC2_HSTRIDE_HI);
+        s2.vstride = xe2_brw_3_src_vstride(s2.hstride);
     } else {
-        xe2_brw_decode_generic_native(qw, op);
+        dst.reg = xe2_brw_parse_dst(qw);
+        s0      = xe2_brw_parse_src0(qw);
+        s1      = xe2_brw_parse_src1(qw);
     }
 
+    xe2_brw_print(qw, op, &dst, &s0, &s1);
+    xe2_brw_emit_spirv(spirv_ctx, qw, op, &dst, &s0, &s1, &s2);
     return size;
+}
+
+static void xe2_write_spirv(const uint32_t *words, uint32_t n)
+{
+    int spirv_fd = open("compiled.spirv", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (spirv_fd < 0) {
+        perror("compiled.spirv");
+        return;
+    }
+    if (write(spirv_fd, words, n * sizeof(uint32_t)) < 0) {
+        perror("write");
+    }
+    close(spirv_fd);
+    rvvm_info(" ");
+    rvvm_info(" ");
+    rvvm_info("-- Written SPIR-V shader");
+    rvvm_info(" ");
+    system("spirv-dis compiled.spirv");
 }
 
 // Decode and print BRW assembly reported under kernel address.
 // When decoding stage will be passed, this branch of emulator
 // needs to be extended by cross-compiling to Vulkan shaders.
-static void xe2_brw_decode(xe2_dev_t *xe2, xe2_dma_addr_t dma)
+static void xe2_brw_decode(xe2_dev_t *xe2, xe2_shader_kind_t kind, xe2_dma_addr_t dma)
 {
     if (dma.addr == 0U) {
         return;
     }
 
+    memset(&xe2->spirv_ctx, 0, sizeof(xe2->spirv_ctx));
+    xe2->spirv_ctx.stage = kind;
+
+    spirv_module_init(&xe2->spirv_ctx.mod);
+    spirv_module_begin(&xe2->spirv_ctx.mod);
+
+    xe2->spirv_ctx.void_ty = spirv_type_void(&xe2->spirv_ctx.mod);
+    xe2->spirv_ctx.fn_ty   = spirv_type_func_void(&xe2->spirv_ctx.mod);
+    xe2->spirv_ctx.fty     = spirv_type_float32(&xe2->spirv_ctx.mod);
+    xe2->spirv_ctx.v4ty    = spirv_type_vec4_float32(&xe2->spirv_ctx.mod);
+
     static const uint32_t limit = 4096;
     uint32_t len = 0U;
     uint32_t zeros = 0U;
     size_t off = 0ULL;
+
+    {
+        uint32_t block_ty = spirv_seq_id(&xe2->spirv_ctx.mod);
+        spirv_push(xe2->spirv_ctx.mod.globals, SPIRV_OP_TYPE_STRUCT | (3 << 16));
+        spirv_push(xe2->spirv_ctx.mod.globals, block_ty);
+        spirv_push(xe2->spirv_ctx.mod.globals, xe2->spirv_ctx.fty);
+        spirv_decorate_0(&xe2->spirv_ctx.mod, block_ty, SPIRV_DECORATION_BLOCK);
+        spirv_member_decorate_1(&xe2->spirv_ctx.mod, block_ty, 0, SPIRV_DECORATION_OFFSET, 0);
+
+        uint32_t block_ptr = spirv_type_ptr(&xe2->spirv_ctx.mod, SPIRV_STORAGE_CLASS_PUSH_CONSTANT, block_ty);
+        xe2->spirv_ctx.push_var = spirv_global_var(&xe2->spirv_ctx.mod, block_ptr, SPIRV_STORAGE_CLASS_PUSH_CONSTANT);
+        xe2->spirv_ctx.entry_iface[xe2->spirv_ctx.entry_iface_n++] = xe2->spirv_ctx.push_var;
+    }
+
+    uint32_t func = spirv_func_begin(&xe2->spirv_ctx.mod, xe2->spirv_ctx.void_ty, xe2->spirv_ctx.fn_ty);
 
     for (uint32_t i = 0; i < limit; ++i) {
         xe2_qword_t qw = {0};
@@ -3226,11 +3399,36 @@ static void xe2_brw_decode(xe2_dev_t *xe2, xe2_dma_addr_t dma)
             len = i + 1;
         }
         bool eot = 0;
-        off += xe2_brw_decode_one(&qw, &eot);
+        off += xe2_brw_decode_one(&xe2->spirv_ctx, &qw, &eot);
         if (eot) {
             break;
         }
     }
+
+    spirv_func_end(&xe2->spirv_ctx.mod);
+
+    uint32_t exec_model
+        = (kind == XE2_SHADER_PS)
+        ? SPIRV_EXECUTION_MODEL_FRAGMENT
+        : SPIRV_EXECUTION_MODEL_VERTEX;
+
+    spirv_entry_point(&xe2->spirv_ctx.mod, exec_model, func, "main",
+                      xe2->spirv_ctx.entry_iface, xe2->spirv_ctx.entry_iface_n);
+
+    if (kind == XE2_SHADER_PS) {
+        spirv_exec_mode0(&xe2->spirv_ctx.mod, func, SPIRV_EXECUTION_MODE_ORIGIN_UPPER_LEFT);
+    }
+
+    uint32_t *words = NULL;
+    uint32_t  n = 0;
+    if (spirv_module_finish(&xe2->spirv_ctx.mod, &words, &n) != 0) {
+        spirv_module_free(&xe2->spirv_ctx.mod);
+        return;
+    }
+    rvvm_info("Vulkan shader: %p, %u dwords", words, n);
+    spirv_module_free(&xe2->spirv_ctx.mod);
+    xe2_write_spirv(words, n);
+    safe_free(words);
 }
 
 
@@ -3431,12 +3629,12 @@ static void xe2_print_decompiled_shader(xe2_dev_t *xe2, xe2_dma_addr_t dma)
     }
 }
 
-static void xe2_print_shader(xe2_dev_t *xe2, const char *name, rvvm_addr_t pdp4, rvvm_addr_t addr_kernel, uint64_t addr_instr)
+static void xe2_decode_shader(xe2_dev_t *xe2, xe2_shader_kind_t kind, rvvm_addr_t pdp4, rvvm_addr_t addr_kernel, uint64_t addr_instr)
 {
-    rvvm_info("(%s) Kernel start address: 0x%lx", name, addr_kernel);
+    rvvm_info("(kind: %u) Kernel start address: 0x%lx", kind, addr_kernel);
     xe2_dma_addr_t kernel_dma = xe2_ppgtt_translate(xe2, pdp4, addr_kernel + addr_instr);
     xe2_print_decompiled_shader(xe2, kernel_dma);
-    xe2_brw_decode(xe2, kernel_dma);
+    xe2_brw_decode(xe2, kind, kernel_dma);
 }
 
 // The supplied ring DMA address is normalized such that the first dword is the
@@ -3495,8 +3693,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ct
             };
             for (size_t i = 0; i < STATIC_ARRAY_SIZE(addr_kernel); ++i) {
                 if (addr_kernel_enable[i]) {
-                    rvvm_info("(PS) Kernel Start Address %lu: 0x%lx, 0x%lx", i, addr_kernel[i], ctx->addr_instr + addr_kernel[i]);
-                    xe2_print_shader(xe2, "VS", pdp4, addr_kernel[i], ctx->addr_instr);
+                    xe2_decode_shader(xe2, XE2_SHADER_PS, pdp4, addr_kernel[i], ctx->addr_instr);
                 }
             }
             break;
@@ -3507,7 +3704,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ct
             bool enable = cmd[7] & 1;
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
-                xe2_print_shader(xe2, "VS", pdp4, addr_kernel, ctx->addr_instr);
+                xe2_decode_shader(xe2, XE2_SHADER_VS, pdp4, addr_kernel, ctx->addr_instr);
             }
             break;
         }
@@ -3517,7 +3714,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ct
             bool enable = cmd[7] & 1;
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
-                xe2_print_shader(xe2, "GS", pdp4, addr_kernel, ctx->addr_instr);
+                xe2_decode_shader(xe2, XE2_SHADER_GS, pdp4, addr_kernel, ctx->addr_instr);
             }
             break;
         }
@@ -3527,7 +3724,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t *xe2, xe2_submit_ctx_t *ct
             bool enable = (cmd[2] >> 31) & 1;
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[3], cmd[4]);
-                xe2_print_shader(xe2, "HS", pdp4, addr_kernel, ctx->addr_instr);
+                xe2_decode_shader(xe2, XE2_SHADER_HS, pdp4, addr_kernel, ctx->addr_instr);
             }
             break;
         }

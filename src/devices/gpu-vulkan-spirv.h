@@ -35,8 +35,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define SPIRV_OP_TYPE_INT                      21
 #define SPIRV_OP_TYPE_FLOAT                    22
 #define SPIRV_OP_TYPE_VECTOR                   23
+#define SPIRV_OP_TYPE_STRUCT                   30
 #define SPIRV_OP_TYPE_POINTER                  32
 #define SPIRV_OP_TYPE_FUNCTION                 33
+#define SPIRV_OP_TYPE_EVENT                    34
+#define SPIRV_OP_TYPE_DEVICE_EVENT             35
+#define SPIRV_OP_TYPE_QUEUE                    37
 #define SPIRV_OP_CONSTANT_TRUE                 41
 #define SPIRV_OP_CONSTANT_FALSE                42
 #define SPIRV_OP_CONSTANT                      43
