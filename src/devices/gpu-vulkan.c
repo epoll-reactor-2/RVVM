@@ -13,25 +13,42 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <rvvm/rvvm_fb.h>
 #include <util/atomics.h>
 #include <util/compiler.h>
-#include <util/utils.h>
+#include <util/spinlock.h>
 #include <util/threading.h>
+#include <util/utils.h>
 
 #include <stdint.h>
-#include <vulkan/vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vulkan/vulkan.h>
 
 // Log-and-bail helper. Every Vulkan call site uses this instead of
 // aborting the process - a broken GPU driver should not take the whole
 // emulator down with it.
-#define VK_TRY(x) do { \
-        VkResult res__ = (x); \
-        if (res__ != VK_SUCCESS) { \
-            rvvm_warn("%s failed (%d) at %s:%d\n", #x, res__, __FILE__, __LINE__); \
-            goto fail; \
-        } \
+#define VK_TRY(x)                                                                                                      \
+    do {                                                                                                               \
+        VkResult res__ = (x);                                                                                          \
+        if (res__ != VK_SUCCESS) {                                                                                     \
+            rvvm_warn("%s failed (%d) at %s:%d\n", #x, res__, __FILE__, __LINE__);                                     \
+            goto fail;                                                                                                 \
+        }                                                                                                              \
     } while (0)
+
+// A draw as the renderer keeps it: everything the caller passed to
+// gpu_vulkan_submit_draw(), copied, so nothing here can be recompiled or
+// freed underneath the render thread.
+typedef struct {
+    uint32_t* spirv[GPU_VULKAN_STAGE_COUNT]; // Owned.
+    uint32_t  spirv_nwords[GPU_VULKAN_STAGE_COUNT];
+    uint8_t   constants[GPU_VULKAN_STAGE_COUNT][GPU_VULKAN_CONST_BYTES];
+
+    uint32_t topology;
+    uint32_t vertex_count;
+    uint32_t instance_count;
+    uint32_t first_vertex;
+    uint32_t first_instance;
+} gpu_vulkan_scene_t;
 
 struct gpu_vulkan_ctx_t {
     VkInstance       instance;
@@ -42,58 +59,79 @@ struct gpu_vulkan_ctx_t {
 
     VkRenderPass     render_pass;
     VkPipelineLayout pipeline_layout;
-    VkPipeline       pipeline;
+    VkPipeline       pipeline; // Built-in scene, drawn until the guest submits one.
 
-    VkCommandPool    command_pool;
-    VkCommandBuffer  command_buffer;
-    VkFence          fence;
+    // Pipeline built for the active guest scene, plus the key it was
+    // built from - shader modules and topology hashed together, so a
+    // guest re-submitting the same scene does not rebuild it.
+    VkPipeline guest_pipeline;
+    uint64_t   guest_pipeline_key;
+
+    // Per-stage uniform blocks holding the constants the guest pushed.
+    // Persistently mapped and written straight from the active scene.
+    VkDescriptorSetLayout const_set_layout;
+    VkDescriptorPool      const_pool;
+    VkDescriptorSet       const_set;
+    VkBuffer              const_buffer[GPU_VULKAN_STAGE_COUNT];
+    VkDeviceMemory        const_memory[GPU_VULKAN_STAGE_COUNT];
+    void*                 const_mapped[GPU_VULKAN_STAGE_COUNT];
+
+    // Scene handoff. The device thread publishes into `pending`, the
+    // render worker takes it over into `active` at the top of a task.
+    spinlock_t         draw_lock;
+    gpu_vulkan_scene_t pending;
+    bool               pending_valid;
+    gpu_vulkan_scene_t active;
+    bool               active_valid;
+
+    VkCommandPool   command_pool;
+    VkCommandBuffer command_buffer;
+    VkFence         fence;
 
     // Per-resolution resources; recreated when width/height/format change.
     // Owned exclusively by the render task thread.
-    uint32_t         cur_width;
-    uint32_t         cur_height;
-    uint32_t         cur_stride;      // only meaningful when zero_copy
-    VkFormat         cur_vk_format;   // format color_image/render_pass/pipeline are built for
-    VkDeviceSize     cur_buf_size;    // readback buffer's actual allocated size
-    bool             zero_copy;       // true: GPU output already matches the guest's byte layout
-    VkImage          color_image;
-    VkDeviceMemory   color_memory;
-    VkImageView      color_view;
-    VkFramebuffer    framebuffer;
-    VkBuffer         readback_buffer;
-    VkDeviceMemory   readback_memory;
-    void            *readback_mapped;
+    uint32_t       cur_width;
+    uint32_t       cur_height;
+    uint32_t       cur_stride;    // only meaningful when zero_copy
+    VkFormat       cur_vk_format; // format color_image/render_pass/pipeline are built for
+    VkDeviceSize   cur_buf_size;  // readback buffer's actual allocated size
+    bool           zero_copy;     // true: GPU output already matches the guest's byte layout
+    VkImage        color_image;
+    VkDeviceMemory color_memory;
+    VkImageView    color_view;
+    VkFramebuffer  framebuffer;
+    VkBuffer       readback_buffer;
+    VkDeviceMemory readback_memory;
+    void*          readback_mapped;
 
-    uint64_t         frame_index;
+    uint64_t frame_index;
 
     // Async page-flip state. The worker does the render AND the CPU-side
     // format conversion/blit, writing straight into the guest's own vram
     // buffer. Scanout never touches a pixel - it just asks what's
     // currently resident in that buffer.
-    bool             render_in_progress;
-    bool             shutting_down;
-    uint32_t         requested_width;
-    uint32_t         requested_height;
+    bool     render_in_progress;
+    bool     shutting_down;
+    uint32_t requested_width;
+    uint32_t requested_height;
 
     // Blit target for the *next* task to pick up - published by scanout
     // every call, read once by the worker at the top of its task. This
     // is the guest's real vram (rvvm_fbdev_get_vram()), not an internal
     // Vulkan buffer.
-    uint8_t         *requested_dst;
-    size_t           requested_dst_size;
-    uint32_t         requested_stride;
-    rvvm_rgb_t       requested_format;
+    uint8_t*   requested_dst;
+    size_t     requested_dst_size;
+    uint32_t   requested_stride;
+    rvvm_rgb_t requested_format;
 
     // Describes whatever the worker most recently finished writing into
     // requested_dst - i.e. what's actually safe to hand to
     // rvvm_fbdev_set_scanout() right now.
-    uint32_t         front_width;
-    uint32_t         front_height;
-    uint32_t         front_stride;
-    rvvm_rgb_t       front_format;
+    uint32_t   front_width;
+    uint32_t   front_height;
+    uint32_t   front_stride;
+    rvvm_rgb_t front_format;
 };
-
-
 
 // -----------------------------------------------------------
 // Initialization
@@ -101,7 +139,7 @@ struct gpu_vulkan_ctx_t {
 
 
 
-static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t *ctx)
+static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t* ctx)
 {
     VkApplicationInfo app_info = {
         .sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -109,8 +147,7 @@ static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t *ctx)
         .apiVersion       = VK_API_VERSION_1_3,
     };
     VkInstanceCreateInfo inst_ci = {
-        .sType            = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pApplicationInfo = &app_info,
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app_info,
         // No extensions: no surface/presentation is ever used.
     };
     VK_TRY(vkCreateInstance(&inst_ci, NULL, &ctx->instance));
@@ -121,19 +158,19 @@ static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t *ctx)
         rvvm_warn("No Vulkan devices available\n");
         goto fail;
     }
-    VkPhysicalDevice *devices = safe_calloc(sizeof(VkPhysicalDevice), dev_count);
+    VkPhysicalDevice* devices = safe_calloc(sizeof(VkPhysicalDevice), dev_count);
     vkEnumeratePhysicalDevices(ctx->instance, &dev_count, devices);
 
     int graphics_family = -1;
     for (uint32_t i = 0; i < dev_count && graphics_family < 0; i++) {
         uint32_t q_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &q_count, NULL);
-        VkQueueFamilyProperties *q_props = safe_calloc(sizeof(VkQueueFamilyProperties), q_count);
+        VkQueueFamilyProperties* q_props = safe_calloc(sizeof(VkQueueFamilyProperties), q_count);
         vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &q_count, q_props);
         for (uint32_t q = 0; q < q_count; q++) {
             if (q_props[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
                 ctx->physical_device = devices[i];
-                graphics_family = (int)q;
+                graphics_family      = (int)q;
                 break;
             }
         }
@@ -147,7 +184,7 @@ static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t *ctx)
     }
     ctx->graphics_family = (uint32_t)graphics_family;
 
-    float priority = 1.0f;
+    float                   priority = 1.0f;
     VkDeviceQueueCreateInfo queue_ci = {
         .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = ctx->graphics_family,
@@ -155,9 +192,7 @@ static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t *ctx)
         .pQueuePriorities = &priority,
     };
     VkDeviceCreateInfo dev_ci = {
-        .sType                = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos    = &queue_ci,
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_ci,
         // No VK_KHR_swapchain - nothing here ever presents.
     };
     VK_TRY(vkCreateDevice(ctx->physical_device, &dev_ci, NULL, &ctx->device));
@@ -210,7 +245,7 @@ static size_t gpu_vulkan_vk_format_bpp(VkFormat fmt)
     return (fmt == VK_FORMAT_R5G6B5_UNORM_PACK16) ? 2 : 4;
 }
 
-static bool gpu_vulkan_create_render_pass(gpu_vulkan_ctx_t *ctx, VkFormat vk_format)
+static bool gpu_vulkan_create_render_pass(gpu_vulkan_ctx_t* ctx, VkFormat vk_format)
 {
     VkAttachmentDescription color_attachment = {
         .format         = vk_format,
@@ -222,11 +257,11 @@ static bool gpu_vulkan_create_render_pass(gpu_vulkan_ctx_t *ctx, VkFormat vk_for
         .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
         // Land directly in a copy-source layout: no manual barrier needed
         // before vkCmdCopyImageToBuffer after the render pass ends.
-        .finalLayout    = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
     };
     VkAttachmentReference color_ref = {
-        .attachment     = 0,
-        .layout         = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .attachment = 0,
+        .layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
     };
     VkSubpassDescription subpass = {
         .pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -255,53 +290,150 @@ fail:
     return false;
 }
 
-// On pipeline configuration: now moved to initialization stage, as
-// shaders are hardcoded for tests sake. But when guest reports a new
-// shader via Xe2 assembly, we should load/unload shader modules as
-// they arrive or leave.
-// vk_format isn't used directly (the pipeline is only tied to the
-// render pass, which already carries the format) but is threaded
-// through so the call site reads clearly next to create_render_pass.
-static bool gpu_vulkan_create_pipeline(gpu_vulkan_ctx_t *ctx, VkFormat vk_format)
+static uint32_t gpu_vulkan_find_memory_type(VkPhysicalDevice phys, uint32_t type_bits, VkMemoryPropertyFlags props)
 {
-    UNUSED(vk_format);
+    VkPhysicalDeviceMemoryProperties mem_props = {0};
+    vkGetPhysicalDeviceMemoryProperties(phys, &mem_props);
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((type_bits & (1u << i)) && (mem_props.memoryTypes[i].propertyFlags & props) == props) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
 
-    VkShaderModuleCreateInfo vertex_ci = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof(xe2_vert_spv),
-        .pCode    = xe2_vert_spv,
+// Uniform block layout shared by every pipeline: one binding per
+// programmable stage, at the set and size gpu-vulkan.h documents. A
+// cross-compiled guest shader declares exactly this, so its constant
+// reads land in the buffer this backend fills.
+//
+// Only vertex and fragment shaders are turned into pipeline stages for
+// now, so those are the stages the bindings are visible to; the bindings
+// themselves all exist, keeping binding number == stage index.
+static bool gpu_vulkan_create_const_layout(gpu_vulkan_ctx_t* ctx)
+{
+    VkDescriptorSetLayoutBinding bindings[GPU_VULKAN_STAGE_COUNT] = {0};
+    for (uint32_t i = 0; i < GPU_VULKAN_STAGE_COUNT; i++) {
+        bindings[i] = (VkDescriptorSetLayoutBinding) {
+            .binding         = i,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+    }
+    VkDescriptorSetLayoutCreateInfo set_ci = {
+        .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = GPU_VULKAN_STAGE_COUNT,
+        .pBindings    = bindings,
     };
-    VkShaderModuleCreateInfo fragment_ci = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof(xe2_frag_spv),
-        .pCode    = xe2_frag_spv,
-    };
-    VkShaderModule vertex_module = VK_NULL_HANDLE;
-    VkShaderModule fragment_module = VK_NULL_HANDLE;
-    VK_TRY(vkCreateShaderModule(ctx->device, &vertex_ci, NULL, &vertex_module));
-    VK_TRY(vkCreateShaderModule(ctx->device, &fragment_ci, NULL, &fragment_module));
+    VK_TRY(vkCreateDescriptorSetLayout(ctx->device, &set_ci, NULL, &ctx->const_set_layout));
 
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = vertex_module,
-            .pName  = "main"
-        },
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = fragment_module,
-            .pName  = "main"
-        },
+    VkDescriptorPoolSize pool_size = {
+        .type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = GPU_VULKAN_STAGE_COUNT,
     };
+    VkDescriptorPoolCreateInfo pool_ci = {
+        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets       = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes    = &pool_size,
+    };
+    VK_TRY(vkCreateDescriptorPool(ctx->device, &pool_ci, NULL, &ctx->const_pool));
+
+    VkDescriptorSetAllocateInfo set_alloc = {
+        .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool     = ctx->const_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts        = &ctx->const_set_layout,
+    };
+    VK_TRY(vkAllocateDescriptorSets(ctx->device, &set_alloc, &ctx->const_set));
+
+    // One host-visible buffer per stage, mapped for the lifetime of the
+    // context. Only the render thread ever writes them, between fence
+    // waits, so no extra synchronization is needed.
+    VkDescriptorBufferInfo buf_info[GPU_VULKAN_STAGE_COUNT] = {0};
+    VkWriteDescriptorSet   writes[GPU_VULKAN_STAGE_COUNT]   = {0};
+    for (uint32_t i = 0; i < GPU_VULKAN_STAGE_COUNT; i++) {
+        VkBufferCreateInfo buf_ci = {
+            .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size        = GPU_VULKAN_CONST_BYTES,
+            .usage       = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        };
+        VK_TRY(vkCreateBuffer(ctx->device, &buf_ci, NULL, &ctx->const_buffer[i]));
+
+        VkMemoryRequirements req = {0};
+        vkGetBufferMemoryRequirements(ctx->device, ctx->const_buffer[i], &req);
+        uint32_t mem_type
+            = gpu_vulkan_find_memory_type(ctx->physical_device, req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mem_type == UINT32_MAX) {
+            goto fail;
+        }
+        VkMemoryAllocateInfo alloc = {
+            .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize  = req.size,
+            .memoryTypeIndex = mem_type,
+        };
+        VK_TRY(vkAllocateMemory(ctx->device, &alloc, NULL, &ctx->const_memory[i]));
+        VK_TRY(vkBindBufferMemory(ctx->device, ctx->const_buffer[i], ctx->const_memory[i], 0));
+        VK_TRY(vkMapMemory(ctx->device, ctx->const_memory[i], 0, GPU_VULKAN_CONST_BYTES, 0, &ctx->const_mapped[i]));
+        memset(ctx->const_mapped[i], 0, GPU_VULKAN_CONST_BYTES);
+
+        buf_info[i] = (VkDescriptorBufferInfo) {
+            .buffer = ctx->const_buffer[i],
+            .offset = 0,
+            .range  = GPU_VULKAN_CONST_BYTES,
+        };
+        writes[i] = (VkWriteDescriptorSet) {
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = ctx->const_set,
+            .dstBinding      = i,
+            .descriptorCount = 1,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo     = &buf_info[i],
+        };
+    }
+    // The bindings never move afterwards, so this is the only update.
+    vkUpdateDescriptorSets(ctx->device, GPU_VULKAN_STAGE_COUNT, writes, 0, NULL);
+
+    VkPushConstantRange push_range = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset     = 0,
+        .size       = sizeof(float),
+    };
+    VkPipelineLayoutCreateInfo layout_ci = {
+        .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts    = &ctx->const_set_layout,
+        // Only the built-in fragment shader uses this (its animation
+        // clock); guest shaders take everything through the uniform
+        // blocks above.
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &push_range,
+    };
+    VK_TRY(vkCreatePipelineLayout(ctx->device, &layout_ci, NULL, &ctx->pipeline_layout));
+    return true;
+
+fail:
+    return false;
+}
+
+// Builds a graphics pipeline around already-created shader modules.
+// Everything not covered by the arguments is fixed: no vertex input
+// (neither the built-in scene nor a cross-compiled kernel declares
+// vertex attributes), dynamic viewport/scissor, no depth or blending.
+static VkPipeline gpu_vulkan_build_pipeline(gpu_vulkan_ctx_t* ctx, const VkPipelineShaderStageCreateInfo* stages,
+                                            uint32_t stage_count, uint32_t topology)
+{
+    VkPipeline pipeline = VK_NULL_HANDLE;
 
     VkPipelineVertexInputStateCreateInfo vertex_input = {
-        .sType    = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
     };
     VkPipelineInputAssemblyStateCreateInfo input_assembly = {
         .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .topology = (VkPrimitiveTopology)topology,
     };
 
     // Viewport/scissor are dynamic so the same pipeline serves any
@@ -314,7 +446,7 @@ static bool gpu_vulkan_create_pipeline(gpu_vulkan_ctx_t *ctx, VkFormat vk_format
     };
     VkDynamicState dynamic_states[2] = {
         VK_DYNAMIC_STATE_VIEWPORT,
-        VK_DYNAMIC_STATE_SCISSOR
+        VK_DYNAMIC_STATE_SCISSOR,
     };
     VkPipelineDynamicStateCreateInfo dynamic_state = {
         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
@@ -334,10 +466,8 @@ static bool gpu_vulkan_create_pipeline(gpu_vulkan_ctx_t *ctx, VkFormat vk_format
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
     };
     VkPipelineColorBlendAttachmentState blend_attachment = {
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT
-                        | VK_COLOR_COMPONENT_G_BIT
-                        | VK_COLOR_COMPONENT_B_BIT
-                        | VK_COLOR_COMPONENT_A_BIT,
+        .colorWriteMask
+        = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
     };
     VkPipelineColorBlendStateCreateInfo color_blending = {
         .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -345,21 +475,9 @@ static bool gpu_vulkan_create_pipeline(gpu_vulkan_ctx_t *ctx, VkFormat vk_format
         .pAttachments    = &blend_attachment,
     };
 
-    VkPushConstantRange push_range = {
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset     = 0,
-        .size       = sizeof(float),
-    };
-    VkPipelineLayoutCreateInfo layout_ci = {
-        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges    = &push_range,
-    };
-    VK_TRY(vkCreatePipelineLayout(ctx->device, &layout_ci, NULL, &ctx->pipeline_layout));
-
     VkGraphicsPipelineCreateInfo pipeline_ci = {
         .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .stageCount          = 2,
+        .stageCount          = stage_count,
         .pStages             = stages,
         .pVertexInputState   = &vertex_input,
         .pInputAssemblyState = &input_assembly,
@@ -372,11 +490,52 @@ static bool gpu_vulkan_create_pipeline(gpu_vulkan_ctx_t *ctx, VkFormat vk_format
         .renderPass          = ctx->render_pass,
         .subpass             = 0,
     };
-    VK_TRY(vkCreateGraphicsPipelines(ctx->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &ctx->pipeline));
+    VK_TRY(vkCreateGraphicsPipelines(ctx->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &pipeline));
+    return pipeline;
+
+fail:
+    return VK_NULL_HANDLE;
+}
+
+// The scene drawn until the guest submits one of its own: a triangle
+// from the built-in shader snippets. Keeping it means the display shows
+// something during boot, long before the guest touches the 3D pipeline.
+static bool gpu_vulkan_create_fallback_pipeline(gpu_vulkan_ctx_t* ctx)
+{
+    VkShaderModuleCreateInfo vertex_ci = {
+        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = sizeof(xe2_vert_spv),
+        .pCode    = xe2_vert_spv,
+    };
+    VkShaderModuleCreateInfo fragment_ci = {
+        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = sizeof(xe2_frag_spv),
+        .pCode    = xe2_frag_spv,
+    };
+    VkShaderModule vertex_module   = VK_NULL_HANDLE;
+    VkShaderModule fragment_module = VK_NULL_HANDLE;
+    VK_TRY(vkCreateShaderModule(ctx->device, &vertex_ci, NULL, &vertex_module));
+    VK_TRY(vkCreateShaderModule(ctx->device, &fragment_ci, NULL, &fragment_module));
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {
+         .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage  = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vertex_module,
+         .pName  = "main",
+         },
+        {
+         .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = fragment_module,
+         .pName  = "main",
+         },
+    };
+    ctx->pipeline = gpu_vulkan_build_pipeline(ctx, stages, 2, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 
     vkDestroyShaderModule(ctx->device, fragment_module, NULL);
     vkDestroyShaderModule(ctx->device, vertex_module, NULL);
-    return true;
+    return ctx->pipeline != VK_NULL_HANDLE;
 
 fail:
     if (fragment_module) {
@@ -388,7 +547,164 @@ fail:
     return false;
 }
 
-static bool gpu_vulkan_create_command_and_sync(gpu_vulkan_ctx_t *ctx)
+// Identity of a scene as far as pipeline construction is concerned:
+// the shader modules and the topology. Constants deliberately do not
+// take part - they change every frame and never invalidate a pipeline.
+static uint64_t gpu_vulkan_scene_key(const gpu_vulkan_scene_t* scene)
+{
+    uint64_t hash = 0xCBF29CE484222325ULL; // FNV-1a
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        for (uint32_t i = 0; i < scene->spirv_nwords[s]; i++) {
+            hash = (hash ^ scene->spirv[s][i]) * 0x100000001B3ULL;
+        }
+        hash = (hash ^ scene->spirv_nwords[s]) * 0x100000001B3ULL;
+    }
+    return (hash ^ scene->topology) * 0x100000001B3ULL;
+}
+
+// Builds (or reuses) the pipeline for the active guest scene. Stages
+// beyond vertex and fragment are skipped: turning them into pipeline
+// stages needs device features this backend does not request yet.
+static bool gpu_vulkan_ensure_guest_pipeline(gpu_vulkan_ctx_t* ctx)
+{
+    const gpu_vulkan_scene_t* scene = &ctx->active;
+    uint64_t                  key   = gpu_vulkan_scene_key(scene);
+
+    if (ctx->guest_pipeline != VK_NULL_HANDLE && ctx->guest_pipeline_key == key) {
+        return true;
+    }
+
+    static const VkShaderStageFlagBits stage_bits[GPU_VULKAN_STAGE_COUNT] = {
+        [GPU_VULKAN_STAGE_VERTEX]   = VK_SHADER_STAGE_VERTEX_BIT,
+        [GPU_VULKAN_STAGE_FRAGMENT] = VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+
+    VkShaderModule                  modules[GPU_VULKAN_STAGE_COUNT] = {0};
+    VkPipelineShaderStageCreateInfo stages[GPU_VULKAN_STAGE_COUNT]  = {0};
+    uint32_t                        stage_count                     = 0;
+    VkPipeline                      pipeline                        = VK_NULL_HANDLE;
+
+    // A graphics pipeline without a vertex shader is not a legal one.
+    // A missing fragment shader is fine - it just writes no colour.
+    if (!scene->spirv[GPU_VULKAN_STAGE_VERTEX]) {
+        return false;
+    }
+
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        if (!scene->spirv[s] || !scene->spirv_nwords[s] || !stage_bits[s]) {
+            continue;
+        }
+        VkShaderModuleCreateInfo module_ci = {
+            .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = scene->spirv_nwords[s] * sizeof(uint32_t),
+            .pCode    = scene->spirv[s],
+        };
+        VK_TRY(vkCreateShaderModule(ctx->device, &module_ci, NULL, &modules[s]));
+        stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
+            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage  = stage_bits[s],
+            .module = modules[s],
+            .pName  = "main",
+        };
+    }
+
+    pipeline = gpu_vulkan_build_pipeline(ctx, stages, stage_count, scene->topology);
+
+fail:
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        if (modules[s]) {
+            vkDestroyShaderModule(ctx->device, modules[s], NULL);
+        }
+    }
+    if (pipeline == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (ctx->guest_pipeline) {
+        vkDestroyPipeline(ctx->device, ctx->guest_pipeline, NULL);
+    }
+    ctx->guest_pipeline     = pipeline;
+    ctx->guest_pipeline_key = key;
+    return true;
+}
+
+// -----------------------------------------------------------
+// Scene handoff
+// -----------------------------------------------------------
+
+static void gpu_vulkan_scene_free(gpu_vulkan_scene_t* scene)
+{
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        free(scene->spirv[s]);
+    }
+    memset(scene, 0, sizeof(*scene));
+}
+
+bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw)
+{
+    if (unlikely(!ctx || !draw || atomic_load_uint8_relax(&ctx->shutting_down))) {
+        return false;
+    }
+    // Every graphics pipeline needs a vertex shader; without one there
+    // is nothing to build the scene around.
+    if (!draw->stage[GPU_VULKAN_STAGE_VERTEX].spirv || !draw->stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords) {
+        return false;
+    }
+
+    // Build the copy outside the lock - the device thread should not
+    // hold it across allocations.
+    gpu_vulkan_scene_t scene = {
+        .topology
+        = (draw->topology <= GPU_VULKAN_TOPOLOGY_TRIANGLE_FAN) ? draw->topology : GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST,
+        .vertex_count   = draw->vertex_count,
+        .instance_count = draw->instance_count ? draw->instance_count : 1,
+        .first_vertex   = draw->first_vertex,
+        .first_instance = draw->first_instance,
+    };
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        const gpu_vulkan_stage_desc_t* desc = &draw->stage[s];
+        if (desc->spirv && desc->spirv_nwords) {
+            size_t size    = desc->spirv_nwords * sizeof(uint32_t);
+            scene.spirv[s] = safe_malloc(size);
+            memcpy(scene.spirv[s], desc->spirv, size);
+            scene.spirv_nwords[s] = desc->spirv_nwords;
+        }
+        if (desc->constants && desc->const_bytes) {
+            uint32_t nbytes = (desc->const_bytes > GPU_VULKAN_CONST_BYTES) ? GPU_VULKAN_CONST_BYTES : desc->const_bytes;
+            memcpy(scene.constants[s], desc->constants, nbytes);
+        }
+    }
+
+    spin_lock(&ctx->draw_lock);
+    // An unconsumed scene is replaced wholesale: the renderer only ever
+    // draws the newest one, so the older is dead weight.
+    if (ctx->pending_valid) {
+        gpu_vulkan_scene_free(&ctx->pending);
+    }
+    ctx->pending       = scene;
+    ctx->pending_valid = true;
+    spin_unlock(&ctx->draw_lock);
+    return true;
+}
+
+// Moves a newly submitted scene into the renderer's own copy. Returns
+// whether a guest scene is available to draw at all.
+static bool gpu_vulkan_take_scene(gpu_vulkan_ctx_t* ctx)
+{
+    spin_lock(&ctx->draw_lock);
+    if (ctx->pending_valid) {
+        if (ctx->active_valid) {
+            gpu_vulkan_scene_free(&ctx->active);
+        }
+        ctx->active        = ctx->pending;
+        ctx->active_valid  = true;
+        ctx->pending_valid = false;
+        memset(&ctx->pending, 0, sizeof(ctx->pending));
+    }
+    spin_unlock(&ctx->draw_lock);
+    return ctx->active_valid;
+}
+
+static bool gpu_vulkan_create_command_and_sync(gpu_vulkan_ctx_t* ctx)
 {
     VkCommandPoolCreateInfo pool_ci = {
         .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -398,15 +714,15 @@ static bool gpu_vulkan_create_command_and_sync(gpu_vulkan_ctx_t *ctx)
     VK_TRY(vkCreateCommandPool(ctx->device, &pool_ci, NULL, &ctx->command_pool));
 
     VkCommandBufferAllocateInfo alloc_info = {
-        .sType       = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = ctx->command_pool,
-        .level       = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool        = ctx->command_pool,
+        .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1,
     };
     VK_TRY(vkAllocateCommandBuffers(ctx->device, &alloc_info, &ctx->command_buffer));
 
     VkFenceCreateInfo fence_ci = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
     };
     VK_TRY(vkCreateFence(ctx->device, &fence_ci, NULL, &ctx->fence));
     return true;
@@ -414,14 +730,22 @@ fail:
     return false;
 }
 
-gpu_vulkan_ctx_t *gpu_vulkan_create(void)
+gpu_vulkan_ctx_t* gpu_vulkan_create(void)
 {
-    gpu_vulkan_ctx_t *ctx = safe_calloc(1, sizeof(*ctx));
+    gpu_vulkan_ctx_t* ctx = safe_calloc(1, sizeof(*ctx));
+
+    spin_init(&ctx->draw_lock);
 
     if (!gpu_vulkan_create_instance_and_device(ctx)) {
         goto fail;
     }
     if (!gpu_vulkan_create_command_and_sync(ctx)) {
+        goto fail;
+    }
+    // The constant buffers and the pipeline layout around them do not
+    // depend on the render target, so they are built once here and
+    // outlive every mode-set.
+    if (!gpu_vulkan_create_const_layout(ctx)) {
         goto fail;
     }
     // render_pass/pipeline are built lazily in gpu_vulkan_reconfigure()
@@ -436,7 +760,7 @@ fail:
     return NULL;
 }
 
-static void gpu_vulkan_destroy_sized_resources(gpu_vulkan_ctx_t *ctx)
+static void gpu_vulkan_destroy_sized_resources(gpu_vulkan_ctx_t* ctx)
 {
     if (!ctx->device) {
         return;
@@ -462,16 +786,16 @@ static void gpu_vulkan_destroy_sized_resources(gpu_vulkan_ctx_t *ctx)
     if (ctx->readback_memory) {
         vkFreeMemory(ctx->device, ctx->readback_memory, NULL);
     }
-    ctx->framebuffer = VK_NULL_HANDLE;
-    ctx->color_view = VK_NULL_HANDLE;
-    ctx->color_image = VK_NULL_HANDLE;
-    ctx->color_memory = VK_NULL_HANDLE;
+    ctx->framebuffer     = VK_NULL_HANDLE;
+    ctx->color_view      = VK_NULL_HANDLE;
+    ctx->color_image     = VK_NULL_HANDLE;
+    ctx->color_memory    = VK_NULL_HANDLE;
     ctx->readback_buffer = VK_NULL_HANDLE;
     ctx->readback_memory = VK_NULL_HANDLE;
     ctx->readback_mapped = NULL;
 }
 
-void gpu_vulkan_destroy(gpu_vulkan_ctx_t *ctx)
+void gpu_vulkan_destroy(gpu_vulkan_ctx_t* ctx)
 {
     if (unlikely(!ctx)) {
         return;
@@ -491,11 +815,37 @@ void gpu_vulkan_destroy(gpu_vulkan_ctx_t *ctx)
 
     gpu_vulkan_destroy_sized_resources(ctx);
 
+    gpu_vulkan_scene_free(&ctx->pending);
+    gpu_vulkan_scene_free(&ctx->active);
+    ctx->pending_valid = false;
+    ctx->active_valid  = false;
+
     if (ctx->fence) {
         vkDestroyFence(ctx->device, ctx->fence, NULL);
     }
     if (ctx->command_pool) {
         vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
+    }
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        if (ctx->const_mapped[s]) {
+            vkUnmapMemory(ctx->device, ctx->const_memory[s]);
+        }
+        if (ctx->const_buffer[s]) {
+            vkDestroyBuffer(ctx->device, ctx->const_buffer[s], NULL);
+        }
+        if (ctx->const_memory[s]) {
+            vkFreeMemory(ctx->device, ctx->const_memory[s], NULL);
+        }
+    }
+    if (ctx->const_pool) {
+        // Frees the set allocated from it.
+        vkDestroyDescriptorPool(ctx->device, ctx->const_pool, NULL);
+    }
+    if (ctx->const_set_layout) {
+        vkDestroyDescriptorSetLayout(ctx->device, ctx->const_set_layout, NULL);
+    }
+    if (ctx->guest_pipeline) {
+        vkDestroyPipeline(ctx->device, ctx->guest_pipeline, NULL);
     }
     if (ctx->pipeline) {
         vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
@@ -515,33 +865,19 @@ void gpu_vulkan_destroy(gpu_vulkan_ctx_t *ctx)
     free(ctx);
 }
 
-
-
 // -----------------------------------------------------------
 // Real-time render
 // -----------------------------------------------------------
 
 
 
-static uint32_t gpu_vulkan_find_memory_type(VkPhysicalDevice phys, uint32_t type_bits, VkMemoryPropertyFlags props)
-{
-    VkPhysicalDeviceMemoryProperties mem_props = {0};
-    vkGetPhysicalDeviceMemoryProperties(phys, &mem_props);
-    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-        if ((type_bits & (1u << i)) && (mem_props.memoryTypes[i].propertyFlags & props) == props) {
-            return i;
-        }
-    }
-    return UINT32_MAX;
-}
-
 // This optionally re-maps Vulkan framebuffer to CPU-visible memory.
 // buf_size is passed in rather than computed here because it depends on
 // whether the caller is in the zero-copy path (buf_size == guest's real
 // stride * height) or the CPU-conversion fallback (tightly packed
 // width * height * bpp) - see gpu_vulkan_reconfigure().
-static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_t h,
-                                       VkFormat vk_format, VkDeviceSize buf_size)
+static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t* ctx, uint32_t w, uint32_t h, VkFormat vk_format,
+                                      VkDeviceSize buf_size)
 {
     if (ctx->framebuffer != VK_NULL_HANDLE && ctx->cur_width == w && ctx->cur_height == h
         && ctx->cur_vk_format == vk_format && ctx->cur_buf_size == buf_size) {
@@ -555,11 +891,7 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType     = VK_IMAGE_TYPE_2D,
         .format        = vk_format,
-        .extent        = {
-            .width  = w,
-            .height = h,
-            .depth  = 1
-        },
+        .extent        = {.width = w, .height = h, .depth = 1},
         .mipLevels     = 1,
         .arrayLayers   = 1,
         .samples       = VK_SAMPLE_COUNT_1_BIT,
@@ -573,7 +905,7 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
     VkMemoryRequirements image_req = {0};
     vkGetImageMemoryRequirements(ctx->device, ctx->color_image, &image_req);
     uint32_t image_mem_type = gpu_vulkan_find_memory_type(ctx->physical_device, image_req.memoryTypeBits,
-                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (image_mem_type == UINT32_MAX) {
         goto fail;
     }
@@ -586,17 +918,15 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
     VK_TRY(vkBindImageMemory(ctx->device, ctx->color_image, ctx->color_memory, 0));
 
     VkImageViewCreateInfo view_ci = {
-        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image    = ctx->color_image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format   = vk_format,
-        .subresourceRange = {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel   = 0,
-            .levelCount     = 1,
-            .baseArrayLayer = 0,
-            .layerCount     = 1
-        },
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image            = ctx->color_image,
+        .viewType         = VK_IMAGE_VIEW_TYPE_2D,
+        .format           = vk_format,
+        .subresourceRange = {.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .baseMipLevel   = 0,
+                             .levelCount     = 1,
+                             .baseArrayLayer = 0,
+                             .layerCount     = 1},
     };
     VK_TRY(vkCreateImageView(ctx->device, &view_ci, NULL, &ctx->color_view));
 
@@ -622,9 +952,9 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
 
     VkMemoryRequirements buf_req = {0};
     vkGetBufferMemoryRequirements(ctx->device, ctx->readback_buffer, &buf_req);
-    uint32_t buf_mem_type = gpu_vulkan_find_memory_type(ctx->physical_device, buf_req.memoryTypeBits,
-                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    uint32_t buf_mem_type
+        = gpu_vulkan_find_memory_type(ctx->physical_device, buf_req.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (buf_mem_type == UINT32_MAX) {
         goto fail;
     }
@@ -638,10 +968,10 @@ static bool gpu_vulkan_resize_targets(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_
     // HOST_COHERENT: no explicit flush/invalidate needed around reads.
     VK_TRY(vkMapMemory(ctx->device, ctx->readback_memory, 0, buf_size, 0, &ctx->readback_mapped));
 
-    ctx->cur_width = w;
-    ctx->cur_height = h;
+    ctx->cur_width     = w;
+    ctx->cur_height    = h;
     ctx->cur_vk_format = vk_format;
-    ctx->cur_buf_size = buf_size;
+    ctx->cur_buf_size  = buf_size;
     return true;
 
 fail:
@@ -655,34 +985,43 @@ fail:
 // buffer for the current width/height/stride. Leaves ctx->zero_copy set
 // so the caller knows whether the GPU output already matches the
 // guest's byte layout (straight memcpy) or needs the CPU fallback path.
-static bool gpu_vulkan_reconfigure(gpu_vulkan_ctx_t *ctx, uint32_t w, uint32_t h,
-                                    uint32_t stride, rvvm_rgb_t guest_format)
+static bool gpu_vulkan_reconfigure(gpu_vulkan_ctx_t* ctx, uint32_t w, uint32_t h, uint32_t stride,
+                                   rvvm_rgb_t guest_format)
 {
-    VkFormat native     = gpu_vulkan_native_format_for_guest(guest_format);
-    bool     zero_copy  = gpu_vulkan_format_usable(ctx->physical_device, native);
-    VkFormat vk_format  = zero_copy ? native : VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat native    = gpu_vulkan_native_format_for_guest(guest_format);
+    bool     zero_copy = gpu_vulkan_format_usable(ctx->physical_device, native);
+    VkFormat vk_format = zero_copy ? native : VK_FORMAT_B8G8R8A8_UNORM;
 
     if (vk_format != ctx->cur_vk_format) {
-        // Attachment format changed - pipeline/render pass must be
-        // rebuilt to match; this only happens on a real mode-set.
-        if (ctx->pipeline)        vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
-        if (ctx->pipeline_layout) vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, NULL);
-        if (ctx->render_pass)     vkDestroyRenderPass(ctx->device, ctx->render_pass, NULL);
-        ctx->pipeline = VK_NULL_HANDLE;
-        ctx->pipeline_layout = VK_NULL_HANDLE;
-        ctx->render_pass = VK_NULL_HANDLE;
+        // Attachment format changed - the render pass and every pipeline
+        // built against it must be rebuilt to match; this only happens on
+        // a real mode-set. The pipeline layout does not depend on the
+        // format and stays as it is, so the constant bindings survive.
+        if (ctx->pipeline) {
+            vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
+        }
+        if (ctx->guest_pipeline) {
+            vkDestroyPipeline(ctx->device, ctx->guest_pipeline, NULL);
+        }
+        if (ctx->render_pass) {
+            vkDestroyRenderPass(ctx->device, ctx->render_pass, NULL);
+        }
+        ctx->pipeline           = VK_NULL_HANDLE;
+        ctx->guest_pipeline     = VK_NULL_HANDLE;
+        ctx->guest_pipeline_key = 0;
+        ctx->render_pass        = VK_NULL_HANDLE;
 
         if (!gpu_vulkan_create_render_pass(ctx, vk_format)) {
             return false;
         }
-        if (!gpu_vulkan_create_pipeline(ctx, vk_format)) {
+        if (!gpu_vulkan_create_fallback_pipeline(ctx)) {
             return false;
         }
     }
 
-    VkDeviceSize buf_size = zero_copy
-        ? (VkDeviceSize) stride * h // GPU writes guest's exact layout.
-        : (VkDeviceSize) w * h * gpu_vulkan_vk_format_bpp(vk_format); // Tightly packed for CPU fallback.
+    VkDeviceSize buf_size
+        = zero_copy ? (VkDeviceSize)stride * h                                   // GPU writes guest's exact layout.
+                    : (VkDeviceSize)w * h * gpu_vulkan_vk_format_bpp(vk_format); // Tightly packed for CPU fallback.
 
     if (!gpu_vulkan_resize_targets(ctx, w, h, vk_format, buf_size)) {
         return false;
@@ -711,7 +1050,7 @@ forceinline static size_t gpu_vulkan_bytes_per_pixel(rvvm_rgb_t format)
 // Only used by the fallback path, which always renders in
 // VK_FORMAT_B8G8R8A8_UNORM (see gpu_vulkan_reconfigure), so src_bgra is
 // always (B,G,R,A) per pixel here.
-static inline void gpu_vulkan_write_pixel(uint8_t *dst, const uint8_t *src_bgra, rvvm_rgb_t format)
+static inline void gpu_vulkan_write_pixel(uint8_t* dst, const uint8_t* src_bgra, rvvm_rgb_t format)
 {
     uint8_t b = src_bgra[0];
     uint8_t g = src_bgra[1];
@@ -724,9 +1063,9 @@ static inline void gpu_vulkan_write_pixel(uint8_t *dst, const uint8_t *src_bgra,
             break;
         }
         case RVVM_RGB_XRGB2101010: {
-            uint32_t r10   = (uint32_t) r * 1023 / 255;
-            uint32_t g10   = (uint32_t) g * 1023 / 255;
-            uint32_t b10   = (uint32_t) b * 1023 / 255;
+            uint32_t r10   = (uint32_t)r * 1023 / 255;
+            uint32_t g10   = (uint32_t)g * 1023 / 255;
+            uint32_t b10   = (uint32_t)b * 1023 / 255;
             uint32_t pixel = (r10 << 20) | (g10 << 10) | b10;
             memcpy(dst, &pixel, sizeof(pixel));
             break;
@@ -750,14 +1089,13 @@ static inline void gpu_vulkan_write_pixel(uint8_t *dst, const uint8_t *src_bgra,
 // Converts the tightly-packed BGRA8 render output into dst at the
 // guest's real stride/format. Runs entirely on the worker thread now -
 // this used to be xe2_blit_shader_output() called from xe2_scanout().
-static void gpu_vulkan_blit_to_guest(uint8_t *dst, uint32_t stride,
-                                      const uint8_t *pixels, size_t row_pitch,
-                                      uint32_t width, uint32_t height, rvvm_rgb_t format)
+static void gpu_vulkan_blit_to_guest(uint8_t* dst, uint32_t stride, const uint8_t* pixels, size_t row_pitch,
+                                     uint32_t width, uint32_t height, rvvm_rgb_t format)
 {
     size_t bpp = gpu_vulkan_bytes_per_pixel(format);
     for (uint32_t y = 0; y < height; y++) {
-        const uint8_t *src_row = pixels + (size_t) y * row_pitch;
-        uint8_t       *dst_row = dst + (size_t) y * stride;
+        const uint8_t* src_row = pixels + (size_t)y * row_pitch;
+        uint8_t*       dst_row = dst + (size_t)y * stride;
         for (uint32_t x = 0; x < width; x++) {
             gpu_vulkan_write_pixel(dst_row + x * bpp, src_row + x * 4, format);
         }
@@ -771,15 +1109,15 @@ static void gpu_vulkan_blit_to_guest(uint8_t *dst, uint32_t stride,
 // can page-flip without touching a single pixel.
 //
 // I am drunk while writing this. God forgive me.
-static void *gpu_vulkan_render_task(void *arg)
+static void* gpu_vulkan_render_task(void* arg)
 {
-    gpu_vulkan_ctx_t *ctx = (gpu_vulkan_ctx_t *) arg;
-    uint32_t   width      = ctx->requested_width;
-    uint32_t   height     = ctx->requested_height;
-    uint32_t   stride     = ctx->requested_stride;
-    rvvm_rgb_t format     = ctx->requested_format;
-    uint8_t   *dst        = ctx->requested_dst;
-    size_t     dst_size   = ctx->requested_dst_size;
+    gpu_vulkan_ctx_t* ctx      = (gpu_vulkan_ctx_t*)arg;
+    uint32_t          width    = ctx->requested_width;
+    uint32_t          height   = ctx->requested_height;
+    uint32_t          stride   = ctx->requested_stride;
+    rvvm_rgb_t        format   = ctx->requested_format;
+    uint8_t*          dst      = ctx->requested_dst;
+    size_t            dst_size = ctx->requested_dst_size;
 
     if (atomic_load_uint8_relax(&ctx->shutting_down) || width == 0 || height == 0) {
         goto done;
@@ -789,68 +1127,66 @@ static void *gpu_vulkan_render_task(void *arg)
         goto done;
     }
 
+    // Pick up whatever the guest submitted last. A scene whose pipeline
+    // fails to build (a kernel we cross-compiled into something the
+    // driver rejects) falls back to the built-in one rather than
+    // dropping the frame, so the display keeps updating.
+    bool       guest_scene = gpu_vulkan_take_scene(ctx) && gpu_vulkan_ensure_guest_pipeline(ctx);
+    VkPipeline pipeline    = guest_scene ? ctx->guest_pipeline : ctx->pipeline;
+
+    // Publish the constants of the active scene into the uniform blocks
+    // the shaders read. Nothing else touches these buffers, and the
+    // previous frame's fence has already been waited on.
+    if (guest_scene) {
+        for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+            if (ctx->const_mapped[s]) {
+                memcpy(ctx->const_mapped[s], ctx->active.constants[s], GPU_VULKAN_CONST_BYTES);
+            }
+        }
+    }
+
     // Deterministic frame clock - not wall-clock time.
     const float dt    = 1.0f / 60.0f;
     const float speed = 20.0f;
-    float time        = (float) ctx->frame_index * dt * speed;
+    float       time  = (float)ctx->frame_index * dt * speed;
 
     vkResetCommandBuffer(ctx->command_buffer, 0);
-    VkCommandBufferBeginInfo begin_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
-    };
+    VkCommandBufferBeginInfo begin_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     if (vkBeginCommandBuffer(ctx->command_buffer, &begin_info) != VK_SUCCESS) {
         goto done;
     }
 
-    VkViewport viewport = {
-        .x        = 0.0f,
-        .y        = 0.0f,
-        .width    = (float) width,
-        .height   = (float) height,
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f
-    };
+    VkViewport viewport
+        = {.x = 0.0f, .y = 0.0f, .width = (float)width, .height = (float)height, .minDepth = 0.0f, .maxDepth = 1.0f};
     VkRect2D scissor = {
-        .offset = {
-            .x = 0,
-            .y = 0
-        },
-        .extent = {
-            .width  = width,
-            .height = height
-        }
+        .offset = {        .x = 0,           .y = 0},
+          .extent = {.width = width, .height = height}
     };
     vkCmdSetViewport(ctx->command_buffer, 0, 1, &viewport);
     vkCmdSetScissor(ctx->command_buffer, 0, 1, &scissor);
 
-    VkClearValue clear = {
-        .color = {
-            .float32 = { 0.02f, 0.02f, 0.05f, 1.0f }
-        }
-    };
+    VkClearValue          clear            = {.color = {.float32 = {0.02f, 0.02f, 0.05f, 1.0f}}};
     VkRenderPassBeginInfo render_pass_info = {
-        .sType        = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass   = ctx->render_pass,
-        .framebuffer  = ctx->framebuffer,
-        .renderArea   = {
-            .offset = {
-                .x = 0,
-                .y = 0
-            },
-            .extent = {
-                .width  = width,
-                .height = height
-            }
-        },
+        .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass      = ctx->render_pass,
+        .framebuffer     = ctx->framebuffer,
+        .renderArea      = {.offset = {.x = 0, .y = 0}, .extent = {.width = width, .height = height}},
         .clearValueCount = 1,
         .pClearValues    = &clear,
     };
     vkCmdBeginRenderPass(ctx->command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->pipeline);
-    // layout(push_constant) uniform PushConsts { float time; } pc;
-    vkCmdPushConstants(ctx->command_buffer, ctx->pipeline_layout,
-                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float), &time);
-    vkCmdDraw(ctx->command_buffer, 3, 1, 0, 0);
+    vkCmdBindPipeline(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindDescriptorSets(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->pipeline_layout,
+                            GPU_VULKAN_CONST_SET, 1, &ctx->const_set, 0, NULL);
+    if (guest_scene) {
+        vkCmdDraw(ctx->command_buffer, ctx->active.vertex_count, ctx->active.instance_count, ctx->active.first_vertex,
+                  ctx->active.first_instance);
+    } else {
+        // layout(push_constant) uniform PushConsts { float time; } pc;
+        vkCmdPushConstants(ctx->command_buffer, ctx->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float),
+                           &time);
+        vkCmdDraw(ctx->command_buffer, 3, 1, 0, 0);
+    }
     vkCmdEndRenderPass(ctx->command_buffer);
     // finalLayout already leaves the image in TRANSFER_SRC_OPTIMAL.
 
@@ -858,27 +1194,18 @@ static void *gpu_vulkan_render_task(void *arg)
     // (in texels of vk_format) - the GPU's copy engine handles any row
     // padding for us. In the fallback path it's just `width`, tightly
     // packed, and gpu_vulkan_blit_to_guest() destrides it on the CPU.
-    size_t vk_bpp = gpu_vulkan_vk_format_bpp(ctx->cur_vk_format);
+    size_t   vk_bpp            = gpu_vulkan_vk_format_bpp(ctx->cur_vk_format);
     uint32_t buffer_row_length = ctx->zero_copy ? (uint32_t)(stride / vk_bpp) : width;
 
     VkBufferImageCopy region = {
         .bufferOffset      = 0,
         .bufferRowLength   = buffer_row_length,
         .bufferImageHeight = height,
-        .imageSubresource  = {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .mipLevel       = 0,
-            .baseArrayLayer = 0,
-            .layerCount     = 1
-        },
-        .imageExtent = {
-            .width  = width,
-            .height = height,
-            .depth  = 1
-        },
+        .imageSubresource
+        = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+        .imageExtent = {.width = width, .height = height, .depth = 1},
     };
-    vkCmdCopyImageToBuffer(ctx->command_buffer, ctx->color_image,
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdCopyImageToBuffer(ctx->command_buffer, ctx->color_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            ctx->readback_buffer, 1, &region);
 
     if (vkEndCommandBuffer(ctx->command_buffer) != VK_SUCCESS) {
@@ -914,7 +1241,7 @@ static void *gpu_vulkan_render_task(void *arg)
             // guest's real stride - one flat memcpy, no per-pixel work,
             // no branchy switch. This is the fast path for all four
             // formats whenever the GPU supports them as attachments.
-            size_t needed = (size_t) stride * height;
+            size_t needed = (size_t)stride * height;
             if (needed <= dst_size) {
                 memcpy(dst, ctx->readback_mapped, needed);
                 ctx->front_width  = width;
@@ -927,8 +1254,8 @@ static void *gpu_vulkan_render_task(void *arg)
             // format (only expected for RGB565/XRGB2101010 on some
             // drivers) - readback_mapped is tightly-packed B8G8R8A8 here,
             // matching gpu_vulkan_blit_to_guest()'s assumption.
-            size_t row_pitch = (size_t) width * gpu_vulkan_vk_format_bpp(ctx->cur_vk_format);
-            size_t needed    = (size_t) stride * height;
+            size_t row_pitch = (size_t)width * gpu_vulkan_vk_format_bpp(ctx->cur_vk_format);
+            size_t needed    = (size_t)stride * height;
             if (needed <= dst_size) {
                 gpu_vulkan_blit_to_guest(dst, stride, ctx->readback_mapped, row_pitch, width, height, format);
                 ctx->front_width  = width;
@@ -951,10 +1278,9 @@ done:
 // out_format describe whatever the worker most recently finished
 // writing into dst, which the caller hands straight to
 // rvvm_fbdev_set_scanout() - no per-frame CPU work on this thread.
-bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t *ctx, uint32_t width, uint32_t height,
-                             uint8_t *dst, size_t dst_size, uint32_t stride, rvvm_rgb_t format,
-                             uint32_t *out_width, uint32_t *out_height,
-                             uint32_t *out_stride, rvvm_rgb_t *out_format)
+bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t* ctx, uint32_t width, uint32_t height, uint8_t* dst, size_t dst_size,
+                             uint32_t stride, rvvm_rgb_t format, uint32_t* out_width, uint32_t* out_height,
+                             uint32_t* out_stride, rvvm_rgb_t* out_format)
 {
     if (unlikely(!ctx || width == 0 || height == 0 || atomic_load_uint8_relax(&ctx->shutting_down))) {
         return false;
@@ -962,12 +1288,12 @@ bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t *ctx, uint32_t width, uint32_t hei
 
     // Publish what the worker should render/blit next. Cheap field
     // stores, same as requested_width/height already were.
-    ctx->requested_width     = width;
-    ctx->requested_height    = height;
-    ctx->requested_dst       = dst;
-    ctx->requested_dst_size  = dst_size;
-    ctx->requested_stride    = stride;
-    ctx->requested_format    = format;
+    ctx->requested_width    = width;
+    ctx->requested_height   = height;
+    ctx->requested_dst      = dst;
+    ctx->requested_dst_size = dst_size;
+    ctx->requested_stride   = stride;
+    ctx->requested_format   = format;
 
     // Queue a new render+blit only when the previous one has finished.
     // This keeps at most one in-flight task, and guarantees the GUI

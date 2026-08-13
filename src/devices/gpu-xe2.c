@@ -9,6 +9,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <devices/gpu-vulkan-spirv.h>
 #include <devices/gpu-vulkan.h>
+#include <devices/gpu-xe2-3dstate.h>
+#include <devices/gpu-xe2-shader.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <rvvm/rvvm_board.h>
@@ -23,6 +25,21 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/spinlock.h>
 #include <util/utils.h>
 #include <util/vma_ops.h>
+
+// The uniform block a cross-compiled shader declares for its pushed
+// constants and the buffer the backend binds to it are the same object
+// seen from two sides, so their sizes have to agree.
+BUILD_ASSERT(XE2_CONST_MAX_BYTES == GPU_VULKAN_CONST_BYTES);
+BUILD_ASSERT(XE2_SHADER_CONST_SET == GPU_VULKAN_CONST_SET);
+
+// So do the binding numbers: the shader is compiled with its Xe2 stage
+// index as the binding, while the backend lays the descriptor set out by
+// Vulkan stage index. See xe2_draw_stages[] for the correspondence.
+BUILD_ASSERT((int)XE2_SHADER_VS == (int)GPU_VULKAN_STAGE_VERTEX);
+BUILD_ASSERT((int)XE2_SHADER_HS == (int)GPU_VULKAN_STAGE_TESS_CTRL);
+BUILD_ASSERT((int)XE2_SHADER_DS == (int)GPU_VULKAN_STAGE_TESS_EVAL);
+BUILD_ASSERT((int)XE2_SHADER_GS == (int)GPU_VULKAN_STAGE_GEOMETRY);
+BUILD_ASSERT((int)XE2_SHADER_PS == (int)GPU_VULKAN_STAGE_FRAGMENT);
 
 // Basic DRM programs and weston works with following
 // boot arguments:
@@ -1196,14 +1213,6 @@ typedef struct {
     uint16_t sram_rd_addr;  // Latched SRAM read address.
 } xe2_cx0_lane_t;
 
-#define XE2_MEM_SMEM 0 // System memory (accessed via DMA)
-#define XE2_MEM_LMEM 1 // Local memory (accessed via VRAM)
-
-typedef struct {
-    uint64_t addr;
-    uint8_t  type;
-} xe2_dma_addr_t;
-
 // Power-related registers. Used to handle
 // - PP  (Panel power)
 // - PCH (Panel controller hub)
@@ -1214,72 +1223,6 @@ typedef struct {
     uint32_t on_delays;
     uint32_t off_delays;
 } xe2_power_control_t;
-
-typedef enum {
-    XE2_SHADER_VS = 0,
-    XE2_SHADER_HS,
-    XE2_SHADER_DS,
-    XE2_SHADER_GS,
-    XE2_SHADER_PS,
-    XE2_SHADER_CS,
-    XE2_SHADER_STAGE_COUNT
-} xe2_shader_kind_t;
-
-#define XE2_SHADER_MAX_PUSH_DWORDS 32
-#define XE2_SHADER_MAX_BINDINGS    16
-#define XE2_SHADER_MAX_GRF         128
-
-// One dirty-tracked snapshot of fixed-function + shader-stage state that
-// feeds a VkGraphicsPipelineCreateInfo + descriptor/push-constant update.
-// Lives on xe2_submit_ctx_t because state is scoped to the logical ring
-// context, same as addr_general_state/addr_surf_state.
-typedef struct {
-    struct {
-        uint32_t* spirv; // owned; from spirv_module_finish()
-        uint32_t  spirv_nwords;
-        bool      enabled;
-        bool      dirty; // kernel changed since last pipeline build
-    } stage[XE2_SHADER_STAGE_COUNT];
-
-    struct {
-        uint8_t  data[XE2_SHADER_MAX_PUSH_DWORDS * 4];
-        uint32_t nbytes;
-        bool     dirty;
-    } push_constants[XE2_SHADER_STAGE_COUNT];
-
-    struct {
-        xe2_dma_addr_t addr;
-        uint32_t       stride;
-        uint32_t       size;
-    } vertex[XE2_SHADER_MAX_BINDINGS];
-
-    uint32_t vertex_count;
-
-    struct {
-        uint32_t binding;
-        uint32_t format; // SURFACE_FORMAT enum -> translate to VkFormat
-        uint32_t offset;
-        uint32_t location; // shader input location
-    } vertex_element[XE2_SHADER_MAX_BINDINGS];
-
-    uint32_t vertex_element_count;
-
-    xe2_dma_addr_t index_buf_addr;
-    uint32_t       index_format; // 0=BYTE,1=WORD,2=DWORD -> VkIndexType
-    bool           index_buf_valid;
-
-    uint32_t vf_topology; // from 3DSTATE_VF_TOPOLOGY -> VkPrimitiveTopology
-
-    // --- Binding tables per stage, from 3DSTATE_BINDING_TABLE_POINTERS_XS ---
-    uint32_t binding_table_offset[XE2_SHADER_STAGE_COUNT];
-    bool     binding_table_dirty[XE2_SHADER_STAGE_COUNT];
-
-    // --- Rasterizer / blend / depth-stencil, opaque blobs for now ---
-    uint32_t raster_state[4];  // 3DSTATE_RASTER dwords, decode as needed
-    uint32_t blend_state[4];   // 3DSTATE_PS_BLEND
-    uint32_t depth_stencil[4]; // 3DSTATE_WM_DEPTH_STENCIL
-    bool     ff_state_dirty;
-} xe2_3dstate_t;
 
 // Registered submission contexts. A doorbell on the shared host-interrupt
 // register carries both CT messages and ring-work submissions; rather than
@@ -1376,42 +1319,6 @@ typedef struct {
 
     uint32_t dmc_base;
 } xe2_firmware_t;
-
-typedef struct {
-    spirv_module_t    mod;
-    xe2_shader_kind_t stage;
-
-    uint32_t fty;  // float32
-    uint32_t v4ty; // vec4 float
-    uint32_t void_ty;
-    uint32_t fn_ty;
-
-    // Per-GRF Function-local float pointer (lazy).
-    uint32_t grf_f32[XE2_SHADER_MAX_GRF];
-
-    uint32_t position_out;  // BuiltIn Position.
-    uint32_t fragcolor_out; // Location 0.
-    uint32_t push_var;
-
-    uint32_t entry_iface[8];
-    size_t   entry_iface_n;
-
-    bool saw_eot;
-} xe2_spirv_ctx_t;
-
-typedef struct xe2_shader {
-    uint32_t* spirv;
-    uint32_t  spirv_nwords;
-} xe2_shader_t;
-
-#define XE2_SHADER_CACHE_BUCKETS 64
-
-// Unhandled. Shaders now are generated and printed, then we forget
-// about them.
-typedef struct {
-    xe2_shader_t* bucket[XE2_SHADER_CACHE_BUCKETS];
-    size_t        count;
-} xe2_shader_cache_t;
 
 typedef struct {
     rvvm_pci_func_t* pci_func;
@@ -1561,6 +1468,18 @@ static uint32_t xe2_spi_read32(xe2_dev_t* xe2)
 static void xe2_remove(rvvm_reg_dev_t* dev)
 {
     xe2_dev_t* xe2 = rvvm_region_data(dev);
+
+    // Tear the renderer down first: it owns a worker thread that blits
+    // into the framebuffer memory freed further down.
+    gpu_vulkan_destroy(xe2->vulkan_ctx);
+    xe2->vulkan_ctx = NULL;
+
+    for (size_t i = 0; i < XE2_MAX_CONTEXTS; ++i) {
+        for (size_t s = 0; s < XE2_SHADER_STAGE_COUNT; ++s) {
+            free(xe2->ctx[i].d3d.shader[s].spirv);
+        }
+    }
+
     if (xe2->fbdev) {
         rvvm_fbdev_dec_ref(xe2->fbdev);
     }
@@ -1825,6 +1744,35 @@ static inline void xe2_dma_read_many(xe2_dev_t* xe2, xe2_dma_addr_t dma, void* o
         uint32_t* ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr, 4);
         memcpy(out, ptr, total);
         rvvm_pci_end_dma(xe2->pci_func, ptr);
+    }
+}
+
+// Bulk read of an arbitrary byte range. Unlike xe2_dma_read_many() this
+// asks the PCI layer to map the whole range, so it stays correct for
+// reads bigger than a dword, and copies whatever prefix is mappable when
+// the range crosses into unmapped memory.
+static void xe2_dma_read_bytes(xe2_dev_t* xe2, xe2_dma_addr_t dma, void* out, size_t size)
+{
+    if (dma.type == XE2_MEM_LMEM) {
+        if (unlikely(dma.addr + size > XE2_VRAM_SIZE)) {
+            return;
+        }
+        memcpy(out, xe2->vram + dma.addr, size);
+        return;
+    }
+
+    uint8_t* dst = (uint8_t*)out;
+    size_t   off = 0;
+    while (off < size) {
+        size_t avail = size - off;
+        void*  ptr   = rvvm_pci_get_dma_part(xe2->pci_func, dma.addr + off, &avail);
+        if (unlikely(!ptr || !avail)) {
+            rvvm_pci_end_dma(xe2->pci_func, ptr);
+            return;
+        }
+        memcpy(dst + off, ptr, avail);
+        rvvm_pci_end_dma(xe2->pci_func, ptr);
+        off += avail;
     }
 }
 
@@ -2970,35 +2918,6 @@ static const uint32_t xe2_brw_width_decode[8] = {1, 2, 4, 8, 16, 32, 0, 0};
 
 static const uint32_t xe2_brw_vstride_decode[8] = {0, 1, 2, 4, 8, 16, 32, 64};
 
-static forceinline uint32_t xe2_spirv_grf(xe2_spirv_ctx_t* ctx, uint32_t grf)
-{
-    if (grf >= XE2_SHADER_MAX_GRF) {
-        grf = 0;
-    }
-    if (!ctx->grf_f32[grf]) {
-        uint32_t pty      = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_FUNCTION, ctx->fty);
-        ctx->grf_f32[grf] = spirv_local_var(&ctx->mod, pty);
-    }
-    return ctx->grf_f32[grf];
-}
-
-static forceinline uint32_t xe2_spirv_load_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, bool neg, bool abs)
-{
-    uint32_t id = spirv_op_load(&ctx->mod, ctx->fty, xe2_spirv_grf(ctx, grf));
-    if (abs) {
-        id = spirv_ext_inst1(&ctx->mod, ctx->fty, SPIRV_GLSL_STD450_FABS, id);
-    }
-    if (neg) {
-        id = spirv_op_fneg(&ctx->mod, ctx->fty, id);
-    }
-    return id;
-}
-
-static forceinline void xe2_spirv_store_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t val)
-{
-    spirv_op_store(&ctx->mod, xe2_spirv_grf(ctx, grf), val);
-}
-
 // Decoded operand used by the emitter (register number + modifiers).
 typedef struct {
     uint32_t reg;
@@ -3029,7 +2948,9 @@ static forceinline uint32_t xe2_spirv_load_operand(xe2_spirv_ctx_t* ctx, const x
         }
         return id;
     }
-    return xe2_spirv_load_grf(ctx, op->reg, op->neg, op->abs);
+    // The subregister matters here: it is what tells apart two uniforms
+    // gathered into the same register.
+    return xe2_spirv_load_grf(ctx, op->reg, op->subreg, op->neg, op->abs);
 }
 
 // No width field in align1 3-src. Width is architecturally fixed at 8;
@@ -3051,25 +2972,24 @@ static inline uint32_t xe2_brw_math_fc(const xe2_qword_t* qw)
     return fc;
 }
 
-static forceinline void xe2_brw_emit_send(xe2_spirv_ctx_t* spirv_ctx, const xe2_brw_operand_t* s0,
-                                          const xe2_brw_operand_t* s1)
+#define XE2_BRW_SFID_URB 6
+
+// A send carries the thread's output message: the URB write that hands a
+// vertex to the next stage, or the render target write that hands a
+// fragment to the framebuffer. Either way its payload register holds the
+// value we want.
+//
+// The fragment case keys off EOT rather than the SFID: a render target
+// write is always the message a fragment thread ends on, whereas the
+// dataport SFID it travels under has been renumbered across generations.
+static forceinline void xe2_brw_emit_send(xe2_spirv_ctx_t* spirv_ctx, uint32_t sfid, bool eot,
+                                          const xe2_brw_operand_t* s0, const xe2_brw_operand_t* s1)
 {
-    uint32_t base = s0->reg ? s0->reg : s1->reg;
-    if (spirv_ctx->stage == XE2_SHADER_VS && spirv_ctx->position_out) {
-        uint32_t x   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 0));
-        uint32_t y   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 1));
-        uint32_t z   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 2));
-        uint32_t ww  = spirv_type_const_float32(&spirv_ctx->mod, 1.0f);
-        uint32_t pos = spirv_composite_construct4(&spirv_ctx->mod, spirv_ctx->v4ty, x, y, z, ww);
-        spirv_op_store(&spirv_ctx->mod, spirv_ctx->position_out, pos);
-    } else if (spirv_ctx->stage == XE2_SHADER_PS && spirv_ctx->fragcolor_out) {
-        uint32_t r   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 0));
-        uint32_t g   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 1));
-        uint32_t b   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 2));
-        uint32_t a   = spirv_op_load(&spirv_ctx->mod, spirv_ctx->fty, xe2_spirv_grf(spirv_ctx, base + 3));
-        uint32_t col = spirv_composite_construct4(&spirv_ctx->mod, spirv_ctx->v4ty, r, g, b, a);
-        spirv_op_store(&spirv_ctx->mod, spirv_ctx->fragcolor_out, col);
+    bool is_output = (spirv_ctx->stage == XE2_SHADER_PS) ? eot : (sfid == XE2_BRW_SFID_URB);
+    if (!is_output) {
+        return;
     }
+    xe2_spirv_emit_output(spirv_ctx, s0->reg ? s0->reg : s1->reg);
 }
 
 static forceinline void xe2_brw_emit_spirv(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t* qw, uint32_t op,
@@ -3353,10 +3273,8 @@ static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t
             spirv_ctx->saw_eot = true;
         }
 
-        // URB SFID is 6 on recent gens. Payload starts at s0.reg (or s1).
-        if (sfid == 6) {
-            xe2_brw_emit_send(spirv_ctx, &s0, &s1);
-        }
+        // Payload starts at s0.reg (or s1 when src0 is not a register).
+        xe2_brw_emit_send(spirv_ctx, sfid, *eot, &s0, &s1);
         if (xe2_brw_op_nsrc(op) == 1) {
             xe2_brw_print(qw, op, &dst, &s0, NULL, NULL);
         } else {
@@ -3426,12 +3344,19 @@ static void xe2_write_spirv(const uint32_t* words, uint32_t n)
     rvvm_info(" ");
     rvvm_info("-- Written SPIR-V shader");
     rvvm_info(" ");
-    system("spirv-dis compiled.spirv");
+    if (system("spirv-dis compiled.spirv") != 0) {
+        rvvm_warn("spirv-dis failed");
+    }
+    // Catches a module the driver would reject before it reaches one.
+    if (system("spirv-val --target-env vulkan1.1 compiled.spirv") != 0) {
+        rvvm_warn("spirv-val rejected the compiled shader");
+    }
 }
 
-// Decode and print BRW assembly reported under kernel address.
-// When decoding stage will be passed, this branch of emulator
-// needs to be extended by cross-compiling to Vulkan shaders.
+// Cross-compile the BRW kernel at the given address into a SPIR-V module
+// for the stage. The module scaffolding (register file, pushed constant
+// block, stage outputs, entry point) is built by gpu-xe2-shader.h; this
+// walks the kernel and feeds its instructions through the translator.
 static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_t dma, uint32_t** spirv,
                            uint32_t* spirv_nwords)
 {
@@ -3439,36 +3364,12 @@ static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_
         return;
     }
 
-    memset(&xe2->spirv_ctx, 0, sizeof(xe2->spirv_ctx));
-    xe2->spirv_ctx.stage = kind;
-
-    spirv_module_init(&xe2->spirv_ctx.mod);
-    spirv_module_begin(&xe2->spirv_ctx.mod);
-
-    xe2->spirv_ctx.void_ty = spirv_type_void(&xe2->spirv_ctx.mod);
-    xe2->spirv_ctx.fn_ty   = spirv_type_func_void(&xe2->spirv_ctx.mod);
-    xe2->spirv_ctx.fty     = spirv_type_float32(&xe2->spirv_ctx.mod);
-    xe2->spirv_ctx.v4ty    = spirv_type_vec4_float32(&xe2->spirv_ctx.mod);
+    xe2_spirv_begin(&xe2->spirv_ctx, kind);
 
     static const uint32_t limit = 4096;
     uint32_t              len   = 0U;
     uint32_t              zeros = 0U;
     size_t                off   = 0ULL;
-
-    {
-        uint32_t block_ty = spirv_seq_id(&xe2->spirv_ctx.mod);
-        spirv_push(xe2->spirv_ctx.mod.globals, SPIRV_OP_TYPE_STRUCT | (3 << 16));
-        spirv_push(xe2->spirv_ctx.mod.globals, block_ty);
-        spirv_push(xe2->spirv_ctx.mod.globals, xe2->spirv_ctx.fty);
-        spirv_decorate_0(&xe2->spirv_ctx.mod, block_ty, SPIRV_DECORATION_BLOCK);
-        spirv_member_decorate_1(&xe2->spirv_ctx.mod, block_ty, 0, SPIRV_DECORATION_OFFSET, 0);
-
-        uint32_t block_ptr      = spirv_type_ptr(&xe2->spirv_ctx.mod, SPIRV_STORAGE_CLASS_PUSH_CONSTANT, block_ty);
-        xe2->spirv_ctx.push_var = spirv_global_var(&xe2->spirv_ctx.mod, block_ptr, SPIRV_STORAGE_CLASS_PUSH_CONSTANT);
-        xe2->spirv_ctx.entry_iface[xe2->spirv_ctx.entry_iface_n++] = xe2->spirv_ctx.push_var;
-    }
-
-    uint32_t func = spirv_func_begin(&xe2->spirv_ctx.mod, xe2->spirv_ctx.void_ty, xe2->spirv_ctx.fn_ty);
 
     for (uint32_t i = 0; i < limit; ++i) {
         xe2_qword_t qw = {0};
@@ -3488,23 +3389,15 @@ static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_
         }
     }
 
-    spirv_func_end(&xe2->spirv_ctx.mod);
-
-    uint32_t exec_model = (kind == XE2_SHADER_PS) ? SPIRV_EXECUTION_MODEL_FRAGMENT : SPIRV_EXECUTION_MODEL_VERTEX;
-
-    spirv_entry_point(&xe2->spirv_ctx.mod, exec_model, func, "main", xe2->spirv_ctx.entry_iface,
-                      xe2->spirv_ctx.entry_iface_n);
-
-    if (kind == XE2_SHADER_PS) {
-        spirv_exec_mode0(&xe2->spirv_ctx.mod, func, SPIRV_EXECUTION_MODE_ORIGIN_UPPER_LEFT);
+    if (!xe2->spirv_ctx.wrote_output) {
+        rvvm_warn("(kind: %u) No output message recognised in kernel, shader writes a default", kind);
     }
 
-    if (spirv_module_finish(&xe2->spirv_ctx.mod, spirv, spirv_nwords) != 0) {
-        spirv_module_free(&xe2->spirv_ctx.mod);
+    if (xe2_spirv_finish(&xe2->spirv_ctx, spirv, spirv_nwords) != 0) {
+        rvvm_warn("(kind: %u) Failed to serialize SPIR-V module", kind);
         return;
     }
-    rvvm_info("Vulkan shader: %p, %u dwords", spirv, *spirv_nwords);
-    spirv_module_free(&xe2->spirv_ctx.mod);
+    rvvm_info("Vulkan shader: %p, %u dwords", (void*)*spirv, *spirv_nwords);
     xe2_write_spirv(*spirv, *spirv_nwords);
 }
 
@@ -3695,23 +3588,40 @@ static void xe2_print_decompiled_shader(xe2_dev_t* xe2, xe2_dma_addr_t dma)
 static void xe2_decode_shader(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_shader_kind_t kind, rvvm_addr_t pdp4,
                               rvvm_addr_t addr_kernel, uint64_t addr_instr)
 {
+    xe2_shader_stage_t* stage = &ctx->d3d.shader[kind];
+    rvvm_addr_t         va    = addr_kernel + addr_instr;
+
+    // The driver re-emits 3DSTATE_XS on every batch even when nothing
+    // changed; recompiling the same kernel each time would be wasted
+    // work. This takes the kernel address as the kernel's identity,
+    // which holds as long as the driver allocates a new buffer for a new
+    // kernel rather than overwriting one in place.
+    if (stage->spirv && stage->kernel_va == va) {
+        stage->enabled = true;
+        return;
+    }
+
     rvvm_info("(kind: %u) Kernel start address: 0x%lx", kind, addr_kernel);
-    xe2_dma_addr_t kernel_dma = xe2_ppgtt_translate(xe2, pdp4, addr_kernel + addr_instr);
+    xe2_dma_addr_t kernel_dma = xe2_ppgtt_translate(xe2, pdp4, va);
     xe2_print_decompiled_shader(xe2, kernel_dma);
 
     uint32_t* spirv        = NULL;
     uint32_t  spirv_nwords = 0;
     xe2_brw_decode(xe2, kind, kernel_dma, &spirv, &spirv_nwords);
+    if (!spirv || !spirv_nwords) {
+        return;
+    }
 
-    xe2_3dstate_t* d3d = &ctx->d3d;
-    free(d3d->stage[kind].spirv);
-    d3d->stage[kind].spirv        = spirv;
-    d3d->stage[kind].spirv_nwords = spirv_nwords;
-    d3d->stage[kind].enabled      = true;
-    d3d->stage[kind].dirty        = true;
+    free(stage->spirv);
+    stage->spirv         = spirv;
+    stage->spirv_nwords  = spirv_nwords;
+    stage->kernel_va     = va;
+    stage->push_grf_base = xe2_push_const_grf_base(kind);
+    stage->enabled       = true;
+    stage->dirty         = true;
 }
 
-static int xe2_constant_cmd_to_stage(uint32_t cmd)
+static xe2_shader_kind_t xe2_constant_cmd_to_stage(uint32_t cmd)
 {
     switch (cmd) {
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_VS:
@@ -3726,11 +3636,111 @@ static int xe2_constant_cmd_to_stage(uint32_t cmd)
             return XE2_SHADER_PS;
         default:
             rvvm_fatal("Unknown 3DSTATE shader kind: %u", cmd);
-            return 0;
+            return XE2_SHADER_VS;
     }
 }
 
-static void xe2_3dprimitive(xe2_submit_ctx_t* ctx, uint32_t* cmd)
+// Reads a constant buffer's contents out of guest memory into the
+// stage's gathered payload, at the offset the hardware would have
+// placed it. Returns the number of bytes taken.
+static uint32_t xe2_const_buffer_fetch(xe2_dev_t* xe2, rvvm_addr_t pdp4, const xe2_const_buffer_t* buf,
+                                       uint8_t* dst, uint32_t space)
+{
+    uint32_t nbytes = buf->read_length * XE2_CONST_CHUNK_BYTES;
+    if (!buf->va || !nbytes) {
+        return 0;
+    }
+    if (nbytes > space) {
+        rvvm_warn("Constant buffer truncated: %u of %u bytes fit", space, nbytes);
+        nbytes = space;
+    }
+
+    xe2_dma_addr_t dma = xe2_ppgtt_translate(xe2, pdp4, buf->va);
+    if (!dma.addr) {
+        rvvm_warn("Failed to translate constant buffer address 0x%" PRIx64, buf->va);
+        return 0;
+    }
+    xe2_dma_read_bytes(xe2, dma, dst, nbytes);
+    return nbytes;
+}
+
+// 3DSTATE_CONSTANT_XS handler: decode the four buffers the command
+// programs, then gather their contents into the stage's payload - the
+// same byte image the hardware would push into the thread's GRFs, and
+// the one the cross-compiled shader reads through its uniform block.
+static void xe2_3dstate_constant(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_shader_kind_t kind, rvvm_addr_t pdp4,
+                                 const uint32_t* cmd)
+{
+    xe2_push_const_t* consts = &ctx->d3d.consts[kind];
+
+    xe2_const_body_decode(cmd, consts);
+
+    uint32_t off      = 0;
+    uint32_t gathered = 0;
+    for (uint32_t i = 0; i < XE2_CONST_BUFFERS; ++i) {
+        uint32_t taken = xe2_const_buffer_fetch(xe2, pdp4, &consts->buffer[i], consts->payload + off,
+                                                XE2_CONST_MAX_BYTES - off);
+        off            += taken;
+        gathered       += taken ? 1 : 0;
+    }
+    // Stale bytes from a previous, larger payload would otherwise leak
+    // into the uniform block the shader reads.
+    memset(consts->payload + off, 0, XE2_CONST_MAX_BYTES - off);
+
+    consts->nbytes = off;
+    consts->dirty  = true;
+
+    rvvm_info("(kind: %u) Pushed constants: %u bytes from %u buffer(s)", kind, off, gathered);
+    for (uint32_t i = 0; i < off / 4 && i < 16; ++i) {
+        uint32_t dw = read_uint32_le(consts->payload + i * 4);
+        float    f;
+        memcpy(&f, &dw, sizeof(f));
+        rvvm_info("  c[%u][%u] = 0x%08x (%f)", i / 4, i % 4, dw, (double)f);
+    }
+}
+
+// The stages the graphics pipeline can carry, in pipeline order. The
+// compute stage has no place in a draw, so it is not in this table.
+static const struct {
+    xe2_shader_kind_t  xe2;
+    gpu_vulkan_stage_t vk;
+} xe2_draw_stages[] = {
+    {XE2_SHADER_VS, GPU_VULKAN_STAGE_VERTEX},   {XE2_SHADER_HS, GPU_VULKAN_STAGE_TESS_CTRL},
+    {XE2_SHADER_DS, GPU_VULKAN_STAGE_TESS_EVAL}, {XE2_SHADER_GS, GPU_VULKAN_STAGE_GEOMETRY},
+    {XE2_SHADER_PS, GPU_VULKAN_STAGE_FRAGMENT},
+};
+
+// 3D_PRIM_TOPOLOGY_TYPE -> VkPrimitiveTopology. Only the topologies with
+// a direct Vulkan counterpart are translated; adjacency and patch lists
+// fall back to a triangle list.
+static uint32_t xe2_topology_to_vulkan(uint32_t topology)
+{
+    switch (topology) {
+        case 0x01:
+            return GPU_VULKAN_TOPOLOGY_POINT_LIST;
+        case 0x02:
+            return GPU_VULKAN_TOPOLOGY_LINE_LIST;
+        case 0x03:
+            return GPU_VULKAN_TOPOLOGY_LINE_STRIP;
+        case 0x05:
+            return GPU_VULKAN_TOPOLOGY_TRIANGLE_STRIP;
+        case 0x06:
+            return GPU_VULKAN_TOPOLOGY_TRIANGLE_FAN;
+        case 0x04:
+        default:
+            return GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST;
+    }
+}
+
+// Turn the accumulated 3D state into a draw for the Vulkan backend.
+//
+// Vertex attributes are not wired yet: a cross-compiled kernel reads its
+// varyings out of the URB payload registers, which the register model
+// does not reproduce, so vertex buffers and vertex element descriptions
+// have no consumer. Constants do have one - that is the path this
+// submits, and what a kernel computes from them is what ends up on
+// screen.
+static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd)
 {
     bool     indexed        = (cmd[1] >> 8) & 1; // VertexAccessType
     uint32_t vertex_count   = cmd[2];
@@ -3744,45 +3754,62 @@ static void xe2_3dprimitive(xe2_submit_ctx_t* ctx, uint32_t* cmd)
     rvvm_info("%s: instance_count: %u", __FUNCTION__, instance_count);
     rvvm_info("%s: start_instance: %u", __FUNCTION__, start_instance);
     rvvm_info("%s: base_vertex:    %u", __FUNCTION__, base_vertex);
+    if (indexed) {
+        rvvm_info("%s: indexed draws are not translated yet", __FUNCTION__);
+    }
 
     xe2_3dstate_t* d3d = &ctx->d3d;
 
-    // 1. Resolve/build the VkPipeline for the current dirty state (cached
-    //    by a hash of: enabled stage SPIR-V blobs, vertex input layout,
-    //    topology, raster/blend/depth-stencil dwords). Only rebuilds when
-    //    something in that set actually changed since last draw.
-    // VkPipeline pipeline = gpu_vulkan_resolve_pipeline(xe2->vulkan_ctx, d3d);
+    xe2_draw_params_t params = {
+        .topology       = xe2_topology_to_vulkan(d3d->vertex_input.topology),
+        .vertex_count   = vertex_count,
+        .instance_count = instance_count ? instance_count : 1,
+        .first_vertex   = start_vertex,
+        .first_instance = start_instance,
+    };
 
-    // 2. Push constants: one vkCmdPushConstants per dirty, enabled stage.
-    for (int s = 0; s < XE2_SHADER_STAGE_COUNT; ++s) {
-        if (d3d->stage[s].enabled && d3d->push_constants[s].nbytes) {
-            rvvm_info("Push constant:");
-            for (uint64_t i = 0; i < d3d->push_constants[s].nbytes; ++i) {
-                rvvm_info("%x", d3d->push_constants[s].data[i]);
-            }
-            // gpu_vulkan_push_constants(xe2->vulkan_ctx, (xe2_shader_kind_t)s, d3d->push[s].data, d3d->push[s].nbytes);
+    // A batch that re-emits the same state and repeats the same draw
+    // gets the same picture; handing it over again would only re-copy
+    // every shader module for nothing.
+    if (!xe2_3dstate_dirty(d3d, &params)) {
+        return;
+    }
+
+    gpu_vulkan_draw_t draw = {
+        .topology       = params.topology,
+        .vertex_count   = params.vertex_count,
+        .instance_count = params.instance_count,
+        .first_vertex   = params.first_vertex,
+        .first_instance = params.first_instance,
+    };
+
+    for (size_t i = 0; i < STATIC_ARRAY_SIZE(xe2_draw_stages); ++i) {
+        xe2_shader_kind_t         kind   = xe2_draw_stages[i].xe2;
+        const xe2_shader_stage_t* stage  = &d3d->shader[kind];
+        const xe2_push_const_t*   consts = &d3d->consts[kind];
+
+        if (!stage->enabled || !stage->spirv) {
+            continue;
         }
+        draw.stage[xe2_draw_stages[i].vk] = (gpu_vulkan_stage_desc_t) {
+            .spirv        = stage->spirv,
+            .spirv_nwords = stage->spirv_nwords,
+            .constants    = consts->payload,
+            .const_bytes  = consts->nbytes,
+        };
     }
 
-    // 3. Descriptor sets from binding tables (SURFACE_STATE -> VkBuffer/VkImageView)
-    // gpu_vulkan_update_descriptors(xe2->vulkan_ctx, d3d);
-
-    // 4. Vertex buffers.
-    // gpu_vulkan_bind_vertex_buffers(xe2->vulkan_ctx, d3d->vb, d3d->vb_count);
-
-    // 5. Draw.
-    // if (indexed) {
-    //     gpu_vulkan_bind_index_buffer(xe2->vulkan_ctx, d3d->index_buf_addr, d3d->index_format);
-    //     gpu_vulkan_draw_indexed(xe2->vulkan_ctx, pipeline, vertex_count, instance_count, start_vertex, base_vertex,
-    //                             start_instance);
-    // } else {
-    //     gpu_vulkan_draw(xe2->vulkan_ctx, pipeline, vertex_count, instance_count, start_vertex, start_instance);
-    // }
-
-    for (int s = 0; s < XE2_SHADER_STAGE_COUNT; ++s) {
-        d3d->stage[s].dirty = false;
+    if (xe2->vulkan_ctx && !gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw)) {
+        rvvm_warn("%s: draw carries no usable shaders, skipped", __FUNCTION__);
     }
-    d3d->ff_state_dirty = false;
+
+    for (uint32_t s = 0; s < XE2_SHADER_STAGE_COUNT; ++s) {
+        d3d->shader[s].dirty = false;
+        d3d->consts[s].dirty = false;
+    }
+    d3d->ff_dirty        = false;
+    d3d->last_draw       = params;
+    d3d->last_draw_valid = true;
 }
 
 // The supplied ring DMA address is normalized such that the first dword is the
@@ -3833,10 +3860,15 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
                 xe2_addr_63_6_mask(cmd[8], cmd[9]),
             };
             bool addr_kernel_enable[] = {cmd[0] & 1, cmd[8] & 1};
+            bool any                  = false;
             for (size_t i = 0; i < STATIC_ARRAY_SIZE(addr_kernel); ++i) {
                 if (addr_kernel_enable[i]) {
                     xe2_decode_shader(xe2, ctx, XE2_SHADER_PS, pdp4, addr_kernel[i], ctx->addr_instr);
+                    any = true;
                 }
+            }
+            if (!any) {
+                ctx->d3d.shader[XE2_SHADER_PS].enabled = false;
             }
             break;
         }
@@ -3847,6 +3879,8 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
                 xe2_decode_shader(xe2, ctx, XE2_SHADER_VS, pdp4, addr_kernel, ctx->addr_instr);
+            } else {
+                ctx->d3d.shader[XE2_SHADER_VS].enabled = false;
             }
             break;
         }
@@ -3857,6 +3891,8 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
                 xe2_decode_shader(xe2, ctx, XE2_SHADER_GS, pdp4, addr_kernel, ctx->addr_instr);
+            } else {
+                ctx->d3d.shader[XE2_SHADER_GS].enabled = false;
             }
             break;
         }
@@ -3867,6 +3903,8 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[3], cmd[4]);
                 xe2_decode_shader(xe2, ctx, XE2_SHADER_HS, pdp4, addr_kernel, ctx->addr_instr);
+            } else {
+                ctx->d3d.shader[XE2_SHADER_HS].enabled = false;
             }
             break;
         }
@@ -3875,20 +3913,10 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_DS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_GS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_PS: {
-            xe2_shader_kind_t kind    = xe2_constant_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
-            uint32_t          cmd[11] = {0};
+            xe2_shader_kind_t kind                       = xe2_constant_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
+            uint32_t          cmd[XE2_CONST_CMD_DWORDS]  = {0};
             xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
-            // dwords 1-4: read lengths (11 bits each); dwords 5-10: 3x(hi,lo) buffer pointers.
-            // Only buffer 0 is relevant for GLSL-style push constants in practice.
-            uint32_t       len0   = cmd[1] & 0x7FF;
-            xe2_dma_addr_t buf0   = xe2_ppgtt_translate(xe2, pdp4, xe2_addr_63_6_mask(cmd[5], cmd[6]));
-            uint32_t       nbytes = len0 * 32; // length field is in 256-bit (32B) GRF units
-            if (nbytes > sizeof(ctx->d3d.push_constants[kind].data)) {
-                nbytes = sizeof(ctx->d3d.push_constants[kind].data);
-            }
-            xe2_dma_read_many(xe2, buf0, ctx->d3d.push_constants[kind].data, nbytes / 4);
-            ctx->d3d.push_constants[kind].nbytes = nbytes;
-            ctx->d3d.push_constants[kind].dirty  = true;
+            xe2_3dstate_constant(xe2, ctx, kind, pdp4, cmd);
             break;
         }
         // What the fuck is this?
@@ -3950,32 +3978,36 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
         //     buffer contents unavailable
         case XE2_GFXPIPE_CMD_3DSTATE_VERTEX_BUFFERS: {
             // VERTEX_BUFFER_STATE entries, 4 dwords each, repeated (len-1)/4 times.
-            uint32_t nentries = ((op & 0xFF) - 3) / 4; // header consumed 1 dword already
+            xe2_vertex_input_t* vi       = &ctx->d3d.vertex_input;
+            uint32_t            nentries = ((op & 0xFF) - 3) / 4; // header consumed 1 dword already
             for (uint32_t i = 0; i < nentries && i < XE2_SHADER_MAX_BINDINGS; ++i) {
                 uint32_t cmd[4] = {0};
                 xe2_dma_read_many(xe2, xe2_dma_offset(ring, (1 + i * 4) * 4), cmd, 4);
-                uint32_t binding                = (cmd[0] >> 26) & 0x3F;
-                ctx->d3d.vertex[binding].stride = (cmd[0] >> 0) & 0xFFF;
-                ctx->d3d.vertex[binding].addr   = xe2_ppgtt_translate(xe2, pdp4, xe2_addr_63_6_mask(cmd[1], cmd[2]));
-                ctx->d3d.vertex[binding].size   = cmd[3];
-                if (binding + 1 > ctx->d3d.vertex_count) {
-                    ctx->d3d.vertex_count = binding + 1;
+                uint32_t binding = (cmd[0] >> 26) & 0x3F;
+                if (binding >= XE2_SHADER_MAX_BINDINGS) {
+                    continue;
+                }
+                vi->buffer[binding].stride = (cmd[0] >> 0) & 0xFFF;
+                vi->buffer[binding].addr   = xe2_ppgtt_translate(xe2, pdp4, xe2_addr_63_6_mask(cmd[1], cmd[2]));
+                vi->buffer[binding].size   = cmd[3];
+                if (binding + 1 > vi->buffer_count) {
+                    vi->buffer_count = binding + 1;
                 }
             }
-            ctx->d3d.ff_state_dirty = true;
+            ctx->d3d.ff_dirty = true;
             break;
         }
         case XE2_GFXPIPE_CMD_3DSTATE_VF_TOPOLOGY: {
             uint32_t cmd[2] = {0};
             xe2_dma_read_many(xe2, ring, cmd, 2);
-            ctx->d3d.vf_topology    = cmd[1] & 0x3F; // PRIM_TOPOLOGY_TYPE enum
-            ctx->d3d.ff_state_dirty = true;
+            ctx->d3d.vertex_input.topology = cmd[1] & 0x3F; // PRIM_TOPOLOGY_TYPE enum
+            ctx->d3d.ff_dirty              = true;
             break;
         }
         case XE2_GFXPIPE_CMD_3DPRIMITIVE: {
             uint32_t cmd[7] = {0};
             xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
-            xe2_3dprimitive(ctx, cmd);
+            xe2_3dprimitive(xe2, ctx, cmd);
             break;
         }
         default:
