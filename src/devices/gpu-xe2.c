@@ -26,21 +26,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/utils.h>
 #include <util/vma_ops.h>
 
-// The uniform block a cross-compiled shader declares for its pushed
-// constants and the buffer the backend binds to it are the same object
-// seen from two sides, so their sizes have to agree.
-BUILD_ASSERT(XE2_CONST_MAX_BYTES == GPU_VULKAN_CONST_BYTES);
-BUILD_ASSERT(XE2_SHADER_CONST_SET == GPU_VULKAN_CONST_SET);
-
-// So do the binding numbers: the shader is compiled with its Xe2 stage
-// index as the binding, while the backend lays the descriptor set out by
-// Vulkan stage index. See xe2_draw_stages[] for the correspondence.
-BUILD_ASSERT((int)XE2_SHADER_VS == (int)GPU_VULKAN_STAGE_VERTEX);
-BUILD_ASSERT((int)XE2_SHADER_HS == (int)GPU_VULKAN_STAGE_TESS_CTRL);
-BUILD_ASSERT((int)XE2_SHADER_DS == (int)GPU_VULKAN_STAGE_TESS_EVAL);
-BUILD_ASSERT((int)XE2_SHADER_GS == (int)GPU_VULKAN_STAGE_GEOMETRY);
-BUILD_ASSERT((int)XE2_SHADER_PS == (int)GPU_VULKAN_STAGE_FRAGMENT);
-
 // Basic DRM programs and weston works with following
 // boot arguments:
 // - fbcon=map:0 xe.enable_dc=0 xe.enable_dsb=0 xe.disable_power_well=0
@@ -57,6 +42,22 @@ weston
 killall -9 Xorg
 INTEL_DEBUG=bat glmark2-es2-drm
 */
+
+
+// The uniform block a cross-compiled shader declares for its pushed
+// constants and the buffer the backend binds to it are the same object
+// seen from two sides, so their sizes have to agree.
+BUILD_ASSERT(XE2_CONST_MAX_BYTES == GPU_VULKAN_CONST_BYTES);
+BUILD_ASSERT(XE2_SHADER_CONST_SET == GPU_VULKAN_CONST_SET);
+
+// So do the binding numbers: the shader is compiled with its Xe2 stage
+// index as the binding, while the backend lays the descriptor set out by
+// Vulkan stage index. See xe2_draw_stages[] for the correspondence.
+BUILD_ASSERT((int)XE2_SHADER_VS == (int)GPU_VULKAN_STAGE_VERTEX);
+BUILD_ASSERT((int)XE2_SHADER_HS == (int)GPU_VULKAN_STAGE_TESS_CTRL);
+BUILD_ASSERT((int)XE2_SHADER_DS == (int)GPU_VULKAN_STAGE_TESS_EVAL);
+BUILD_ASSERT((int)XE2_SHADER_GS == (int)GPU_VULKAN_STAGE_GEOMETRY);
+BUILD_ASSERT((int)XE2_SHADER_PS == (int)GPU_VULKAN_STAGE_FRAGMENT);
 
 #define xe2_reg_genmask(h, l)                                              (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)                                            (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -1377,6 +1378,8 @@ typedef struct {
     gpu_vulkan_ctx_t* vulkan_ctx;
     xe2_spirv_ctx_t   spirv_ctx;
 
+    bool draw_submitted;
+
     // The DMC loader writes a per-firmware list of (register, value) pairs and
     // later verifies the registers read back those values. Shadow the two DMC
     // register windows so those writes stick. These hold no other state.
@@ -1471,7 +1474,11 @@ static void xe2_remove(rvvm_reg_dev_t* dev)
 
     // Tear the renderer down first: it owns a worker thread that blits
     // into the framebuffer memory freed further down.
+    //
+    // BUG: Corrupted synchronization, render is hangs in
+    // "in progress state" while destroyed.
     gpu_vulkan_destroy(xe2->vulkan_ctx);
+
     xe2->vulkan_ctx = NULL;
 
     for (size_t i = 0; i < XE2_MAX_CONTEXTS; ++i) {
@@ -1600,12 +1607,8 @@ static void xe2_scanout(xe2_dev_t* xe2)
         return;
     }
 
-    // As Vulkan is still WIP, we could set this static flag to test it.
-    // When set to true, hardcoded Vulkan shader is rendered. The whole
-    // process takes way too much time and RVVM freezes heavily.
-    bool rendering = true;
-
-    if (rendering) {
+    if (xe2->draw_submitted) {
+        // rvvm_info("Draw submitted, rendering frame");
         uint32_t   out_width  = 0U;
         uint32_t   out_height = 0U;
         uint32_t   out_stride = 0U;
@@ -1897,7 +1900,6 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         return (xe2_dma_addr_t) {0};
     }
 
-    rvvm_info("PTE page: 0x%llx", (pte & ~0xFFFULL) + offset);
     return (xe2_dma_addr_t) {
         .addr = (pte & ~0xFFFULL) + offset,
         .type = (pte & (1 << 11)) ? XE2_MEM_LMEM : XE2_MEM_SMEM,
@@ -3479,7 +3481,7 @@ static inline uint32_t xe2_process_batch_buffer(xe2_dev_t* xe2, xe2_submit_ctx_t
 static inline uint32_t xe2_mi_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring, rvvm_addr_t pdp4,
                                   uint32_t op, bool* user_int)
 {
-    rvvm_info("MI opcode: 0x%x", XE2_MI_OPCODE(op));
+    // rvvm_info("MI opcode: 0x%x", XE2_MI_OPCODE(op));
 
     switch (XE2_MI_OPCODE(op)) {
         case XE2_MI_OP_NOOP:
@@ -3643,8 +3645,8 @@ static xe2_shader_kind_t xe2_constant_cmd_to_stage(uint32_t cmd)
 // Reads a constant buffer's contents out of guest memory into the
 // stage's gathered payload, at the offset the hardware would have
 // placed it. Returns the number of bytes taken.
-static uint32_t xe2_const_buffer_fetch(xe2_dev_t* xe2, rvvm_addr_t pdp4, const xe2_const_buffer_t* buf,
-                                       uint8_t* dst, uint32_t space)
+static uint32_t xe2_const_buffer_fetch(xe2_dev_t* xe2, rvvm_addr_t pdp4, const xe2_const_buffer_t* buf, uint8_t* dst,
+                                       uint32_t space)
 {
     uint32_t nbytes = buf->read_length * XE2_CONST_CHUNK_BYTES;
     if (!buf->va || !nbytes) {
@@ -3678,10 +3680,10 @@ static void xe2_3dstate_constant(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_shad
     uint32_t off      = 0;
     uint32_t gathered = 0;
     for (uint32_t i = 0; i < XE2_CONST_BUFFERS; ++i) {
-        uint32_t taken = xe2_const_buffer_fetch(xe2, pdp4, &consts->buffer[i], consts->payload + off,
-                                                XE2_CONST_MAX_BYTES - off);
-        off            += taken;
-        gathered       += taken ? 1 : 0;
+        uint32_t taken
+            = xe2_const_buffer_fetch(xe2, pdp4, &consts->buffer[i], consts->payload + off, XE2_CONST_MAX_BYTES - off);
+        off      += taken;
+        gathered += taken ? 1 : 0;
     }
     // Stale bytes from a previous, larger payload would otherwise leak
     // into the uniform block the shader reads.
@@ -3705,9 +3707,11 @@ static const struct {
     xe2_shader_kind_t  xe2;
     gpu_vulkan_stage_t vk;
 } xe2_draw_stages[] = {
-    {XE2_SHADER_VS, GPU_VULKAN_STAGE_VERTEX},   {XE2_SHADER_HS, GPU_VULKAN_STAGE_TESS_CTRL},
-    {XE2_SHADER_DS, GPU_VULKAN_STAGE_TESS_EVAL}, {XE2_SHADER_GS, GPU_VULKAN_STAGE_GEOMETRY},
-    {XE2_SHADER_PS, GPU_VULKAN_STAGE_FRAGMENT},
+    {XE2_SHADER_VS,    GPU_VULKAN_STAGE_VERTEX},
+    {XE2_SHADER_HS, GPU_VULKAN_STAGE_TESS_CTRL},
+    {XE2_SHADER_DS, GPU_VULKAN_STAGE_TESS_EVAL},
+    {XE2_SHADER_GS,  GPU_VULKAN_STAGE_GEOMETRY},
+    {XE2_SHADER_PS,  GPU_VULKAN_STAGE_FRAGMENT},
 };
 
 // 3D_PRIM_TOPOLOGY_TYPE -> VkPrimitiveTopology. Only the topologies with
@@ -3788,6 +3792,8 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
         const xe2_shader_stage_t* stage  = &d3d->shader[kind];
         const xe2_push_const_t*   consts = &d3d->consts[kind];
 
+        rvvm_info("%s: Write stage (vertex? %d, spirv: %p, words: %u)", __FUNCTION__, kind == XE2_SHADER_VS,
+                  stage->spirv, stage->spirv_nwords);
         if (!stage->enabled || !stage->spirv) {
             continue;
         }
@@ -3797,7 +3803,12 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
             .constants    = consts->payload,
             .const_bytes  = consts->nbytes,
         };
+        rvvm_info("%s: Write stage (Vulkan vertex? %d)", __FUNCTION__,
+                  xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX);
     }
+
+    rvvm_info("%s: Submit vertex stage (spirv: %p, words: %u)", __FUNCTION__, draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv,
+              draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords);
 
     if (xe2->vulkan_ctx && !gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw)) {
         rvvm_warn("%s: draw carries no usable shaders, skipped", __FUNCTION__);
@@ -3810,6 +3821,7 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
     d3d->ff_dirty        = false;
     d3d->last_draw       = params;
     d3d->last_draw_valid = true;
+    xe2->draw_submitted  = true;
 }
 
 // The supplied ring DMA address is normalized such that the first dword is the
@@ -3817,12 +3829,12 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
 static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring,
                                             rvvm_addr_t pdp4, uint32_t op)
 {
-    rvvm_info("GFX command (%02x, %02x)", XE2_GFXPIPE_OPCODE(op), XE2_GFXPIPE_SUBOPCODE(op));
+    // rvvm_info("GFX command (%02x, %02x)", XE2_GFXPIPE_OPCODE(op), XE2_GFXPIPE_SUBOPCODE(op));
 
-    uint32_t len = (op & 0xFF) + 2;
-    for (uint32_t dump = 0; dump < len; ++dump) {
-        rvvm_info("  [%2u]: 0x%08x", dump, xe2_dma_read_32(xe2, ring, dump * 4));
-    }
+    // uint32_t len = (op & 0xFF) + 2;
+    // for (uint32_t dump = 0; dump < len; ++dump) {
+    //     rvvm_info("  [%2u]: 0x%08x", dump, xe2_dma_read_32(xe2, ring, dump * 4));
+    // }
 
     switch (XE2_GFXPIPE_OPCODES_MASKED(op)) {
         case XE2_GFXPIPE_CMD_PIPE_CONTROL: {
@@ -3908,74 +3920,18 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             }
             break;
         }
+        // Unused in glmark2-es2-drm.
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_VS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_HS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_DS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_GS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_PS: {
-            xe2_shader_kind_t kind                       = xe2_constant_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
-            uint32_t          cmd[XE2_CONST_CMD_DWORDS]  = {0};
+            xe2_shader_kind_t kind                      = xe2_constant_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
+            uint32_t          cmd[XE2_CONST_CMD_DWORDS] = {0};
             xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
             xe2_3dstate_constant(xe2, ctx, kind, pdp4, cmd);
             break;
         }
-        // What the fuck is this?
-        //
-        //  0xfffffffefff755e0:  0x78080007:  3DSTATE_VERTEX_BUFFERS
-        //   0xfffffffefff755e0:  0x78080007 : Dword 0
-        //       DWord Length: 7
-        //   0xfffffffefff755e4:  0x0202400c : Dword 1
-        //   0xfffffffefff755e8:  0xfea00080 : Dword 2
-        //   0xfffffffefff755ec:  0xfffffffe : Dword 3
-        //   0xfffffffefff755f0:  0x00000024 : Dword 4
-        //       Vertex Buffer State[0]: <struct VERTEX_BUFFER_STATE>
-        //   0xfffffffefff755e4:  0x0202400c : Dword 0
-        //       Buffer Pitch: 12
-        //       Null Vertex Buffer: false
-        //       Address Modify Enable: true
-        //       MOCS: 2
-        //       L3 Bypass Disable: true
-        //       Vertex Buffer Index: 0
-        //   0xfffffffefff755e8:  0xfea00080 : Dword 1
-        //   0xfffffffefff755ec:  0xfffffffe : Dword 2
-        //       Buffer Starting Address: 0xfffffffefea00080
-        //   0xfffffffefff755f0:  0x00000024 : Dword 3
-        //       Buffer Size: 36
-        //   0xfffffffefff755f4:  0x06024000 : Dword 5
-        //   0xfffffffefff755f8:  0xfea000c0 : Dword 6
-        //   0xfffffffefff755fc:  0xfffffffe : Dword 7
-        //   0xfffffffefff75600:  0x00000020 : Dword 8
-        //       Vertex Buffer State[1]: <struct VERTEX_BUFFER_STATE>
-        //   0xfffffffefff755f4:  0x06024000 : Dword 0
-        //       Buffer Pitch: 0
-        //       Null Vertex Buffer: false
-        //       Address Modify Enable: true
-        //       MOCS: 2
-        //       L3 Bypass Disable: true
-        //       Vertex Buffer Index: 1
-        //   0xfffffffefff755f8:  0xfea000c0 : Dword 1
-        //   0xfffffffefff755fc:  0xfffffffe : Dword 2
-        //       Buffer Starting Address: 0xfffffffefea000c0
-        //   0xfffffffefff75600:  0x00000020 : Dword 3
-        //       Buffer Size: 32
-        //   vertex buffer 0, size 36
-        //     buffer contents unavailable
-        //   vertex buffer 0, size 36
-        //     buffer contents unavailable
-        //   vertex buffer 0, size 36
-        //     buffer contents unavailable
-        //   vertex buffer 0, size 36
-        //     buffer contents unavailable
-        //   vertex buffer 0, size 36
-        //     buffer contents unavailable
-        //   vertex buffer 0, size 36
-        //     buffer contents unavailable
-        //   vertex buffer 1, size 36
-        //     buffer contents unavailable
-        //   vertex buffer 1, size 36
-        //     buffer contents unavailable
-        //   vertex buffer 1, size 32
-        //     buffer contents unavailable
         case XE2_GFXPIPE_CMD_3DSTATE_VERTEX_BUFFERS: {
             // VERTEX_BUFFER_STATE entries, 4 dwords each, repeated (len-1)/4 times.
             xe2_vertex_input_t* vi       = &ctx->d3d.vertex_input;
@@ -4075,8 +4031,8 @@ static bool xe2_ring_replay(xe2_dev_t* xe2, uint32_t context_idx)
 
     for (uint32_t guard = 0; i != end && guard < ring_dw; guard++) {
         uint32_t op = xe2_dma_read_32(xe2, ring, i * 4);
-        rvvm_info("(GGTT) Dequeued opcode: 0x%x, instruction type: 0x%x, size %u/%u", op, XE2_INSTR_TYPE(op), guard,
-                  ring_dw);
+        // rvvm_info("(GGTT) Dequeued opcode: 0x%x, instruction type: 0x%x, size %u/%u", op, XE2_INSTR_TYPE(op), guard,
+        //           ring_dw);
 
         // How many bytes was consumed by incoming command. That far we
         // will go over the buffer in the next iteration.
@@ -4307,6 +4263,12 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
                 // This called only when context was not registered yet.
                 uint32_t done[2] = {msg[1], msg[2]};
                 rvvm_info("GuC SCHED_CONTEXT_MODE_SET: %s", msg[2] ? "enable" : "disable");
+                if (!msg[2]) {
+                    // FIXME: Temporary solution to disable Vulkan rendering. I guess,
+                    //        stop condition for rendering path is absence of GPU
+                    //        submission buffers, that would be handled somewhere else.
+                    xe2->draw_submitted = 0;
+                }
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
                 break;
             }

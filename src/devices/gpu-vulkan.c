@@ -8,8 +8,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
 #include "gpu-vulkan.h"
-#include "__vulkan_snippet_frag.h"
-#include "__vulkan_snippet_vert.h"
 #include <rvvm/rvvm_fb.h>
 #include <util/atomics.h>
 #include <util/compiler.h>
@@ -444,14 +442,11 @@ static VkPipeline gpu_vulkan_build_pipeline(gpu_vulkan_ctx_t* ctx, const VkPipel
         .viewportCount = 1,
         .scissorCount  = 1,
     };
-    VkDynamicState dynamic_states[2] = {
-        VK_DYNAMIC_STATE_VIEWPORT,
-        VK_DYNAMIC_STATE_SCISSOR,
-    };
-    VkPipelineDynamicStateCreateInfo dynamic_state = {
-        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
-        .pDynamicStates    = dynamic_states,
+    VkDynamicState                   dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic_state     = {
+            .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .dynamicStateCount = 2,
+            .pDynamicStates    = dynamic_states,
     };
 
     VkPipelineRasterizationStateCreateInfo rasterizer = {
@@ -495,56 +490,6 @@ static VkPipeline gpu_vulkan_build_pipeline(gpu_vulkan_ctx_t* ctx, const VkPipel
 
 fail:
     return VK_NULL_HANDLE;
-}
-
-// The scene drawn until the guest submits one of its own: a triangle
-// from the built-in shader snippets. Keeping it means the display shows
-// something during boot, long before the guest touches the 3D pipeline.
-static bool gpu_vulkan_create_fallback_pipeline(gpu_vulkan_ctx_t* ctx)
-{
-    VkShaderModuleCreateInfo vertex_ci = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof(xe2_vert_spv),
-        .pCode    = xe2_vert_spv,
-    };
-    VkShaderModuleCreateInfo fragment_ci = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof(xe2_frag_spv),
-        .pCode    = xe2_frag_spv,
-    };
-    VkShaderModule vertex_module   = VK_NULL_HANDLE;
-    VkShaderModule fragment_module = VK_NULL_HANDLE;
-    VK_TRY(vkCreateShaderModule(ctx->device, &vertex_ci, NULL, &vertex_module));
-    VK_TRY(vkCreateShaderModule(ctx->device, &fragment_ci, NULL, &fragment_module));
-
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {
-         .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-         .module = vertex_module,
-         .pName  = "main",
-         },
-        {
-         .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .module = fragment_module,
-         .pName  = "main",
-         },
-    };
-    ctx->pipeline = gpu_vulkan_build_pipeline(ctx, stages, 2, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-
-    vkDestroyShaderModule(ctx->device, fragment_module, NULL);
-    vkDestroyShaderModule(ctx->device, vertex_module, NULL);
-    return ctx->pipeline != VK_NULL_HANDLE;
-
-fail:
-    if (fragment_module) {
-        vkDestroyShaderModule(ctx->device, fragment_module, NULL);
-    }
-    if (vertex_module) {
-        vkDestroyShaderModule(ctx->device, vertex_module, NULL);
-    }
-    return false;
 }
 
 // Identity of a scene as far as pipeline construction is concerned:
@@ -642,11 +587,13 @@ static void gpu_vulkan_scene_free(gpu_vulkan_scene_t* scene)
 bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw)
 {
     if (unlikely(!ctx || !draw || atomic_load_uint8_relax(&ctx->shutting_down))) {
+        rvvm_warn("%s: invariant", __FUNCTION__);
         return false;
     }
     // Every graphics pipeline needs a vertex shader; without one there
     // is nothing to build the scene around.
     if (!draw->stage[GPU_VULKAN_STAGE_VERTEX].spirv || !draw->stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords) {
+        rvvm_warn("%s: No SPIR-V", __FUNCTION__);
         return false;
     }
 
@@ -667,6 +614,8 @@ bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw
             scene.spirv[s] = safe_malloc(size);
             memcpy(scene.spirv[s], desc->spirv, size);
             scene.spirv_nwords[s] = desc->spirv_nwords;
+            rvvm_info("Set up submitted SPIR-V: %08x %08x %08x %08x", scene.spirv[s][0], scene.spirv[s][1],
+                      scene.spirv[s][2], scene.spirv[s][3]);
         }
         if (desc->constants && desc->const_bytes) {
             uint32_t nbytes = (desc->const_bytes > GPU_VULKAN_CONST_BYTES) ? GPU_VULKAN_CONST_BYTES : desc->const_bytes;
@@ -721,9 +670,7 @@ static bool gpu_vulkan_create_command_and_sync(gpu_vulkan_ctx_t* ctx)
     };
     VK_TRY(vkAllocateCommandBuffers(ctx->device, &alloc_info, &ctx->command_buffer));
 
-    VkFenceCreateInfo fence_ci = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-    };
+    VkFenceCreateInfo fence_ci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VK_TRY(vkCreateFence(ctx->device, &fence_ci, NULL, &ctx->fence));
     return true;
 fail:
@@ -803,6 +750,7 @@ void gpu_vulkan_destroy(gpu_vulkan_ctx_t* ctx)
 
     // Stop accepting new work and wait for any in-flight page-flip task.
     atomic_store_uint8_relax(&ctx->shutting_down, 1);
+    rvvm_info("Vulkan requested to stop");
     while (atomic_load_uint8_relax(&ctx->render_in_progress)) {
         // Worker will clear the flag after its fence wait (or immediately
         // if it sees shutting_down before submit). Short spin is fine;
@@ -1014,9 +962,6 @@ static bool gpu_vulkan_reconfigure(gpu_vulkan_ctx_t* ctx, uint32_t w, uint32_t h
         if (!gpu_vulkan_create_render_pass(ctx, vk_format)) {
             return false;
         }
-        if (!gpu_vulkan_create_fallback_pipeline(ctx)) {
-            return false;
-        }
     }
 
     VkDeviceSize buf_size
@@ -1118,6 +1063,8 @@ static void* gpu_vulkan_render_task(void* arg)
     rvvm_rgb_t        format   = ctx->requested_format;
     uint8_t*          dst      = ctx->requested_dst;
     size_t            dst_size = ctx->requested_dst_size;
+
+    rvvm_info("Vulkan render task");
 
     if (atomic_load_uint8_relax(&ctx->shutting_down) || width == 0 || height == 0) {
         goto done;
@@ -1269,6 +1216,7 @@ static void* gpu_vulkan_render_task(void* arg)
 
 done:
     atomic_store_uint8_relax(&ctx->render_in_progress, 0);
+    rvvm_info("%s: render_in_progress: %u", __FUNCTION__, atomic_load_uint8_relax(&ctx->render_in_progress));
     return NULL;
 }
 
@@ -1299,6 +1247,7 @@ bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t* ctx, uint32_t width, uint32_t hei
     // This keeps at most one in-flight task, and guarantees the GUI
     // thread is never the one doing the work, no matter how slow the
     // blit is.
+    rvvm_info("%s: render_in_progress: %u", __FUNCTION__, atomic_load_uint8_relax(&ctx->render_in_progress));
     if (atomic_cas_uint8(&ctx->render_in_progress, 0, 1)) {
         thread_create_task(gpu_vulkan_render_task, ctx);
     }
