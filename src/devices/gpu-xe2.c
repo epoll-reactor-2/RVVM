@@ -9,8 +9,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <devices/gpu-vulkan-spirv.h>
 #include <devices/gpu-vulkan.h>
-#include <devices/gpu-xe2-3dstate.h>
-#include <devices/gpu-xe2-shader.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <rvvm/rvvm_board.h>
@@ -42,22 +40,6 @@ weston
 killall -9 Xorg
 INTEL_DEBUG=bat glmark2-es2-drm
 */
-
-
-// The uniform block a cross-compiled shader declares for its pushed
-// constants and the buffer the backend binds to it are the same object
-// seen from two sides, so their sizes have to agree.
-BUILD_ASSERT(XE2_CONST_MAX_BYTES == GPU_VULKAN_CONST_BYTES);
-BUILD_ASSERT(XE2_SHADER_CONST_SET == GPU_VULKAN_CONST_SET);
-
-// So do the binding numbers: the shader is compiled with its Xe2 stage
-// index as the binding, while the backend lays the descriptor set out by
-// Vulkan stage index. See xe2_draw_stages[] for the correspondence.
-BUILD_ASSERT((int)XE2_SHADER_VS == (int)GPU_VULKAN_STAGE_VERTEX);
-BUILD_ASSERT((int)XE2_SHADER_HS == (int)GPU_VULKAN_STAGE_TESS_CTRL);
-BUILD_ASSERT((int)XE2_SHADER_DS == (int)GPU_VULKAN_STAGE_TESS_EVAL);
-BUILD_ASSERT((int)XE2_SHADER_GS == (int)GPU_VULKAN_STAGE_GEOMETRY);
-BUILD_ASSERT((int)XE2_SHADER_PS == (int)GPU_VULKAN_STAGE_FRAGMENT);
 
 #define xe2_reg_genmask(h, l)                                              (((~0U) << (l)) & (~0U >> (31 - (h))))
 #define xe2_reg_genmask64(h, l)                                            (((~0ULL) << (l)) & (~0ULL >> (63 - (h))))
@@ -1214,6 +1196,14 @@ typedef struct {
     uint16_t sram_rd_addr;  // Latched SRAM read address.
 } xe2_cx0_lane_t;
 
+#define XE2_MEM_SMEM 0 // System memory (accessed via DMA)
+#define XE2_MEM_LMEM 1 // Local memory (accessed via VRAM)
+
+typedef struct {
+    uint64_t addr;
+    uint8_t  type;
+} xe2_dma_addr_t;
+
 // Power-related registers. Used to handle
 // - PP  (Panel power)
 // - PCH (Panel controller hub)
@@ -1224,6 +1214,154 @@ typedef struct {
     uint32_t on_delays;
     uint32_t off_delays;
 } xe2_power_control_t;
+
+// The 3D pipeline state the command streamer accumulates between draws.
+// GFXPIPE commands mutate it, 3DPRIMITIVE consumes it. Everything here is
+// plain data decoded out of the ring - no Vulkan, no DMA, no device.
+//
+// State is scoped to the logical ring context (same as the STATE_BASE_ADDRESS
+// pointers), so xe2_3dstate_t lives on xe2_submit_ctx_t.
+typedef enum {
+    XE2_SHADER_VS = 0,
+    XE2_SHADER_HS,
+    XE2_SHADER_DS,
+    XE2_SHADER_GS,
+    XE2_SHADER_PS,
+    XE2_SHADER_CS,
+    XE2_SHADER_STAGE_COUNT
+} xe2_shader_kind_t;
+
+// Xe2 dispatches a thread with the constant buffer contents already
+// resident in its GRFs, right after the fixed payload registers. A Xe2
+// GRF is 64 bytes wide; the constant gather works in 32-byte chunks,
+// which is also the unit the Read Length fields are expressed in.
+#define XE2_GRF_BYTES         64
+#define XE2_GRF_DWORDS        (XE2_GRF_BYTES / 4)
+#define XE2_CONST_CHUNK_BYTES 32
+
+// -----------------------------------------------------------
+// Shader stages
+// -----------------------------------------------------------
+
+// A guest kernel cross-compiled to SPIR-V, plus the payload layout the
+// compilation assumed. Both are needed at draw time: the module goes
+// into a VkShaderModule, the layout tells the backend which constant
+// bytes the module expects to find at which binding.
+typedef struct {
+    uint32_t*   spirv; // Owned, from spirv_module_finish().
+    uint32_t    spirv_nwords;
+    rvvm_addr_t kernel_va;     // Kernel address the module was built from.
+    uint8_t     push_grf_base; // First GRF the module reads constants from.
+    bool        enabled;       // Stage enabled by its 3DSTATE_XS command.
+    bool        dirty;         // Kernel changed since the last draw.
+} xe2_shader_stage_t;
+
+// -----------------------------------------------------------
+// Vertex input (3DSTATE_VERTEX_BUFFERS / _ELEMENTS / _INDEX_BUFFER)
+// -----------------------------------------------------------
+
+#define XE2_SHADER_MAX_BINDINGS 16
+#define XE2_SHADER_MAX_GRF      128
+
+typedef struct {
+    xe2_dma_addr_t addr;
+    uint32_t       stride;
+    uint32_t       size;
+} xe2_vertex_buffer_t;
+
+typedef struct {
+    uint32_t binding;
+    uint32_t format; // SURFACE_FORMAT enum -> VkFormat
+    uint32_t offset;
+    uint32_t location; // Shader input location.
+} xe2_vertex_element_t;
+
+typedef struct {
+    xe2_vertex_buffer_t buffer[XE2_SHADER_MAX_BINDINGS];
+    uint32_t            buffer_count;
+    uint32_t            topology; // 3DSTATE_VF_TOPOLOGY -> VkPrimitiveTopology
+
+    // Not decoded by any command handler yet: element descriptions come
+    // from 3DSTATE_VERTEX_ELEMENTS and the index buffer from
+    // 3DSTATE_INDEX_BUFFER, neither of which has a consumer while
+    // attribute fetch is unimplemented.
+    xe2_vertex_element_t element[XE2_SHADER_MAX_BINDINGS];
+    uint32_t             element_count;
+    xe2_dma_addr_t       index_addr;
+    uint32_t             index_format; // 0=BYTE, 1=WORD, 2=DWORD -> VkIndexType
+    bool                 index_valid;
+} xe2_vertex_input_t;
+
+// -----------------------------------------------------------
+// Fixed function
+// -----------------------------------------------------------
+
+// Raw command dwords, kept for whoever decodes them first. Nothing
+// populates these yet; the pipeline the backend builds is fixed.
+typedef struct {
+    uint32_t raster[4];        // 3DSTATE_RASTER
+    uint32_t blend[4];         // 3DSTATE_PS_BLEND
+    uint32_t depth_stencil[4]; // 3DSTATE_WM_DEPTH_STENCIL
+} xe2_ff_state_t;
+
+// -----------------------------------------------------------
+// Aggregate state
+// -----------------------------------------------------------
+
+// 3DSTATE_CONSTANT_BODY exposes four buffers per stage. The hardware
+// concatenates them, in index order, into the pushed GRF payload; Mesa
+// uses buffer 0 for the inline uniforms and buffers 1..3 for pushed UBO
+// ranges.
+#define XE2_CONST_BUFFERS    4
+#define XE2_CONST_MAX_VEC4   64
+#define XE2_CONST_MAX_DWORDS (XE2_CONST_MAX_VEC4 * 4)
+#define XE2_CONST_MAX_BYTES  (XE2_CONST_MAX_DWORDS * 4)
+
+// What a 3DPRIMITIVE asks for, on top of the state around it.
+typedef struct {
+    uint32_t topology;
+    uint32_t vertex_count;
+    uint32_t instance_count;
+    uint32_t first_vertex;
+    uint32_t first_instance;
+} xe2_draw_params_t;
+
+// One entry of 3DSTATE_CONSTANT_BODY.
+typedef struct {
+    rvvm_addr_t va;          // Buffer address, PPGTT virtual. 0 when unused.
+    uint32_t    read_length; // Length in 32-byte chunks, as programmed.
+} xe2_const_buffer_t;
+
+// Per-stage constant state: what the command stream programmed, plus the
+// payload we gathered out of guest memory for it.
+typedef struct {
+    xe2_const_buffer_t buffer[XE2_CONST_BUFFERS];
+
+    // Buffer contents concatenated in index order - the exact byte image
+    // the hardware would have pushed into the thread's GRFs.
+    uint8_t  payload[XE2_CONST_MAX_BYTES];
+    uint32_t nbytes;
+
+    bool dirty; // Payload changed since the last draw.
+} xe2_push_const_t;
+
+typedef struct {
+    xe2_shader_stage_t shader[XE2_SHADER_STAGE_COUNT];
+    xe2_push_const_t   consts[XE2_SHADER_STAGE_COUNT];
+
+    // 3DSTATE_BINDING_TABLE_POINTERS_XS, relative to the surface state
+    // base. Not populated yet - surface binding is unimplemented.
+    uint32_t binding_table_offset[XE2_SHADER_STAGE_COUNT];
+
+    xe2_vertex_input_t vertex_input;
+    xe2_ff_state_t     ff;
+    bool               ff_dirty;
+
+    // The draw last handed to the renderer. An identical draw against
+    // unchanged state does not need to be handed over again.
+    xe2_draw_params_t last_draw;
+    bool              last_draw_valid;
+} xe2_3dstate_t;
 
 // Registered submission contexts. A doorbell on the shared host-interrupt
 // register carries both CT messages and ring-work submissions; rather than
@@ -1320,6 +1458,37 @@ typedef struct {
 
     uint32_t dmc_base;
 } xe2_firmware_t;
+
+typedef struct {
+    spirv_module_t    mod;
+    xe2_shader_kind_t stage;
+
+    uint32_t void_ty;
+    uint32_t fn_ty;
+    uint32_t fty;  // float32
+    uint32_t v4ty; // vec4 float
+    uint32_t func;
+
+    // Register file. grf_var is filled lazily, grf_written tracks which
+    // registers the kernel has defined so far in program order.
+    uint32_t grf_var[XE2_SHADER_MAX_GRF];
+    bool     grf_written[XE2_SHADER_MAX_GRF];
+    uint32_t push_grf_base;
+
+    // Pushed constants, bound as a uniform block (see gpu-vulkan.h for
+    // the descriptor layout the backend builds to match).
+    uint32_t const_var;      // The block variable.
+    uint32_t const_elem_ptr; // Pointer to one float inside it.
+
+    uint32_t position_out; // BuiltIn Position (VS).
+    uint32_t color_out;    // Location 0 (PS).
+    bool     wrote_output;
+
+    uint32_t entry_iface[8];
+    size_t   entry_iface_n;
+
+    bool saw_eot;
+} xe2_spirv_ctx_t;
 
 typedef struct {
     rvvm_pci_func_t* pci_func;
@@ -2368,7 +2537,7 @@ static void xe2_guc_g2h_event(xe2_dev_t* xe2, uint32_t action, const uint32_t* p
 }
 
 // -----------------------------------------------------------
-// Intel BRW assembly
+// Intel BRW assembly -> SPIR-V translation
 // -----------------------------------------------------------
 
 
@@ -2939,6 +3108,236 @@ static forceinline uint32_t xe2_brw_parse_dst(const xe2_qword_t* qw)
     return xe2_brw_mask(qw, XE2_BRW_DST_REG_NR_LO, XE2_BRW_DST_REG_NR_HI);
 }
 
+// Module scaffolding for a guest kernel cross-compiled to SPIR-V: the
+// register file, the pushed constant block, the stage's inputs/outputs
+// and the entry point. The BRW instruction translation itself lives in
+// gpu-xe2.c and drives this through the load/store helpers below.
+//
+// Register model. A GRF is one Function-local float. That is a heavy
+// simplification of a 64-byte SIMD register, but it matches how the
+// instruction translation treats operands today, and it keeps the
+// constant binding below honest: what matters for constants is which
+// (register, subregister) pair a read names, and that is modelled
+// exactly.
+//
+// Constant binding. Xe2 dispatches a thread with the gathered constant
+// buffers already resident in the GRFs that follow the fixed payload
+// registers (see xe2_push_const_grf_base). A kernel therefore reads its
+// uniforms as plain register reads. We recover that: a read of a
+// register at or above the stage's push constant base that the kernel
+// has not written yet is a read of pushed constant data, and compiles
+// into a load from the uniform block. Registers the kernel wrote first
+// are its own temporaries and stay Function-local, so scratch use of
+// high registers keeps working.
+
+
+// Descriptor set/binding the pushed constants of a stage are bound at.
+// One set, one binding per stage, so a pipeline can carry the constants
+// of every stage at once without them colliding.
+#define XE2_SHADER_CONST_SET           0
+#define XE2_SHADER_CONST_BINDING(kind) ((uint32_t)(kind))
+
+static forceinline void xe2_spirv_add_iface(xe2_spirv_ctx_t* ctx, uint32_t var)
+{
+    // SPIR-V 1.3 entry points list Input and Output variables only;
+    // globals in other storage classes joined the interface in 1.4.
+    if (ctx->entry_iface_n < STATIC_ARRAY_SIZE(ctx->entry_iface)) {
+        ctx->entry_iface[ctx->entry_iface_n++] = var;
+    }
+}
+
+// Declares the stage's outputs. Inputs are not wired yet: the kernel
+// reads its varyings out of the URB payload registers, which we do not
+// model, so those reads resolve to undefined Function-locals.
+static forceinline void xe2_spirv_declare_io(xe2_spirv_ctx_t* ctx)
+{
+    uint32_t out_v4 = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_OUTPUT, ctx->v4ty);
+
+    if (ctx->stage == XE2_SHADER_PS) {
+        ctx->color_out = spirv_global_var(&ctx->mod, out_v4, SPIRV_STORAGE_CLASS_OUTPUT);
+        spirv_decorate_1(&ctx->mod, ctx->color_out, SPIRV_DECORATION_LOCATION, 0);
+        spirv_name(&ctx->mod, ctx->color_out, "out_color");
+        xe2_spirv_add_iface(ctx, ctx->color_out);
+    } else {
+        ctx->position_out = spirv_global_var(&ctx->mod, out_v4, SPIRV_STORAGE_CLASS_OUTPUT);
+        spirv_decorate_1(&ctx->mod, ctx->position_out, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
+        spirv_name(&ctx->mod, ctx->position_out, "out_position");
+        xe2_spirv_add_iface(ctx, ctx->position_out);
+    }
+}
+
+// First GRF holding pushed constants, per stage. r0 is the dispatch
+// header; the stage-specific payload registers follow it, and the
+// gathered constants come after those. These are the defaults for a
+// plain SIMD dispatch - they are copied into xe2_shader_stage_t at
+// compile time so a stage can later derive its own base from the real
+// dispatch state (3DSTATE_VS/PS payload fields) without touching the
+// SPIR-V emitter.
+//
+//   VS  r0 header, r1 URB handles          -> r2
+//   HS  r0 header, r1 URB handles, r2 ids  -> r3
+//   DS  r0 header, r1 URB handles          -> r2
+//   GS  r0 header, r1 URB handles          -> r2
+//   PS  r0 header, r1 barycentric setup    -> r2
+static inline uint32_t xe2_push_const_grf_base(xe2_shader_kind_t kind)
+{
+    switch (kind) {
+        case XE2_SHADER_HS:
+            return 3;
+        case XE2_SHADER_CS:
+            return 1;
+        default:
+            return 2;
+    }
+}
+
+// Starts a module for one kernel. Everything the translation needs is
+// live once this returns: base types, the constant block, the stage
+// outputs and an open entry function.
+static forceinline void xe2_spirv_begin(xe2_spirv_ctx_t* ctx, xe2_shader_kind_t stage)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->stage         = stage;
+    ctx->push_grf_base = xe2_push_const_grf_base(stage);
+
+    spirv_module_init(&ctx->mod);
+    spirv_module_begin(&ctx->mod);
+
+    ctx->void_ty = spirv_type_void(&ctx->mod);
+    ctx->fn_ty   = spirv_type_func_void(&ctx->mod);
+    ctx->fty     = spirv_type_float32(&ctx->mod);
+    ctx->v4ty    = spirv_type_vec4_float32(&ctx->mod);
+
+    ctx->const_var = spirv_uniform_vec4_array_block(&ctx->mod, XE2_CONST_MAX_VEC4, XE2_SHADER_CONST_SET,
+                                                    XE2_SHADER_CONST_BINDING(stage), &ctx->const_elem_ptr);
+    spirv_name(&ctx->mod, ctx->const_var, "xe2_constants");
+
+    xe2_spirv_declare_io(ctx);
+
+    ctx->func = spirv_func_begin(&ctx->mod, ctx->void_ty, ctx->fn_ty);
+}
+
+// Function-local backing store for a register, created on first use.
+static forceinline uint32_t xe2_spirv_grf(xe2_spirv_ctx_t* ctx, uint32_t grf)
+{
+    if (grf >= XE2_SHADER_MAX_GRF) {
+        grf = 0;
+    }
+    if (!ctx->grf_var[grf]) {
+        uint32_t pty      = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_FUNCTION, ctx->fty);
+        ctx->grf_var[grf] = spirv_local_var(&ctx->mod, pty);
+    }
+    return ctx->grf_var[grf];
+}
+
+// Dword offset into the gathered payload that a (GRF, subregister) pair
+// addresses. Only meaningful for registers at or above the stage's push
+// constant base; the caller checks that and the XE2_CONST_MAX_DWORDS
+// bound before using the result.
+static inline uint32_t xe2_const_dword_index(uint32_t grf, uint32_t subreg, uint32_t push_grf_base)
+{
+    return (grf - push_grf_base) * XE2_GRF_DWORDS + subreg;
+}
+
+// True when a read of this register names pushed constant data rather
+// than a value the kernel produced. See the binding note at the top.
+static forceinline bool xe2_spirv_grf_is_const(const xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg)
+{
+    if (grf >= XE2_SHADER_MAX_GRF || grf < ctx->push_grf_base || ctx->grf_written[grf]) {
+        return false;
+    }
+    return xe2_const_dword_index(grf, subreg, ctx->push_grf_base) < XE2_CONST_MAX_DWORDS;
+}
+
+// Loads one dword of pushed constant data as a float. The block is a
+// vec4 array, so the dword index splits into (element, component).
+static forceinline uint32_t xe2_spirv_load_const(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg)
+{
+    uint32_t dword      = xe2_const_dword_index(grf, subreg, ctx->push_grf_base);
+    uint32_t indices[3] = {
+        spirv_type_const_uint32(&ctx->mod, 0), // Block member 0: the array.
+        spirv_type_const_uint32(&ctx->mod, dword / 4),
+        spirv_type_const_uint32(&ctx->mod, dword % 4),
+    };
+    uint32_t ptr
+        = spirv_access_chain(&ctx->mod, ctx->const_elem_ptr, ctx->const_var, indices, STATIC_ARRAY_SIZE(indices));
+    return spirv_op_load(&ctx->mod, ctx->fty, ptr);
+}
+
+static forceinline uint32_t xe2_spirv_load_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg, bool neg, bool abs)
+{
+    uint32_t id = xe2_spirv_grf_is_const(ctx, grf, subreg)
+                    ? xe2_spirv_load_const(ctx, grf, subreg)
+                    : spirv_op_load(&ctx->mod, ctx->fty, xe2_spirv_grf(ctx, grf));
+    if (abs) {
+        id = spirv_ext_inst1(&ctx->mod, ctx->fty, SPIRV_GLSL_STD450_FABS, id);
+    }
+    if (neg) {
+        id = spirv_op_fneg(&ctx->mod, ctx->fty, id);
+    }
+    return id;
+}
+
+static forceinline void xe2_spirv_store_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t val)
+{
+    spirv_op_store(&ctx->mod, xe2_spirv_grf(ctx, grf), val);
+    if (grf < XE2_SHADER_MAX_GRF) {
+        ctx->grf_written[grf] = true;
+    }
+}
+
+// Reads four consecutive registers as a vec4. Used for the message
+// payload a kernel hands to the URB write / render target write.
+static forceinline uint32_t xe2_spirv_load_grf_vec4(xe2_spirv_ctx_t* ctx, uint32_t base, bool w_is_one)
+{
+    uint32_t x = xe2_spirv_load_grf(ctx, base + 0, 0, false, false);
+    uint32_t y = xe2_spirv_load_grf(ctx, base + 1, 0, false, false);
+    uint32_t z = xe2_spirv_load_grf(ctx, base + 2, 0, false, false);
+    uint32_t w
+        = w_is_one ? spirv_type_const_float32(&ctx->mod, 1.0f) : xe2_spirv_load_grf(ctx, base + 3, 0, false, false);
+    return spirv_composite_construct4(&ctx->mod, ctx->v4ty, x, y, z, w);
+}
+
+// Translates the kernel's output message into a store to the stage
+// output: a URB write becomes gl_Position, a render target write becomes
+// the colour attachment.
+static forceinline void xe2_spirv_emit_output(xe2_spirv_ctx_t* ctx, uint32_t payload_grf)
+{
+    if (ctx->stage == XE2_SHADER_PS && ctx->color_out) {
+        spirv_op_store(&ctx->mod, ctx->color_out, xe2_spirv_load_grf_vec4(ctx, payload_grf, false));
+        ctx->wrote_output = true;
+    } else if (ctx->stage != XE2_SHADER_PS && ctx->position_out) {
+        spirv_op_store(&ctx->mod, ctx->position_out, xe2_spirv_load_grf_vec4(ctx, payload_grf, true));
+        ctx->wrote_output = true;
+    }
+}
+
+// Closes the module and serializes it. A stage whose output message we
+// failed to recognise would otherwise leave gl_Position or the colour
+// attachment undefined, so give them a defined value instead - a black
+// pixel or a degenerate vertex is debuggable, garbage is not.
+static forceinline int xe2_spirv_finish(xe2_spirv_ctx_t* ctx, uint32_t** spirv, uint32_t* nwords)
+{
+    if (!ctx->wrote_output) {
+        uint32_t zero = spirv_type_const_float32(&ctx->mod, 0.0f);
+        uint32_t one  = spirv_type_const_float32(&ctx->mod, 1.0f);
+        uint32_t def  = spirv_composite_construct4(&ctx->mod, ctx->v4ty, zero, zero, zero, one);
+        spirv_op_store(&ctx->mod, ctx->stage == XE2_SHADER_PS ? ctx->color_out : ctx->position_out, def);
+    }
+
+    spirv_func_end(&ctx->mod);
+
+    uint32_t exec_model = (ctx->stage == XE2_SHADER_PS) ? SPIRV_EXECUTION_MODEL_FRAGMENT : SPIRV_EXECUTION_MODEL_VERTEX;
+    spirv_entry_point(&ctx->mod, exec_model, ctx->func, "main", ctx->entry_iface, ctx->entry_iface_n);
+    if (ctx->stage == XE2_SHADER_PS) {
+        spirv_exec_mode0(&ctx->mod, ctx->func, SPIRV_EXECUTION_MODE_ORIGIN_UPPER_LEFT);
+    }
+
+    int rc = spirv_module_finish(&ctx->mod, spirv, nwords);
+    spirv_module_free(&ctx->mod);
+    return rc;
+}
+
 static forceinline uint32_t xe2_spirv_load_operand(xe2_spirv_ctx_t* ctx, const xe2_brw_operand_t* op)
 {
     if (op->is_imm) {
@@ -3401,6 +3800,90 @@ static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_
     }
     rvvm_info("Vulkan shader: %p, %u dwords", (void*)*spirv, *spirv_nwords);
     xe2_write_spirv(*spirv, *spirv_nwords);
+}
+
+// -----------------------------------------------------------
+// Push constants (3DSTATE_CONSTANT_XS)
+// -----------------------------------------------------------
+
+
+
+// Upper bound on the gathered payload we mirror. Also the size of the
+// uniform block the cross-compiled shader declares and of the buffer
+// the Vulkan backend uploads, so all three agree by construction.
+#define XE2_CONST_MAX_VEC4   64
+#define XE2_CONST_MAX_DWORDS (XE2_CONST_MAX_VEC4 * 4)
+#define XE2_CONST_MAX_BYTES  (XE2_CONST_MAX_DWORDS * 4)
+
+// The uniform block a cross-compiled shader declares for its pushed
+// constants and the buffer the backend binds to it are the same object
+// seen from two sides, so their sizes have to agree.
+BUILD_ASSERT(XE2_CONST_MAX_BYTES == GPU_VULKAN_CONST_BYTES);
+BUILD_ASSERT(XE2_SHADER_CONST_SET == GPU_VULKAN_CONST_SET);
+
+// So do the binding numbers: the shader is compiled with its Xe2 stage
+// index as the binding, while the backend lays the descriptor set out by
+// Vulkan stage index. See xe2_draw_stages[] for the correspondence.
+BUILD_ASSERT((int)XE2_SHADER_VS == (int)GPU_VULKAN_STAGE_VERTEX);
+BUILD_ASSERT((int)XE2_SHADER_HS == (int)GPU_VULKAN_STAGE_TESS_CTRL);
+BUILD_ASSERT((int)XE2_SHADER_DS == (int)GPU_VULKAN_STAGE_TESS_EVAL);
+BUILD_ASSERT((int)XE2_SHADER_GS == (int)GPU_VULKAN_STAGE_GEOMETRY);
+BUILD_ASSERT((int)XE2_SHADER_PS == (int)GPU_VULKAN_STAGE_FRAGMENT);
+
+// Decode the four (read length, address) pairs of a 3DSTATE_CONSTANT_XS
+// command into the stage's constant state. cmd points at the command
+// header, so indices below are command dwords:
+//
+//   [0]      header
+//   [1]      Read Length[0] (15:0), Read Length[1] (31:16)
+//   [2]      Read Length[2] (15:0), Read Length[3] (31:16)
+//   [3..4]   Buffer[0], 64-bit, 32-byte aligned (bits 63:5)
+//   [5..6]   Buffer[1]
+//   [7..8]   Buffer[2]
+//   [9..10]  Buffer[3]
+//
+// Leaves the gathered payload alone - reading it needs DMA, which the
+// caller does in xe2_push_const_gather().
+#define XE2_CONST_CMD_DWORDS 11
+
+static inline void xe2_const_body_decode(const uint32_t* cmd, xe2_push_const_t* consts)
+{
+    for (uint32_t i = 0; i < XE2_CONST_BUFFERS; ++i) {
+        uint32_t len_dw = cmd[1 + (i >> 1)];
+        uint32_t lo     = cmd[3 + i * 2];
+        uint32_t hi     = cmd[4 + i * 2];
+
+        consts->buffer[i].read_length = (i & 1) ? (len_dw >> 16) : (len_dw & 0xFFFF);
+        // Bits 63:5 - the buffer is 32-byte aligned, low bits are MOCS.
+        consts->buffer[i].va = xe2_concat_lohi(lo, hi);
+    }
+}
+
+// Total gathered payload size for the decoded buffers, clamped to what
+// we mirror. Buffers with no address contribute nothing.
+static inline uint32_t xe2_const_payload_size(const xe2_push_const_t* consts)
+{
+    uint32_t nbytes = 0;
+    for (uint32_t i = 0; i < XE2_CONST_BUFFERS; ++i) {
+        if (consts->buffer[i].va) {
+            nbytes += consts->buffer[i].read_length * XE2_CONST_CHUNK_BYTES;
+        }
+    }
+    return (nbytes > XE2_CONST_MAX_BYTES) ? XE2_CONST_MAX_BYTES : nbytes;
+}
+
+// Has anything the renderer cares about changed since the last draw?
+static inline bool xe2_3dstate_dirty(const xe2_3dstate_t* d3d, const xe2_draw_params_t* draw)
+{
+    if (!d3d->last_draw_valid || d3d->ff_dirty) {
+        return true;
+    }
+    for (uint32_t i = 0; i < XE2_SHADER_STAGE_COUNT; ++i) {
+        if (d3d->shader[i].dirty || d3d->consts[i].dirty) {
+            return true;
+        }
+    }
+    return memcmp(draw, &d3d->last_draw, sizeof(*draw)) != 0;
 }
 
 // -----------------------------------------------------------
