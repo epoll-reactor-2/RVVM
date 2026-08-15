@@ -1345,13 +1345,50 @@ typedef struct {
     bool dirty; // Payload changed since the last draw.
 } xe2_push_const_t;
 
+// -----------------------------------------------------------
+// RENDER_SURFACE_STATE (decoded subset needed to build a texture)
+// -----------------------------------------------------------
+//
+// Field positions were cross-checked against the trace dumps for this
+// device - three independent surfaces (a NULL binding, a linear
+// B8G8R8A8 render target, a TILE4 R8G8B8A8 texture) - each bit range
+// below reproduces every printed field exactly for all three, rather
+// than being copied from a genxml on faith.
+typedef enum {
+    XE2_SURFTYPE_1D   = 0,
+    XE2_SURFTYPE_2D   = 1,
+    XE2_SURFTYPE_3D   = 2,
+    XE2_SURFTYPE_CUBE = 3,
+    XE2_SURFTYPE_NULL = 7,
+} xe2_surftype_t;
+
+typedef struct {
+    bool           valid; // false for an empty/NULL binding table slot
+    xe2_surftype_t type;
+    uint32_t       isl_format; // ISL_FORMAT_* - ISL->VkFormat mapping is a backend concern
+    uint32_t       tile_mode;  // 0=LINEAR, 3=TILE4 on Xe2
+    uint32_t       width;      // pixels
+    uint32_t       height;     // pixels
+    uint32_t       pitch;      // bytes per row
+    xe2_dma_addr_t base;       // translated, dereferenceable
+} xe2_surface_state_t;
+
+// Enough headroom for glmark2-es2-drm's handful of texture units per stage.
+#define XE2_MAX_BOUND_SURFACES 8
+
 typedef struct {
     xe2_shader_stage_t shader[XE2_SHADER_STAGE_COUNT];
     xe2_push_const_t   consts[XE2_SHADER_STAGE_COUNT];
 
     // 3DSTATE_BINDING_TABLE_POINTERS_XS, relative to the surface state
-    // base. Not populated yet - surface binding is unimplemented.
+    // base (ctx->addr_surf_state). Resolve with xe2_binding_table_base().
     uint32_t binding_table_offset[XE2_SHADER_STAGE_COUNT];
+
+    // Binding table entries decoded into RENDER_SURFACE_STATE, refreshed
+    // by xe2_resolve_bindings() right before each draw - see the comment
+    // there for why this is lazy rather than done at pointer-decode time.
+    xe2_surface_state_t surface[XE2_SHADER_STAGE_COUNT][XE2_MAX_BOUND_SURFACES];
+    uint32_t            surface_count[XE2_SHADER_STAGE_COUNT];
 
     xe2_vertex_input_t vertex_input;
     xe2_ff_state_t     ff;
@@ -4125,6 +4162,161 @@ static xe2_shader_kind_t xe2_constant_cmd_to_stage(uint32_t cmd)
     }
 }
 
+static xe2_shader_kind_t xe2_binding_table_cmd_to_stage(uint32_t cmd)
+{
+    switch (cmd) {
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_VS:
+            return XE2_SHADER_VS;
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_HS:
+            return XE2_SHADER_HS;
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_DS:
+            return XE2_SHADER_DS;
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_GS:
+            return XE2_SHADER_GS;
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_PS:
+            return XE2_SHADER_PS;
+        default:
+            rvvm_fatal("Unknown 3DSTATE shader kind: %u", cmd);
+            return XE2_SHADER_VS;
+    }
+}
+
+// 3DSTATE_BINDING_TABLE_POINTERS_XS carries a single dword-1 field,
+// "Pointer to <XS> Binding Table", encoded in bits [20:5]: a byte offset
+// from Surface State Base Address (STATE_BASE_ADDRESS dword 4/5), 32-byte
+// aligned so the low 5 bits are always zero. It is NOT a raw graphics
+// address by itself - it only becomes one once added to the surface
+// state base, and that sum is still a PPGTT virtual address, so it needs
+// a page-walk (xe2_ppgtt_translate) before anything can be read from it.
+//
+// Resolves ctx->d3d.binding_table_offset[kind] all the way down to a
+// dereferenceable xe2_dma_addr_t pointing at the binding table's first
+// dword (an array of up to 253 pointers, each itself an offset from the
+// same surface state base to a 16-dword RENDER_SURFACE_STATE).
+static inline xe2_dma_addr_t xe2_binding_table_base(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
+                                                    xe2_shader_kind_t kind)
+{
+    rvvm_addr_t va = ctx->addr_surf_state + ctx->d3d.binding_table_offset[kind];
+    return xe2_ppgtt_translate(xe2, pdp4, va);
+}
+
+// Decodes the 16 dwords at surf_dma into the subset of RENDER_SURFACE_STATE
+// a Vulkan image needs. Base address (dword 8/9) is a plain 64-bit
+// concatenation, unlike STATE_BASE_ADDRESS's page-aligned [63:12] pointers -
+// verified against the trace (0xfffffffefd600000 = dword9<<32 | dword8).
+static void xe2_decode_surface_state(xe2_dev_t* xe2, rvvm_addr_t pdp4, xe2_dma_addr_t surf_dma,
+                                     xe2_surface_state_t* out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!surf_dma.addr) {
+        return; // translation failed - nothing here to read, not a NULL surface
+    }
+
+    uint32_t cmd[16] = {0};
+    xe2_dma_read_many(xe2, surf_dma, cmd, STATIC_ARRAY_SIZE(cmd));
+
+    out->type = (cmd[0] >> 29) & xe2_reg_genmask(2, 0);
+    if (out->type == XE2_SURFTYPE_NULL) {
+        return; // unused binding table slot - nothing to bind
+    }
+
+    //   <struct name="RENDER_SURFACE_STATE" length="16">
+    //     <field name="Surface Vertical Alignment" dword="0" bits="17:16" type="uint">
+    //       <value name="VALIGN_4" value="1" />
+    //       <value name="VALIGN_8" value="2" />
+    //       <value name="VALIGN_16" value="3" />
+    //     </field>
+    //     <field name="Surface Format" dword="0" bits="26:18" type="uint" />
+    //     <field name="Surface Array" dword="0" bits="28:28" type="bool" />
+    //     <field name="Surface Type" dword="0" bits="31:29" type="STATE_SURFACE_TYPE" />
+    //     <field name="Surface QPitch" dword="1" bits="14:0" type="uint" />
+    //     <field name="Sample Tap Discard Disable" dword="1" bits="15:15" type="bool" />
+    //     <field name="Corner Texel Mode" dword="1" bits="18:18" type="bool" />
+    //     <field name="Base Mip Level" dword="1" bits="23:19" type="uint" />
+    //     <field name="MOCS" dword="1" bits="30:24" type="uint" nonzero="true" />
+    //     <field name="Width" dword="2" bits="13:0" type="uint" />
+    //     <field name="Height" dword="2" bits="29:16" type="uint" />
+    //     <field name="Depth Stencil Resource" dword="2" bits="31:31" type="bool" />
+    //     <field name="Surface Pitch" dword="3" bits="17:0" type="uint" />
+    //     <field name="Depth" dword="3" bits="31:21" type="uint" />
+    //     <field name="Multisample Position Palette Index" dword="4" bits="2:0" type="uint" />
+    //     <field name="Number of Multisamples" dword="4" bits="5:3" type="uint">
+    //       <value name="MULTISAMPLECOUNT_1" value="0" />
+    //       <value name="MULTISAMPLECOUNT_2" value="1" />
+    //       <value name="MULTISAMPLECOUNT_4" value="2" />
+    //       <value name="MULTISAMPLECOUNT_8" value="3" />
+    //       <value name="MULTISAMPLECOUNT_16" value="4" />
+    //     </field>
+    //     <field name="Multisampled Surface Storage Format" dword="4" bits="6:6" type="uint">
+    //       <value name="MSFMT_MSS" value="0" />
+    //       <value name="MSFMT_DEPTH_STENCIL" value="1" />
+    //     </field>
+    //     <field name="Render Target View Extent" dword="4" bits="17:7" type="uint" />
+    //     <field name="Minimum Array Element" dword="4" bits="28:18" type="uint" />
+    //     <field name="Render Target And Sample Unorm Rotation" dword="4" bits="30:29" type="uint">
+    //       <value name="0DEG" value="0" />
+    //       <value name="90DEG" value="1" />
+    //       <value name="180DEG" value="2" />
+    //       <value name="270DEG" value="3" />
+    //     </field>
+    //     <field name="MIP Count / LOD" dword="5" bits="3:0" type="uint" />
+    //     <field name="Surface Min LOD" dword="5" bits="7:4" type="uint" />
+    //     <field name="Mip Tail Start LOD" dword="5" bits="11:8" type="uint" />
+    //     <field name="L1 Cache Control" dword="5" bits="18:16" type="L1_CACHE_CONTROL" />
+    //     <field name="EWA Disable For Cube" dword="5" bits="20:20" type="bool" />
+    //     <field name="Y Offset" dword="5" bits="23:21" type="uint" />
+    //     <field name="X Offset" dword="5" bits="31:25" type="uint" />
+    //     <field name="Auxiliary Surface Mode" dword="6" bits="2:0" type="uint">
+    //       <value name="AUX_NONE" value="0" />
+    //       <value name="AUX_APPEND" value="1" />
+    //       <value name="AUX_MCS" value="2" />
+    //     </field>
+    out->isl_format = (cmd[0] >> 18) & xe2_reg_genmask(8, 0);
+    out->tile_mode  = (cmd[0] >> 12) & xe2_reg_genmask(1, 0);
+    out->width      = ((cmd[2] >> 0) & xe2_reg_genmask(13, 0)) + 1;
+    out->height     = ((cmd[2] >> 16) & xe2_reg_genmask(13, 0)) + 1;
+    out->pitch      = (cmd[3] & xe2_reg_genmask(17, 0)) + 1;
+
+    rvvm_addr_t base_va = (rvvm_addr_t)cmd[9] << 32 | cmd[8];
+    out->base           = xe2_ppgtt_translate(xe2, pdp4, base_va);
+    out->valid          = out->base.addr != 0;
+}
+
+// Walks a stage's binding table and decodes every non-NULL entry into
+// ctx->d3d.surface[kind][]. Done lazily, right before the draw that
+// needs it, rather than when the _POINTERS command itself is decoded:
+// the driver is free to emit 3DSTATE_BINDING_TABLE_POINTERS_XS before it
+// has finished writing the table's RENDER_SURFACE_STATE entries into
+// guest memory, so reading eagerly risks stale or half-written surfaces.
+// A draw is the one point state is guaranteed settled.
+static void xe2_resolve_bindings(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_shader_kind_t kind)
+{
+    ctx->d3d.surface_count[kind] = 0;
+
+    if (!ctx->addr_surf_state) {
+        return; // STATE_BASE_ADDRESS not seen yet for this context - nothing to resolve against
+    }
+
+    xe2_dma_addr_t bt = xe2_binding_table_base(xe2, ctx, pdp4, kind);
+    if (!bt.addr) {
+        return; // pointer doesn't translate - stage has no real binding table, not "offset 0"
+    }
+
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < XE2_MAX_BOUND_SURFACES; ++i) {
+        uint32_t entry = xe2_dma_read_32(xe2, bt, i * 4);
+        if (!entry) {
+            continue; // <not valid> slot, same convention the trace dump uses
+        }
+        xe2_dma_addr_t surf_dma = xe2_ppgtt_translate(xe2, pdp4, ctx->addr_surf_state + entry);
+        xe2_decode_surface_state(xe2, pdp4, surf_dma, &ctx->d3d.surface[kind][n]);
+        if (ctx->d3d.surface[kind][n].valid) {
+            n++;
+        }
+    }
+    ctx->d3d.surface_count[kind] = n;
+}
+
 // Reads a constant buffer's contents out of guest memory into the
 // stage's gathered payload, at the offset the hardware would have
 // placed it. Returns the number of bytes taken.
@@ -4227,7 +4419,7 @@ static uint32_t xe2_topology_to_vulkan(uint32_t topology)
 // have no consumer. Constants do have one - that is the path this
 // submits, and what a kernel computes from them is what ends up on
 // screen.
-static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd)
+static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, uint32_t* cmd)
 {
     bool     indexed        = (cmd[1] >> 8) & 1; // VertexAccessType
     uint32_t vertex_count   = cmd[2];
@@ -4278,7 +4470,7 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
         rvvm_info("%s: Write stage (vertex? %d, kind: %s, spirv: %p, words: %u)", __FUNCTION__,
                   xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX, gpu_vulkan_stage_to_string(xe2_draw_stages[i].vk),
                   stage->spirv, stage->spirv_nwords);
-        if (!stage->enabled || !stage->spirv) {
+        if (/* !stage->enabled || */ !stage->spirv) {
             rvvm_warn("Shader stage disabled or SPIR-V wasn't compiled");
             continue;
         }
@@ -4291,6 +4483,30 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
         };
         rvvm_info("%s: Write stage (Vulkan vertex? %d)", __FUNCTION__,
                   xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX);
+
+        // Textures bound to this stage. glmark2's texture bench samples
+        // in the fragment shader, so kind == XE2_SHADER_PS is the one
+        // that matters for `-b texture`; the others just cost 8 dwords
+        // of table walk each when their binding table pointer is null.
+        xe2_resolve_bindings(xe2, ctx, pdp4, kind);
+        for (uint32_t t = 0; t < d3d->surface_count[kind]; ++t) {
+            const xe2_surface_state_t* surf = &d3d->surface[kind][t];
+            rvvm_info("%s: stage %s binds surface %u: %ux%u isl_format=%u tile_mode=%u pitch=%u base=0x%" PRIx64,
+                      __FUNCTION__, gpu_vulkan_stage_to_string(xe2_draw_stages[i].vk), t, surf->width, surf->height,
+                      surf->isl_format, surf->tile_mode, surf->pitch, surf->base.addr);
+        }
+        // TODO(vulkan-textures): gpu_vulkan_stage_desc_t has no image
+        // field yet. It needs one shaped like {isl_format, width, height,
+        // pitch, tile_mode, dereferenceable bytes} per bound surface -
+        // the same "hand over a plain pointer, let the backend own
+        // VkImage/VkSampler/descriptor-set creation" pattern .spirv and
+        // .constants already use above. TILE4 surfaces (this device's
+        // only non-linear mode) need de-tiling into a linear staging
+        // buffer before vkCmdCopyBufferToImage; LINEAR ones can copy
+        // through as-is via xe2_dma_read_bytes(). Sampler state
+        // (3DSTATE_SAMPLER_STATE_POINTERS_PS -> SAMPLER_STATE, opcodes
+        // already #defined above, not yet decoded) is the matching piece
+        // for filter/wrap modes and belongs in the same struct.
     }
 
     rvvm_info("%s: Submit vertex stage (spirv: %p, words: %u)", __FUNCTION__, draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv,
@@ -4406,6 +4622,23 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             }
             break;
         }
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_VS:
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_HS:
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_DS:
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_GS:
+        case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_PS: {
+            // 2 dwords total: header + "Pointer to <XS> Binding Table" in
+            // dword[1] bits [20:5]. Store the raw offset now; resolving it
+            // against ctx->addr_surf_state is deferred to whoever walks
+            // the table (xe2_binding_table_base()), since the surface
+            // state base can only be trusted once STATE_BASE_ADDRESS has
+            // been seen and stays constant for the whole context after.
+            xe2_shader_kind_t kind   = xe2_binding_table_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
+            uint32_t          cmd[2] = {0};
+            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+            ctx->d3d.binding_table_offset[kind] = cmd[1] & xe2_reg_genmask(20, 5);
+            break;
+        }
         // Unused in glmark2-es2-drm.
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_VS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_HS:
@@ -4449,7 +4682,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
         case XE2_GFXPIPE_CMD_3DPRIMITIVE: {
             uint32_t cmd[7] = {0};
             xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
-            xe2_3dprimitive(xe2, ctx, cmd);
+            xe2_3dprimitive(xe2, ctx, pdp4, cmd);
             break;
         }
         default:
