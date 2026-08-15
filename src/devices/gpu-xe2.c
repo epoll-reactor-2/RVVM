@@ -4275,11 +4275,14 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
         const xe2_shader_stage_t* stage  = &d3d->shader[kind];
         const xe2_push_const_t*   consts = &d3d->consts[kind];
 
-        rvvm_info("%s: Write stage (vertex? %d, spirv: %p, words: %u)", __FUNCTION__, kind == XE2_SHADER_VS,
+        rvvm_info("%s: Write stage (vertex? %d, kind: %s, spirv: %p, words: %u)", __FUNCTION__,
+                  xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX, gpu_vulkan_stage_to_string(xe2_draw_stages[i].vk),
                   stage->spirv, stage->spirv_nwords);
         if (!stage->enabled || !stage->spirv) {
+            rvvm_warn("Shader stage disabled or SPIR-V wasn't compiled");
             continue;
         }
+
         draw.stage[xe2_draw_stages[i].vk] = (gpu_vulkan_stage_desc_t) {
             .spirv        = stage->spirv,
             .spirv_nwords = stage->spirv_nwords,
@@ -4755,11 +4758,6 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
                 break;
             }
-            case XE2_GUC_ACTION_HOST2GUC_UPDATE_CONTEXT_POLICIES:
-                for (uint32_t i = 0; i < num_dwords; ++i) {
-                    rvvm_info("GuC update context policies dword[%u]: 0x%x", i, msg[i]);
-                }
-                break;
             case XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST:
                 // Bring up GuC-PC: publish the running SLPC state and frequency
                 // caps into the shared BO so the driver's start handshake clears.

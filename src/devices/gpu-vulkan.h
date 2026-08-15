@@ -10,6 +10,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #ifndef RVVM_GPU_VULKAN_H
 #define RVVM_GPU_VULKAN_H
 
+#include "compiler.h"
 #include "rvvm/rvvm_base.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -35,6 +36,24 @@ typedef enum {
     GPU_VULKAN_STAGE_FRAGMENT,
     GPU_VULKAN_STAGE_COUNT
 } gpu_vulkan_stage_t;
+
+static forceinline const char* gpu_vulkan_stage_to_string(gpu_vulkan_stage_t s)
+{
+    switch (s) {
+        case GPU_VULKAN_STAGE_VERTEX:
+            return "GPU_VULKAN_STAGE_VERTEX";
+        case GPU_VULKAN_STAGE_TESS_CTRL:
+            return "GPU_VULKAN_STAGE_TESS_CTRL";
+        case GPU_VULKAN_STAGE_TESS_EVAL:
+            return "GPU_VULKAN_STAGE_TESS_EVAL";
+        case GPU_VULKAN_STAGE_GEOMETRY:
+            return "GPU_VULKAN_STAGE_GEOMETRY";
+        case GPU_VULKAN_STAGE_FRAGMENT:
+            return "GPU_VULKAN_STAGE_FRAGMENT";
+        default:
+            return "<unknown GPU vertex kind>";
+    }
+}
 
 // Values match VkPrimitiveTopology.
 typedef enum {

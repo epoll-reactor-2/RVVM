@@ -57,7 +57,6 @@ struct gpu_vulkan_ctx_t {
 
     VkRenderPass     render_pass;
     VkPipelineLayout pipeline_layout;
-    VkPipeline       pipeline; // Built-in scene, drawn until the guest submits one.
 
     // Pipeline built for the active guest scene, plus the key it was
     // built from - shader modules and topology hashed together, so a
@@ -516,6 +515,7 @@ static bool gpu_vulkan_ensure_guest_pipeline(gpu_vulkan_ctx_t* ctx)
     uint64_t                  key   = gpu_vulkan_scene_key(scene);
 
     if (ctx->guest_pipeline != VK_NULL_HANDLE && ctx->guest_pipeline_key == key) {
+        rvvm_warn("%s: Already created", __FUNCTION__);
         return true;
     }
 
@@ -532,6 +532,7 @@ static bool gpu_vulkan_ensure_guest_pipeline(gpu_vulkan_ctx_t* ctx)
     // A graphics pipeline without a vertex shader is not a legal one.
     // A missing fragment shader is fine - it just writes no colour.
     if (!scene->spirv[GPU_VULKAN_STAGE_VERTEX]) {
+        rvvm_warn("%s: No SPIR-V submitted", __FUNCTION__);
         return false;
     }
 
@@ -554,6 +555,7 @@ static bool gpu_vulkan_ensure_guest_pipeline(gpu_vulkan_ctx_t* ctx)
     }
 
     pipeline = gpu_vulkan_build_pipeline(ctx, stages, stage_count, scene->topology);
+    rvvm_info("Created guest Vulkan pipeline");
 
 fail:
     for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
@@ -562,6 +564,7 @@ fail:
         }
     }
     if (pipeline == VK_NULL_HANDLE) {
+        rvvm_warn("%s: Vulkan attempt to create pipeline failed", __FUNCTION__);
         return false;
     }
     if (ctx->guest_pipeline) {
@@ -593,7 +596,8 @@ bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw
     // Every graphics pipeline needs a vertex shader; without one there
     // is nothing to build the scene around.
     if (!draw->stage[GPU_VULKAN_STAGE_VERTEX].spirv || !draw->stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords) {
-        rvvm_warn("%s: No SPIR-V", __FUNCTION__);
+        rvvm_warn("%s: No SPIR-V (spirv: %p, spirv_nwords: %u)", __FUNCTION__,
+                  draw->stage[GPU_VULKAN_STAGE_VERTEX].spirv, draw->stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords);
         return false;
     }
 
@@ -795,9 +799,6 @@ void gpu_vulkan_destroy(gpu_vulkan_ctx_t* ctx)
     if (ctx->guest_pipeline) {
         vkDestroyPipeline(ctx->device, ctx->guest_pipeline, NULL);
     }
-    if (ctx->pipeline) {
-        vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
-    }
     if (ctx->pipeline_layout) {
         vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, NULL);
     }
@@ -945,16 +946,12 @@ static bool gpu_vulkan_reconfigure(gpu_vulkan_ctx_t* ctx, uint32_t w, uint32_t h
         // built against it must be rebuilt to match; this only happens on
         // a real mode-set. The pipeline layout does not depend on the
         // format and stays as it is, so the constant bindings survive.
-        if (ctx->pipeline) {
-            vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
-        }
         if (ctx->guest_pipeline) {
             vkDestroyPipeline(ctx->device, ctx->guest_pipeline, NULL);
         }
         if (ctx->render_pass) {
             vkDestroyRenderPass(ctx->device, ctx->render_pass, NULL);
         }
-        ctx->pipeline           = VK_NULL_HANDLE;
         ctx->guest_pipeline     = VK_NULL_HANDLE;
         ctx->guest_pipeline_key = 0;
         ctx->render_pass        = VK_NULL_HANDLE;
@@ -1078,24 +1075,20 @@ static void* gpu_vulkan_render_task(void* arg)
     // fails to build (a kernel we cross-compiled into something the
     // driver rejects) falls back to the built-in one rather than
     // dropping the frame, so the display keeps updating.
-    bool       guest_scene = gpu_vulkan_take_scene(ctx) && gpu_vulkan_ensure_guest_pipeline(ctx);
-    VkPipeline pipeline    = guest_scene ? ctx->guest_pipeline : ctx->pipeline;
+    bool guest_scene = gpu_vulkan_take_scene(ctx) && gpu_vulkan_ensure_guest_pipeline(ctx);
+    if (!guest_scene) {
+        rvvm_warn("Failed to obtain guest pipeline");
+        goto done;
+    }
 
     // Publish the constants of the active scene into the uniform blocks
     // the shaders read. Nothing else touches these buffers, and the
     // previous frame's fence has already been waited on.
-    if (guest_scene) {
-        for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
-            if (ctx->const_mapped[s]) {
-                memcpy(ctx->const_mapped[s], ctx->active.constants[s], GPU_VULKAN_CONST_BYTES);
-            }
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        if (ctx->const_mapped[s]) {
+            memcpy(ctx->const_mapped[s], ctx->active.constants[s], GPU_VULKAN_CONST_BYTES);
         }
     }
-
-    // Deterministic frame clock - not wall-clock time.
-    const float dt    = 1.0f / 60.0f;
-    const float speed = 20.0f;
-    float       time  = (float)ctx->frame_index * dt * speed;
 
     vkResetCommandBuffer(ctx->command_buffer, 0);
     VkCommandBufferBeginInfo begin_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1103,11 +1096,17 @@ static void* gpu_vulkan_render_task(void* arg)
         goto done;
     }
 
-    VkViewport viewport
-        = {.x = 0.0f, .y = 0.0f, .width = (float)width, .height = (float)height, .minDepth = 0.0f, .maxDepth = 1.0f};
+    VkViewport viewport = {
+        .x        = 0.0f,
+        .y        = 0.0f,
+        .width    = width,
+        .height   = height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
     VkRect2D scissor = {
         .offset = {        .x = 0,           .y = 0},
-          .extent = {.width = width, .height = height}
+        .extent = {.width = width, .height = height},
     };
     vkCmdSetViewport(ctx->command_buffer, 0, 1, &viewport);
     vkCmdSetScissor(ctx->command_buffer, 0, 1, &scissor);
@@ -1122,18 +1121,11 @@ static void* gpu_vulkan_render_task(void* arg)
         .pClearValues    = &clear,
     };
     vkCmdBeginRenderPass(ctx->command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindPipeline(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->guest_pipeline);
     vkCmdBindDescriptorSets(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->pipeline_layout,
                             GPU_VULKAN_CONST_SET, 1, &ctx->const_set, 0, NULL);
-    if (guest_scene) {
-        vkCmdDraw(ctx->command_buffer, ctx->active.vertex_count, ctx->active.instance_count, ctx->active.first_vertex,
-                  ctx->active.first_instance);
-    } else {
-        // layout(push_constant) uniform PushConsts { float time; } pc;
-        vkCmdPushConstants(ctx->command_buffer, ctx->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float),
-                           &time);
-        vkCmdDraw(ctx->command_buffer, 3, 1, 0, 0);
-    }
+    vkCmdDraw(ctx->command_buffer, ctx->active.vertex_count, ctx->active.instance_count, ctx->active.first_vertex,
+              ctx->active.first_instance);
     vkCmdEndRenderPass(ctx->command_buffer);
     // finalLayout already leaves the image in TRANSFER_SRC_OPTIMAL.
 
@@ -1141,16 +1133,16 @@ static void* gpu_vulkan_render_task(void* arg)
     // (in texels of vk_format) - the GPU's copy engine handles any row
     // padding for us. In the fallback path it's just `width`, tightly
     // packed, and gpu_vulkan_blit_to_guest() destrides it on the CPU.
-    size_t   vk_bpp            = gpu_vulkan_vk_format_bpp(ctx->cur_vk_format);
-    uint32_t buffer_row_length = ctx->zero_copy ? (uint32_t)(stride / vk_bpp) : width;
+    size_t   vk_bpp         = gpu_vulkan_vk_format_bpp(ctx->cur_vk_format);
+    uint32_t buffer_row_len = ctx->zero_copy ? (uint32_t)(stride / vk_bpp) : width;
 
     VkBufferImageCopy region = {
         .bufferOffset      = 0,
-        .bufferRowLength   = buffer_row_length,
+        .bufferRowLength   = buffer_row_len,
         .bufferImageHeight = height,
         .imageSubresource
         = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
-        .imageExtent = {.width = width, .height = height, .depth = 1},
+        .imageExtent = {.width = width, .height = height, .depth = 1}
     };
     vkCmdCopyImageToBuffer(ctx->command_buffer, ctx->color_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            ctx->readback_buffer, 1, &region);
