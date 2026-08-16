@@ -5013,9 +5013,37 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
                 xe2->guc.huc_authenticated = true;
                 break;
             case XE2_GUC_ACTION_TLB_INVALIDATION:
+            case XE2_GUC_ACTION_TLB_INVALIDATION_ALL: {
                 // Report completed invalidation without meaningful work.
-                xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_TLB_INVALIDATION_DONE, &fence, 1);
+                //
+                // Bug: Look at invalidation seqno's:
+                // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 228
+                // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 229
+                // [   67.551720] xe 0000:00:01.0: [drm] Tile0: GT0: Context scheduled
+                // [   67.556618] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
+                // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 230
+                // [   67.567649] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
+                // [   67.572331] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
+                // [   67.577021] xe_sched_job_arm: Assign job seqno: 4294967290
+                // [   67.580633] emit_copy_timestamp: dw[0] (cmd):      0x12480002
+                // info: (PPGTT) ... Done, moved 0 bytes
+                // info: (PPGTT) ... Done, moved 7 bytes
+                //
+                // ... But! When Vulkan rendering is submitted, it probably blocks
+                // MMIO requests submission:
+                // [   68.354120] xe_sched_job_arm: Assign job seqno: 4294967178
+                // [   68.364864] xe_sched_job_arm: Assign job seqno: 4294967170
+                // [   70.801727] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=231 recv=230
+                // [   73.361299] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=232 recv=230
+                // [   75.665224] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=233 recv=230
+                // [   77.969124] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=234 recv=230
+                // [   80.273245] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=235 recv=230
+                // ...
+                uint32_t seqno = msg[1];
+                rvvm_info("XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: %u", seqno);
+                xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_TLB_INVALIDATION_DONE, &seqno, 1);
                 break;
+            }
             default:
                 break;
         }
