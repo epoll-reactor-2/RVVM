@@ -1584,7 +1584,9 @@ typedef struct {
     gpu_vulkan_ctx_t* vulkan_ctx;
     xe2_spirv_ctx_t   spirv_ctx;
 
-    bool draw_submitted;
+    bool     draw_submitted;
+    uint64_t last_draw_tick;
+    uint64_t scanout_tick;
 
     // The DMC loader writes a per-firmware list of (register, value) pairs and
     // later verifies the registers read back those values. Shadow the two DMC
@@ -1762,6 +1764,8 @@ static uint8_t* xe2_scanout_page_dma(xe2_dev_t* xe2, rvvm_addr_t ggtt, size_t* a
     return rvvm_pci_get_dma(xe2->pci_func, addr, *avail);
 }
 
+#define XE2_DRAW_IDLE_TICKS 60
+
 // Present pipe-A plane 1 onto the host window. The driver programs a linear
 // XRGB8888 framebuffer (fbcon) into a GPU buffer object whose surface address is
 // a GGTT offset; resolve it page by page and blit it into the window's VRAM,
@@ -1771,6 +1775,8 @@ static void xe2_scanout(xe2_dev_t* xe2)
     if (!xe2->fbdev) {
         return;
     }
+
+    xe2->scanout_tick++;
 
     uint32_t ctl = xe2->display.plane_ctl;
     if (unlikely(!(ctl & XE2_REG_PLANE_CTL_X_ENABLE_MASK))) {
@@ -1811,6 +1817,13 @@ static void xe2_scanout(xe2_dev_t* xe2)
     size_t   needed    = (size_t)stride * height;
     if (!dst || needed > vram_size) {
         return;
+    }
+    // No new 3DPRIMITIVE for a while: the guest stopped driving the 3D
+    // pipeline (app exited, compositor switched back to fbcon, context
+    // torn down, etc). Fall back to the plane's raw buffer rather than
+    // freezing on a stale Vulkan frame forever.
+    if (xe2->draw_submitted && (xe2->scanout_tick - xe2->last_draw_tick) > XE2_DRAW_IDLE_TICKS) {
+        xe2->draw_submitted = false;
     }
 
     if (xe2->draw_submitted) {
@@ -2078,7 +2091,6 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
     // 1 GiB huge page
     if (pdpte & (1 << 7)) {
         uint64_t phys = (pdpte & ~0x3FFFFFFFULL) + (va & 0x3FFFFFFF);
-        rvvm_info("PDPTE 1 GiB page: 0x%lx", phys);
         return (xe2_dma_addr_t) {.addr = phys, .type = (pdpte & (1ULL << 11)) ? XE2_MEM_LMEM : XE2_MEM_SMEM};
     }
 
@@ -2092,7 +2104,6 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
     // 2 MiB huge page
     if (likely(pde & (1 << 7))) {
         rvvm_addr_t phys = (pde & ~0x1FFFFFULL) + (va & 0x1FFFFF);
-        rvvm_info("PDE 2 MiB page: 0x%lx", phys);
         return (xe2_dma_addr_t) {
             .addr = phys,
             .type = (pde & (1 << 11)) ? XE2_MEM_LMEM : XE2_MEM_SMEM,
@@ -4428,11 +4439,8 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t p
     uint32_t start_instance = cmd[5];
     int32_t  base_vertex    = (int32_t)cmd[6];
 
-    rvvm_info("%s: vertex_count:   %u", __FUNCTION__, vertex_count);
-    rvvm_info("%s: start_vertex:   %u", __FUNCTION__, start_vertex);
-    rvvm_info("%s: instance_count: %u", __FUNCTION__, instance_count);
-    rvvm_info("%s: start_instance: %u", __FUNCTION__, start_instance);
-    rvvm_info("%s: base_vertex:    %u", __FUNCTION__, base_vertex);
+    rvvm_info("%s: vertex_count: %u, start_vertex: %u, instances: %u, start_instance: %u, base_vertex: %u",
+              __FUNCTION__, vertex_count, start_vertex, instance_count, start_instance, base_vertex);
     if (indexed) {
         rvvm_info("%s: indexed draws are not translated yet", __FUNCTION__);
     }
@@ -4471,7 +4479,9 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t p
                   xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX, gpu_vulkan_stage_to_string(xe2_draw_stages[i].vk),
                   stage->spirv, stage->spirv_nwords);
         if (/* !stage->enabled || */ !stage->spirv) {
-            rvvm_warn("Shader stage disabled or SPIR-V wasn't compiled");
+            // This could happen when 3DPRIMITIVE was already issued without
+            // submitting kernel addresses (3DSTATE_PS/VS/HS/...). I have no
+            // idea why that happens, but that happens.
             continue;
         }
 
@@ -4481,8 +4491,6 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t p
             .constants    = consts->payload,
             .const_bytes  = consts->nbytes,
         };
-        rvvm_info("%s: Write stage (Vulkan vertex? %d)", __FUNCTION__,
-                  xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX);
 
         // Textures bound to this stage. glmark2's texture bench samples
         // in the fragment shader, so kind == XE2_SHADER_PS is the one
@@ -4509,10 +4517,8 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t p
         // for filter/wrap modes and belongs in the same struct.
     }
 
-    rvvm_info("%s: Submit vertex stage (spirv: %p, words: %u)", __FUNCTION__, draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv,
-              draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords);
-
-    if (xe2->vulkan_ctx && !gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw)) {
+    bool submitted = xe2->vulkan_ctx && gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
+    if (!submitted) {
         rvvm_warn("%s: draw carries no usable shaders, skipped", __FUNCTION__);
     }
 
@@ -4523,7 +4529,14 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t p
     d3d->ff_dirty        = false;
     d3d->last_draw       = params;
     d3d->last_draw_valid = true;
-    xe2->draw_submitted  = true;
+
+    // Only an actually-accepted draw counts as "guest is driving the 3D
+    // pipeline" - a rejected/shaderless draw must not flip scanout away
+    // from the plane's raw buffer.
+    if (submitted) {
+        xe2->draw_submitted = true;
+        xe2->last_draw_tick = xe2->scanout_tick;
+    }
 }
 
 // The supplied ring DMA address is normalized such that the first dword is the
@@ -4577,6 +4590,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             bool any                  = false;
             for (size_t i = 0; i < STATIC_ARRAY_SIZE(addr_kernel); ++i) {
                 if (addr_kernel_enable[i]) {
+                    rvvm_info("(PS) kernel %zu: lx%0lx", i, addr_kernel[i]);
                     xe2_decode_shader(xe2, ctx, XE2_SHADER_PS, pdp4, addr_kernel[i], ctx->addr_instr);
                     any = true;
                 }
@@ -4592,6 +4606,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             bool enable = cmd[7] & 1;
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
+                rvvm_info("(VS) kernel: lx%0lx", addr_kernel);
                 xe2_decode_shader(xe2, ctx, XE2_SHADER_VS, pdp4, addr_kernel, ctx->addr_instr);
             } else {
                 ctx->d3d.shader[XE2_SHADER_VS].enabled = false;
@@ -4604,6 +4619,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             bool enable = cmd[7] & 1;
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
+                rvvm_info("(GS) kernel: lx%0lx", addr_kernel);
                 xe2_decode_shader(xe2, ctx, XE2_SHADER_GS, pdp4, addr_kernel, ctx->addr_instr);
             } else {
                 ctx->d3d.shader[XE2_SHADER_GS].enabled = false;
@@ -4616,6 +4632,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
             bool enable = (cmd[2] >> 31) & 1;
             if (enable) {
                 rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[3], cmd[4]);
+                rvvm_info("(HS) kernel: lx%0lx", addr_kernel);
                 xe2_decode_shader(xe2, ctx, XE2_SHADER_HS, pdp4, addr_kernel, ctx->addr_instr);
             } else {
                 ctx->d3d.shader[XE2_SHADER_HS].enabled = false;
@@ -4982,12 +4999,6 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
                 // This called only when context was not registered yet.
                 uint32_t done[2] = {msg[1], msg[2]};
                 rvvm_info("GuC SCHED_CONTEXT_MODE_SET: %s", msg[2] ? "enable" : "disable");
-                if (!msg[2]) {
-                    // FIXME: Temporary solution to disable Vulkan rendering. I guess,
-                    //        stop condition for rendering path is absence of GPU
-                    //        submission buffers, that would be handled somewhere else.
-                    xe2->draw_submitted = 0;
-                }
                 xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
                 break;
             }
