@@ -4297,6 +4297,46 @@ static uint32_t xe2_topology_to_vulkan(uint32_t topology)
     }
 }
 
+static inline void xe2_surface_print(const char* name, xe2_surface_state_t* surface)
+{
+    if (surface->valid) {
+        rvvm_info(" | (%s) ISL format:        %u", name, surface->isl_format);
+        rvvm_info(" | (%s) Tile mode:         %u", name, surface->tile_mode);
+        rvvm_info(" | (%s) Width/Height:      %u/%u", name, surface->width, surface->height);
+        rvvm_info(" | (%s) Pitch:             %u", name, surface->pitch);
+    } else {
+        rvvm_info(" | (%s) ... Empty", name);
+    }
+}
+
+static inline void xe2_3dprimitive_print(xe2_submit_ctx_t* ctx)
+{
+    rvvm_info("3DPRIMITIVE state dump");
+    rvvm_info(" Surface states:");
+
+    if (ctx->d3d.shader[XE2_SHADER_PS].enabled) {
+        xe2_surface_print("PS", &ctx->d3d.surface[XE2_SHADER_PS][0]);
+    }
+    if (ctx->d3d.shader[XE2_SHADER_VS].enabled) {
+        xe2_surface_print("VS", &ctx->d3d.surface[XE2_SHADER_VS][0]);
+    }
+    if (ctx->d3d.shader[XE2_SHADER_HS].enabled) {
+        xe2_surface_print("HS", &ctx->d3d.surface[XE2_SHADER_HS][0]);
+    }
+    if (ctx->d3d.shader[XE2_SHADER_DS].enabled) {
+        xe2_surface_print("DS", &ctx->d3d.surface[XE2_SHADER_DS][0]);
+    }
+    if (ctx->d3d.shader[XE2_SHADER_GS].enabled) {
+        xe2_surface_print("GS", &ctx->d3d.surface[XE2_SHADER_GS][0]);
+    }
+
+    rvvm_info(" (PS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_PS].enabled);
+    rvvm_info(" (VS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_VS].enabled);
+    rvvm_info(" (HS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_HS].enabled);
+    rvvm_info(" (DS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_DS].enabled);
+    rvvm_info(" (GS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_GS].enabled);
+}
+
 // Turn the accumulated 3D state into a draw for the Vulkan backend.
 //
 // Vertex attributes are not wired yet: a cross-compiled kernel reads its
@@ -4307,6 +4347,8 @@ static uint32_t xe2_topology_to_vulkan(uint32_t topology)
 // screen.
 static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd)
 {
+    xe2_3dprimitive_print(ctx);
+
     bool     indexed        = (cmd[1] >> 8) & 1; // VertexAccessType
     uint32_t vertex_count   = cmd[2];
     uint32_t start_vertex   = cmd[3];
@@ -4413,7 +4455,17 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
     }
 }
 
-static inline void xe2_ring_3dstate_ps(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
+static inline void xe2_gfxpipe_pipe_control_cmd(xe2_dev_t* xe2, xe2_dma_addr_t ring)
+{
+    uint32_t flags = xe2_dma_read_32(xe2, ring, 1 * 4);
+    if ((flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_QW_WRITE) && (flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_GLOBAL_GTT)) {
+        uint32_t a = xe2_dma_read_32(xe2, ring, 2 * 4);
+        uint32_t v = xe2_dma_read_32(xe2, ring, 4 * 4);
+        xe2_ring_store(xe2, a, v);
+    }
+}
+
+static inline void xe2_3dstate_ps_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
 {
     uint32_t cmd[12] = {0};
     xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
@@ -4434,9 +4486,10 @@ static inline void xe2_ring_3dstate_ps(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rv
         ctx->d3d.shader[XE2_SHADER_PS].enabled = false;
     }
     ctx->d3d.binding_table_entry_count[XE2_SHADER_PS] = xe2_reg_field_get(xe2_reg_genmask(25, 18), cmd[3]);
+    rvvm_info("(PS) Binding table entry count: %u", ctx->d3d.binding_table_entry_count[XE2_SHADER_PS]);
 }
 
-static inline void xe2_ring_3dstate_vs(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
+static inline void xe2_3dstate_vs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
 {
     uint32_t cmd[9] = {0};
     xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
@@ -4452,7 +4505,7 @@ static inline void xe2_ring_3dstate_vs(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rv
     rvvm_info("(VS) Binding table entry count: %u", ctx->d3d.binding_table_entry_count[XE2_SHADER_VS]);
 }
 
-static inline void xe2_ring_3dstate_gs(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
+static inline void xe2_3dstate_gs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
 {
     uint32_t cmd[10] = {0};
     xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
@@ -4465,9 +4518,10 @@ static inline void xe2_ring_3dstate_gs(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rv
         ctx->d3d.shader[XE2_SHADER_GS].enabled = false;
     }
     ctx->d3d.binding_table_entry_count[XE2_SHADER_GS] = xe2_reg_field_get(xe2_reg_genmask(25, 18), cmd[3]);
+    rvvm_info("(GS) Binding table entry count: %u", ctx->d3d.binding_table_entry_count[XE2_SHADER_GS]);
 }
 
-static inline void xe2_ring_3dstate_hs(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
+static inline void xe2_3dstate_hs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
 {
     uint32_t cmd[9] = {0};
     xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
@@ -4480,10 +4534,61 @@ static inline void xe2_ring_3dstate_hs(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rv
         ctx->d3d.shader[XE2_SHADER_HS].enabled = false;
     }
     ctx->d3d.binding_table_entry_count[XE2_SHADER_HS] = xe2_reg_field_get(xe2_reg_genmask(25, 18), cmd[1]);
+    rvvm_info("(HS) Binding table entry count: %u", ctx->d3d.binding_table_entry_count[XE2_SHADER_HS]);
 }
 
-static inline void xe2_ring_3dstate_parse_binding_table_entry(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
-                                                              xe2_dma_addr_t dma, xe2_shader_kind_t kind)
+static inline void xe2_3dstate_vertex_buffers_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring,
+                                                  rvvm_addr_t pdp4, uint32_t op)
+{
+    xe2_vertex_input_t* vertex = &ctx->d3d.vertex_input;
+    size_t              total  = EVAL_MIN(((op & 0xFF) - 3) / 4, XE2_SHADER_MAX_BINDINGS);
+
+    // BUG: XE2_SHADER_MAX_BINDINGS value is wrong. We could have huge
+    //      vertex buffers of sizes:
+    //        Buffer Starting Address: 0xfffffffefe83f090
+    //      0xfffffffefff75c8c: 0x001c0f70: Dword 3
+    //        Buffer Size : 1838960 vertex buffer 0, size 2097152
+    //        -0.21       0.57       0.01
+    //        -0.20       0.59       0.01
+    //        -0.16       0.56      -0.02
+    for (size_t i = 0; i < total; ++i) {
+        uint32_t buf[4] = {0};
+        xe2_dma_read_many(xe2, xe2_dma_offset(ring, (1 + i * 4) * 4), buf, 4);
+
+        uint32_t binding = (buf[0] >> 26) & 0x3F;
+        if (binding >= XE2_SHADER_MAX_BINDINGS) {
+            continue;
+        }
+        vertex->buffer[binding].stride = (buf[0] >> 0) & 0xFFF;
+        vertex->buffer[binding].addr   = xe2_ppgtt_translate(xe2, pdp4, xe2_addr_63_6_mask(buf[1], buf[2]));
+        vertex->buffer[binding].size   = buf[3];
+        if (binding + 1 > vertex->buffer_count) {
+            vertex->buffer_count = binding + 1;
+        }
+
+        // Print first submitted vertices to prove it works. Since big
+        // amount of them is passed, we should consider deferring access
+        // to them somewhere near Vulkan renderer.
+        {
+            uint32_t buffers[16] = {0};
+            xe2_dma_read_many(xe2, vertex->buffer[binding].addr, buffers, STATIC_ARRAY_SIZE(buffers));
+            for (uint32_t j = 0; j + 2 < STATIC_ARRAY_SIZE(buffers); j += 3) {
+                float x, y, z;
+                memcpy(&x, &buffers[j + 0], sizeof(x));
+                memcpy(&y, &buffers[j + 1], sizeof(y));
+                memcpy(&z, &buffers[j + 2], sizeof(z));
+                char dump[128] = {0};
+                sprintf(dump, "Vertex[%u]: %.3f %.3f %.3f", j / 3, (double)x, (double)y, (double)z);
+                rvvm_info("%s", dump);
+            }
+        }
+    }
+
+    ctx->d3d.ff_dirty = 1;
+}
+
+static inline void xe2_3dstate_parse_binding_table_entry(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
+                                                         xe2_dma_addr_t dma, xe2_shader_kind_t kind)
 {
     uint32_t payload[14] = {0};
     xe2_dma_read_many(xe2, dma, payload, STATIC_ARRAY_SIZE(payload));
@@ -4501,88 +4606,170 @@ static inline void xe2_ring_3dstate_parse_binding_table_entry(xe2_dev_t* xe2, xe
     surface->pitch      = xe2_reg_field_get(xe2_reg_genmask(17, 0), payload[3]);
     surface->base       = xe2_ppgtt_translate(xe2, pdp4, xe2_concat_lohi(payload[8], payload[9]));
     surface->valid      = !!surface->base.addr;
-
-    rvvm_info("Parsed binding table entry:");
-    rvvm_info(" ISL format:        %u", surface->isl_format);
-    rvvm_info(" Tile mode:         %u", surface->tile_mode);
-    rvvm_info(" Width/Height:      %u/%u", surface->width, surface->height);
-    rvvm_info(" Pitch:             %u", surface->pitch);
-    rvvm_info(" Translated base:   0x%lx (0x%lx)", surface->base.addr, xe2_concat_lohi(payload[8], payload[9]));
 }
 
-static inline void xe2_ring_3dstate_binding_table_pointers(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
-                                                           xe2_dma_addr_t ring, uint32_t op)
+// This suspicious:
+//
+// We have updated binding table base and for some reason
+// translation logic suddenly fucked up.
+//
+// Binding table pointers (XE2_SHADER_VS): Offset: 0
+// Binding table pointers (XE2_SHADER_VS): Base: 13f600000
+// Binding table pointers (XE2_SHADER_VS): Translated entry: 0x400000
+// Binding table pointers (XE2_SHADER_VS): Payload DMA 0x0
+// Binding table pointers (XE2_SHADER_HS): Offset: 0
+// Binding table pointers (XE2_SHADER_HS): Base: 13f600000
+// Binding table pointers (XE2_SHADER_HS): Translated entry: 0x400000
+// Binding table pointers (XE2_SHADER_HS): Payload DMA 0x0
+// Binding table pointers (XE2_SHADER_DS): Offset: 0
+// Binding table pointers (XE2_SHADER_DS): Base: 13f600000
+// Binding table pointers (XE2_SHADER_DS): Translated entry: 0x400000
+// Binding table pointers (XE2_SHADER_DS): Payload DMA 0x0
+// Binding table pointers (XE2_SHADER_GS): Offset: 0
+// Binding table pointers (XE2_SHADER_GS): Base: 13f600000
+// Binding table pointers (XE2_SHADER_GS): Translated entry: 0x400000
+// Binding table pointers (XE2_SHADER_GS): Payload DMA 0x0
+// Binding table pointers (XE2_SHADER_PS): Offset: 20
+// Binding table pointers (XE2_SHADER_PS): Base: 13f600000
+// Binding table pointers (XE2_SHADER_PS): Translated entry: 0x400020
+// Binding table pointers (XE2_SHADER_PS): Payload DMA 0x170080
+// Binding table pointers (XE2_SHADER_PS): Count: 1
+// Binding table pointers (XE2_SHADER_PS): 0x20 (raw: 0x20)
+// Binding table pointers [0]: 0x3301c000 << Correct
+// Binding table pointers [1]: 0x200010e
+// Binding table pointers [2]: 0x437077f
+// Binding table pointers [3]: 0x1dff
+// Binding table pointers [4]: 0x0
+// Binding table pointers [5]: 0x20100
+// Binding table pointers [6]: 0x0
+// Binding table pointers [7]: 0x9770000
+// Binding table pointers [8]: 0xff600000
+// Binding table pointers [9]: 0xfffffffe
+// Binding table pointers [10]: 0x0
+// Binding table pointers [11]: 0x0
+// Binding table pointers [12]: 0x0
+// Binding table pointers [13]: 0x0
+//
+// Binding table pointers (XE2_SHADER_VS): Offset: 0
+// Binding table pointers (XE2_SHADER_VS): Base: 13f400000
+// Binding table pointers (XE2_SHADER_VS): Translated entry: 0x1c00000
+// Binding table pointers (XE2_SHADER_VS): Payload DMA 0x0
+// Binding table pointers (XE2_SHADER_HS): Offset: 0
+// Binding table pointers (XE2_SHADER_HS): Base: 13f400000
+// Binding table pointers (XE2_SHADER_HS): Translated entry: 0x1c00000
+// Binding table pointers (XE2_SHADER_HS): Payload DMA 0x0
+// Binding table pointers (XE2_SHADER_DS): Offset: 0
+// Binding table pointers (XE2_SHADER_DS): Base: 13f400000
+// Binding table pointers (XE2_SHADER_DS): Translated entry: 0x1c00000
+// Binding table pointers (XE2_SHADER_DS): Payload DMA 0x0
+// Binding table pointers (XE2_SHADER_GS): Offset: 0
+// Binding table pointers (XE2_SHADER_GS): Base: 13f400000
+// Binding table pointers (XE2_SHADER_GS): Translated entry: 0x1c00000
+// Binding table pointers (XE2_SHADER_GS): Payload DMA 0x0
+// Binding table pointers (XE2_SHADER_PS): Offset: 20
+// Binding table pointers (XE2_SHADER_PS): Base: 13f400000
+// Binding table pointers (XE2_SHADER_PS): Translated entry: 0x1c00020
+// Binding table pointers (XE2_SHADER_PS): Payload DMA 0x80 <<< BUG: This
+// Binding table pointers (XE2_SHADER_PS): Count: 1
+// Binding table pointers (XE2_SHADER_PS): 0x20 (raw: 0x20)
+// Binding table pointers [0]: 0x15040001
+// Binding table pointers [1]: 0x600
+// Binding table pointers [2]: 0x6210
+// Binding table pointers [3]: 0x11080005
+// Binding table pointers [4]: 0x600
+// Binding table pointers [5]: 0x0
+// Binding table pointers [6]: 0x608
+// Binding table pointers [7]: 0x0
+// Binding table pointers [8]: 0x610
+// Binding table pointers [9]: 0x0
+// Binding table pointers [10]: 0x78150009
+// Binding table pointers [11]: 0x0
+// Binding table pointers [12]: 0x0
+// Binding table pointers [13]: 0x0
+static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
+                                                               xe2_dma_addr_t ring, uint32_t op)
 {
     xe2_shader_kind_t kind   = xe2_binding_table_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
+    const char*       name   = xe2_shader_kind_to_string(kind);
     uint32_t          cmd[2] = {0};
     xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
 
     ctx->d3d.binding_table_offset[kind] = cmd[1] & xe2_reg_genmask(20, 5);
 
+    rvvm_info("Binding table pointers (%s): Offset: %x", name, ctx->d3d.binding_table_offset[kind]);
+    rvvm_info("Binding table pointers (%s): Base: %lx", name, ctx->addr_binding_table_base);
+
     rvvm_addr_t    binding_table_address = ctx->addr_binding_table_base + ctx->d3d.binding_table_offset[kind];
     xe2_dma_addr_t binding_table         = xe2_ppgtt_translate(xe2, pdp4, binding_table_address);
     uint32_t       binding_table_entry   = xe2_dma_read_32(xe2, binding_table, 0);
 
+    rvvm_info("Binding table pointers (%s): Translated entry: 0x%lx", name, binding_table.addr);
+
     xe2_dma_addr_t entry_dma = xe2_ppgtt_translate(xe2, pdp4, ctx->addr_surf_state + binding_table_entry);
+    rvvm_info("Binding table pointers (%s): Payload DMA 0x%lx", name, entry_dma.addr);
+
     // Guest sometimes reports zeroed 3DSTATE commands for some reason. If so,
     // skip them.
     if (unlikely(entry_dma.addr == 0x00)) {
         return;
     }
 
-    rvvm_info("Binding table pointers (%s): 0x%x (raw: 0x%x)", xe2_shader_kind_to_string(kind),
-              ctx->d3d.binding_table_offset[kind], cmd[1]);
-    rvvm_info("Binding table pointers (%s): Entry 0x%lx", xe2_shader_kind_to_string(kind), binding_table.addr);
-    rvvm_info("Binding table pointers (%s): Payload 0x%lx", xe2_shader_kind_to_string(kind), entry_dma.addr);
+    rvvm_info("Binding table pointers (%s): Count: %u", name, ctx->d3d.binding_table_entry_count[kind]);
+    if (ctx->d3d.binding_table_entry_count[kind] > 0) {
+        rvvm_info("Binding table pointers (%s): 0x%x (raw: 0x%x)", name, ctx->d3d.binding_table_offset[kind], cmd[1]);
 
-    xe2_ring_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, entry_dma, kind);
+        xe2_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, entry_dma, kind);
+        xe2_surface_print(name, &ctx->d3d.surface[kind][0]);
+    }
+}
+
+static inline void xe2_3dstate_base_address_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring)
+{
+    // discard flags (MOCS, modify, enable).
+    //
+    // I assume, these addresses are per-LRC. So we need to store them
+    // accordingly. Store XE2_MAX_CONTEXTS addresses rather senseless,
+    // find optimized approach.
+    uint32_t cmd[21] = {0};
+    xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+    ctx->addr_general_state    = xe2_addr_63_12_mask(cmd[1], cmd[2]);
+    ctx->addr_surf_state       = xe2_addr_63_12_mask(cmd[4], cmd[5]);
+    ctx->addr_dynamic_state    = xe2_addr_63_12_mask(cmd[6], cmd[7]);
+    ctx->addr_indirect_object  = xe2_addr_63_12_mask(cmd[8], cmd[9]);
+    ctx->addr_instr            = xe2_addr_63_12_mask(cmd[10], cmd[11]);
+    ctx->addr_bindless_surface = xe2_addr_63_12_mask(cmd[16], cmd[17]);
+    ctx->addr_bindless_sampler = xe2_addr_63_12_mask(cmd[19], cmd[20]);
 }
 
 // The supplied ring DMA address is normalized such that the first dword is the
 // currently processed instruction header (opcode).
-static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring,
-                                            rvvm_addr_t pdp4, uint32_t op)
+static inline uint32_t xe2_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring, rvvm_addr_t pdp4,
+                                       uint32_t op)
 {
     switch (XE2_GFXPIPE_OPCODES_MASKED(op)) {
-        case XE2_GFXPIPE_CMD_PIPE_CONTROL: {
-            uint32_t flags = xe2_dma_read_32(xe2, ring, 1 * 4);
-            if ((flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_QW_WRITE) && (flags & XE2_GFXPIPE_CMD_PIPE_CONTROL_GLOBAL_GTT)) {
-                uint32_t a = xe2_dma_read_32(xe2, ring, 2 * 4);
-                uint32_t v = xe2_dma_read_32(xe2, ring, 4 * 4);
-                xe2_ring_store(xe2, a, v);
-            }
+        case XE2_GFXPIPE_CMD_PIPE_CONTROL:
+            xe2_gfxpipe_pipe_control_cmd(xe2, ring);
             break;
-        }
-        case XE2_GFXPIPE_CMD_STATE_BASE_ADDRESS: {
-            // We are interested in base addresses for different memory regions,
-            // discard flags (MOCS, modify, enable).
-            //
-            // I assume, these addresses are per-LRC. So we need to store them
-            // accordingly. Store XE2_MAX_CONTEXTS addresses rather senseless,
-            // find optimized approach.
-            uint32_t cmd[21] = {0};
-            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
-            ctx->addr_general_state    = xe2_addr_63_12_mask(cmd[1], cmd[2]);
-            ctx->addr_surf_state       = xe2_addr_63_12_mask(cmd[4], cmd[5]);
-            ctx->addr_dynamic_state    = xe2_addr_63_12_mask(cmd[6], cmd[7]);
-            ctx->addr_indirect_object  = xe2_addr_63_12_mask(cmd[8], cmd[9]);
-            ctx->addr_instr            = xe2_addr_63_12_mask(cmd[10], cmd[11]);
-            ctx->addr_bindless_surface = xe2_addr_63_12_mask(cmd[16], cmd[17]);
-            ctx->addr_bindless_sampler = xe2_addr_63_12_mask(cmd[19], cmd[20]);
+
+        case XE2_GFXPIPE_CMD_STATE_BASE_ADDRESS:
+            xe2_3dstate_base_address_cmd(xe2, ctx, ring);
             break;
-        }
 
         case XE2_GFXPIPE_CMD_3DSTATE_PS:
-            xe2_ring_3dstate_ps(xe2, ctx, pdp4, ring);
+            xe2_3dstate_ps_cmd(xe2, ctx, pdp4, ring);
             break;
         case XE2_GFXPIPE_CMD_3DSTATE_VS:
-            xe2_ring_3dstate_vs(xe2, ctx, pdp4, ring);
+            xe2_3dstate_vs_cmd(xe2, ctx, pdp4, ring);
             break;
         case XE2_GFXPIPE_CMD_3DSTATE_GS:
-            xe2_ring_3dstate_gs(xe2, ctx, pdp4, ring);
+            xe2_3dstate_gs_cmd(xe2, ctx, pdp4, ring);
             break;
         case XE2_GFXPIPE_CMD_3DSTATE_HS:
-            xe2_ring_3dstate_hs(xe2, ctx, pdp4, ring);
+            xe2_3dstate_hs_cmd(xe2, ctx, pdp4, ring);
+            break;
+
+        case XE2_GFXPIPE_CMD_3DSTATE_VERTEX_BUFFERS:
+            xe2_3dstate_vertex_buffers_cmd(xe2, ctx, ring, pdp4, op);
             break;
 
         case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_VS:
@@ -4590,7 +4777,7 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
         case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_DS:
         case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_GS:
         case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_PS:
-            xe2_ring_3dstate_binding_table_pointers(xe2, ctx, pdp4, ring, op);
+            xe2_ring_3dstate_binding_table_pointers_cmd(xe2, ctx, pdp4, ring, op);
             break;
 
         case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POOL_ALLOC: {
@@ -4606,33 +4793,14 @@ static inline uint32_t xe2_ring_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ct
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_DS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_GS:
         case XE2_GFXPIPE_CMD_3DSTATE_CONSTANT_PS: {
-            xe2_shader_kind_t kind                      = xe2_constant_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
-            uint32_t          cmd[XE2_CONST_CMD_DWORDS] = {0};
+            xe2_shader_kind_t kind = xe2_constant_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
+
+            uint32_t cmd[XE2_CONST_CMD_DWORDS] = {0};
             xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
             xe2_3dstate_constant(xe2, ctx, kind, pdp4, cmd);
             break;
         }
-        case XE2_GFXPIPE_CMD_3DSTATE_VERTEX_BUFFERS: {
-            // VERTEX_BUFFER_STATE entries, 4 dwords each, repeated (len-1)/4 times.
-            xe2_vertex_input_t* vi       = &ctx->d3d.vertex_input;
-            uint32_t            nentries = ((op & 0xFF) - 3) / 4; // header consumed 1 dword already
-            for (uint32_t i = 0; i < nentries && i < XE2_SHADER_MAX_BINDINGS; ++i) {
-                uint32_t cmd[4] = {0};
-                xe2_dma_read_many(xe2, xe2_dma_offset(ring, (1 + i * 4) * 4), cmd, 4);
-                uint32_t binding = (cmd[0] >> 26) & 0x3F;
-                if (binding >= XE2_SHADER_MAX_BINDINGS) {
-                    continue;
-                }
-                vi->buffer[binding].stride = (cmd[0] >> 0) & 0xFFF;
-                vi->buffer[binding].addr   = xe2_ppgtt_translate(xe2, pdp4, xe2_addr_63_6_mask(cmd[1], cmd[2]));
-                vi->buffer[binding].size   = cmd[3];
-                if (binding + 1 > vi->buffer_count) {
-                    vi->buffer_count = binding + 1;
-                }
-            }
-            ctx->d3d.ff_dirty = true;
-            break;
-        }
+
         case XE2_GFXPIPE_CMD_3DSTATE_VF_TOPOLOGY: {
             uint32_t cmd[2] = {0};
             xe2_dma_read_many(xe2, ring, cmd, 2);
@@ -4662,7 +4830,7 @@ static uint32_t xe2_ring_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr
             return xe2_mi_cmd(xe2, ctx, ring, pdp4, op, user_int);
             break;
         case XE2_INSTR_TYPE_GFXPIPE:
-            return xe2_ring_gfxpipe_cmd(xe2, ctx, ring, pdp4, op);
+            return xe2_gfxpipe_cmd(xe2, ctx, ring, pdp4, op);
             break;
         case XE2_INSTR_TYPE_GSC:
             return (op & 0xFF) + 2;
