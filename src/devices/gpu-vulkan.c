@@ -515,7 +515,6 @@ static bool gpu_vulkan_ensure_guest_pipeline(gpu_vulkan_ctx_t* ctx)
     uint64_t                  key   = gpu_vulkan_scene_key(scene);
 
     if (ctx->guest_pipeline != VK_NULL_HANDLE && ctx->guest_pipeline_key == key) {
-        rvvm_warn("%s: Already created", __FUNCTION__);
         return true;
     }
 
