@@ -2061,7 +2061,7 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
     // 000000000 0100000000 000000001 100000001 100100100000
     // |         |        |         |         |            |
     // 47        39       30        21        12           0
-    rvvm_addr_t root_addr = (pdp4 & ~0xFFFULL) + 0 * 8;
+    rvvm_addr_t root_addr = pdp4 & ~0xFFFULL;
     rvvm_addr_t root_e    = xe2_read_pte_lmem(xe2, root_addr);
     if (unlikely(!(root_e & 1))) {
         rvvm_warn("PPGTT: Root L4 entry not present (VA=0x%lx)", va);
@@ -2120,7 +2120,6 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PTE not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
-
     return (xe2_dma_addr_t) {
         .addr = (pte & ~0xFFFULL) + offset,
         .type = (pte & (1 << 11)) ? XE2_MEM_LMEM : XE2_MEM_SMEM,
@@ -4145,7 +4144,7 @@ static void xe2_decode_shader(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_shader_
         return;
     }
 
-    rvvm_info("(kind: %u) Kernel start address: 0x%lx", kind, addr_kernel);
+    rvvm_info("(kind: %s) Kernel start address: 0x%lx", xe2_shader_kind_to_string(kind), addr_kernel);
     xe2_dma_addr_t kernel_dma = xe2_ppgtt_translate(xe2, pdp4, va);
     xe2_print_decompiled_shader(xe2, kernel_dma);
 
@@ -4608,117 +4607,45 @@ static inline void xe2_3dstate_parse_binding_table_entry(xe2_dev_t* xe2, xe2_sub
     surface->valid      = !!surface->base.addr;
 }
 
-// This suspicious:
-//
-// We have updated binding table base and for some reason
-// translation logic suddenly fucked up.
-//
-// Binding table pointers (XE2_SHADER_VS): Offset: 0
-// Binding table pointers (XE2_SHADER_VS): Base: 13f600000
-// Binding table pointers (XE2_SHADER_VS): Translated entry: 0x400000
-// Binding table pointers (XE2_SHADER_VS): Payload DMA 0x0
-// Binding table pointers (XE2_SHADER_HS): Offset: 0
-// Binding table pointers (XE2_SHADER_HS): Base: 13f600000
-// Binding table pointers (XE2_SHADER_HS): Translated entry: 0x400000
-// Binding table pointers (XE2_SHADER_HS): Payload DMA 0x0
-// Binding table pointers (XE2_SHADER_DS): Offset: 0
-// Binding table pointers (XE2_SHADER_DS): Base: 13f600000
-// Binding table pointers (XE2_SHADER_DS): Translated entry: 0x400000
-// Binding table pointers (XE2_SHADER_DS): Payload DMA 0x0
-// Binding table pointers (XE2_SHADER_GS): Offset: 0
-// Binding table pointers (XE2_SHADER_GS): Base: 13f600000
-// Binding table pointers (XE2_SHADER_GS): Translated entry: 0x400000
-// Binding table pointers (XE2_SHADER_GS): Payload DMA 0x0
-// Binding table pointers (XE2_SHADER_PS): Offset: 20
-// Binding table pointers (XE2_SHADER_PS): Base: 13f600000
-// Binding table pointers (XE2_SHADER_PS): Translated entry: 0x400020
-// Binding table pointers (XE2_SHADER_PS): Payload DMA 0x170080
-// Binding table pointers (XE2_SHADER_PS): Count: 1
-// Binding table pointers (XE2_SHADER_PS): 0x20 (raw: 0x20)
-// Binding table pointers [0]: 0x3301c000 << Correct
-// Binding table pointers [1]: 0x200010e
-// Binding table pointers [2]: 0x437077f
-// Binding table pointers [3]: 0x1dff
-// Binding table pointers [4]: 0x0
-// Binding table pointers [5]: 0x20100
-// Binding table pointers [6]: 0x0
-// Binding table pointers [7]: 0x9770000
-// Binding table pointers [8]: 0xff600000
-// Binding table pointers [9]: 0xfffffffe
-// Binding table pointers [10]: 0x0
-// Binding table pointers [11]: 0x0
-// Binding table pointers [12]: 0x0
-// Binding table pointers [13]: 0x0
-//
-// Binding table pointers (XE2_SHADER_VS): Offset: 0
-// Binding table pointers (XE2_SHADER_VS): Base: 13f400000
-// Binding table pointers (XE2_SHADER_VS): Translated entry: 0x1c00000
-// Binding table pointers (XE2_SHADER_VS): Payload DMA 0x0
-// Binding table pointers (XE2_SHADER_HS): Offset: 0
-// Binding table pointers (XE2_SHADER_HS): Base: 13f400000
-// Binding table pointers (XE2_SHADER_HS): Translated entry: 0x1c00000
-// Binding table pointers (XE2_SHADER_HS): Payload DMA 0x0
-// Binding table pointers (XE2_SHADER_DS): Offset: 0
-// Binding table pointers (XE2_SHADER_DS): Base: 13f400000
-// Binding table pointers (XE2_SHADER_DS): Translated entry: 0x1c00000
-// Binding table pointers (XE2_SHADER_DS): Payload DMA 0x0
-// Binding table pointers (XE2_SHADER_GS): Offset: 0
-// Binding table pointers (XE2_SHADER_GS): Base: 13f400000
-// Binding table pointers (XE2_SHADER_GS): Translated entry: 0x1c00000
-// Binding table pointers (XE2_SHADER_GS): Payload DMA 0x0
-// Binding table pointers (XE2_SHADER_PS): Offset: 20
-// Binding table pointers (XE2_SHADER_PS): Base: 13f400000
-// Binding table pointers (XE2_SHADER_PS): Translated entry: 0x1c00020
-// Binding table pointers (XE2_SHADER_PS): Payload DMA 0x80 <<< BUG: This
-// Binding table pointers (XE2_SHADER_PS): Count: 1
-// Binding table pointers (XE2_SHADER_PS): 0x20 (raw: 0x20)
-// Binding table pointers [0]: 0x15040001
-// Binding table pointers [1]: 0x600
-// Binding table pointers [2]: 0x6210
-// Binding table pointers [3]: 0x11080005
-// Binding table pointers [4]: 0x600
-// Binding table pointers [5]: 0x0
-// Binding table pointers [6]: 0x608
-// Binding table pointers [7]: 0x0
-// Binding table pointers [8]: 0x610
-// Binding table pointers [9]: 0x0
-// Binding table pointers [10]: 0x78150009
-// Binding table pointers [11]: 0x0
-// Binding table pointers [12]: 0x0
-// Binding table pointers [13]: 0x0
 static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
                                                                xe2_dma_addr_t ring, uint32_t op)
 {
     xe2_shader_kind_t kind   = xe2_binding_table_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
     const char*       name   = xe2_shader_kind_to_string(kind);
     uint32_t          cmd[2] = {0};
+
     xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
 
-    ctx->d3d.binding_table_offset[kind] = cmd[1] & xe2_reg_genmask(20, 5);
+    rvvm_addr_t bt_offset               = cmd[1] & xe2_reg_genmask(20, 5);
+    ctx->d3d.binding_table_offset[kind] = bt_offset;
 
-    rvvm_info("Binding table pointers (%s): Offset: %x", name, ctx->d3d.binding_table_offset[kind]);
-    rvvm_info("Binding table pointers (%s): Base: %lx", name, ctx->addr_binding_table_base);
+    rvvm_addr_t    binding_table_va    = ctx->addr_binding_table_base + bt_offset;
+    xe2_dma_addr_t binding_table_dma   = xe2_ppgtt_translate(xe2, pdp4, binding_table_va);
+    uint32_t       binding_table_entry = xe2_dma_read_32(xe2, binding_table_dma, 0);
 
-    rvvm_addr_t    binding_table_address = ctx->addr_binding_table_base + ctx->d3d.binding_table_offset[kind];
-    xe2_dma_addr_t binding_table         = xe2_ppgtt_translate(xe2, pdp4, binding_table_address);
-    uint32_t       binding_table_entry   = xe2_dma_read_32(xe2, binding_table, 0);
+    rvvm_info(" ");
+    rvvm_info("Binding table pointers (%s): Offset: 0x%lx", name, bt_offset);
+    rvvm_info("Binding table pointers (%s): Base VA: 0x%lx", name, ctx->addr_binding_table_base);
+    rvvm_info("Binding table pointers (%s): BT VA: 0x%lx", name, binding_table_va);
+    rvvm_info("Binding table pointers (%s): BT DMA: 0x%lx", name, binding_table_dma.addr);
+    rvvm_info("Binding table pointers (%s): Entry: 0x%x", name, binding_table_entry);
 
-    rvvm_info("Binding table pointers (%s): Translated entry: 0x%lx", name, binding_table.addr);
+    rvvm_addr_t    surface_state_va  = ctx->addr_surf_state + binding_table_entry;
+    xe2_dma_addr_t surface_state_dma = xe2_ppgtt_translate(xe2, pdp4, surface_state_va);
 
-    xe2_dma_addr_t entry_dma = xe2_ppgtt_translate(xe2, pdp4, ctx->addr_surf_state + binding_table_entry);
-    rvvm_info("Binding table pointers (%s): Payload DMA 0x%lx", name, entry_dma.addr);
+    rvvm_info("Binding table pointers (%s): Surface state VA: 0x%lx", name, surface_state_va);
+    rvvm_info("Binding table pointers (%s): Surface state DMA: 0x%lx", name, surface_state_dma.addr);
 
-    // Guest sometimes reports zeroed 3DSTATE commands for some reason. If so,
-    // skip them.
-    if (unlikely(entry_dma.addr == 0x00)) {
+    if (unlikely(surface_state_dma.addr < 0x100)) {
+        rvvm_warn("Binding table pointers (%s): Suspicious surface state DMA: 0x%lx", name, surface_state_dma.addr);
         return;
     }
 
     rvvm_info("Binding table pointers (%s): Count: %u", name, ctx->d3d.binding_table_entry_count[kind]);
-    if (ctx->d3d.binding_table_entry_count[kind] > 0) {
-        rvvm_info("Binding table pointers (%s): 0x%x (raw: 0x%x)", name, ctx->d3d.binding_table_offset[kind], cmd[1]);
 
-        xe2_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, entry_dma, kind);
+    if (ctx->d3d.binding_table_entry_count[kind] > 0) {
+        xe2_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, surface_state_dma, kind);
+
         xe2_surface_print(name, &ctx->d3d.surface[kind][0]);
     }
 }
