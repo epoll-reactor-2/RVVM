@@ -4387,19 +4387,17 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
         .first_instance = params.first_instance,
     };
 
-    // BUG: Not each stage, only submitted ones.
     for (size_t i = 0; i < STATIC_ARRAY_SIZE(xe2_draw_stages); ++i) {
         xe2_shader_kind_t         kind   = xe2_draw_stages[i].xe2;
         const xe2_shader_stage_t* stage  = &d3d->shader[kind];
         const xe2_push_const_t*   consts = &d3d->consts[kind];
 
-        rvvm_info("%s: Write stage (vertex? %d, kind: %s, spirv: %p, words: %u)", __FUNCTION__,
-                  xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX, gpu_vulkan_stage_to_string(xe2_draw_stages[i].vk),
-                  stage->spirv, stage->spirv_nwords);
-        if (/* !stage->enabled || */ !stage->spirv) {
-            // This could happen when 3DPRIMITIVE was already issued without
-            // submitting kernel addresses (3DSTATE_PS/VS/HS/...). I have no
-            // idea why that happens, but that happens.
+        // rvvm_info("%s: Write stage (vertex? %d, kind: %s, spirv: %p, words: %u)", __FUNCTION__,
+        //           xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX,
+        //           gpu_vulkan_stage_to_string(xe2_draw_stages[i].vk), stage->spirv, stage->spirv_nwords);
+        if (!stage->enabled || !stage->spirv || !stage->spirv_nwords) {
+            rvvm_warn("%s: stage %s not ready (enabled=%d spirv=%p nwords=%u)", __FUNCTION__,
+                      xe2_shader_kind_to_string(kind), stage->enabled, stage->spirv, stage->spirv_nwords);
             continue;
         }
 
@@ -4542,17 +4540,13 @@ static inline void xe2_3dstate_vertex_buffers_cmd(xe2_dev_t* xe2, xe2_submit_ctx
     xe2_vertex_input_t* vertex = &ctx->d3d.vertex_input;
     size_t              total  = EVAL_MIN(((op & 0xFF) - 3) / 4, XE2_SHADER_MAX_BINDINGS);
 
-    // BUG: XE2_SHADER_MAX_BINDINGS value is wrong. We could have huge
-    //      vertex buffers of sizes:
-    //        Buffer Starting Address: 0xfffffffefe83f090
-    //      0xfffffffefff75c8c: 0x001c0f70: Dword 3
-    //        Buffer Size : 1838960 vertex buffer 0, size 2097152
-    //        -0.21       0.57       0.01
-    //        -0.20       0.59       0.01
-    //        -0.16       0.56      -0.02
+    rvvm_info("3DSTATE_VERTEX_BUFFERS cmd received (size: %zu)", total);
+
     for (size_t i = 0; i < total; ++i) {
         uint32_t buf[4] = {0};
         xe2_dma_read_many(xe2, xe2_dma_offset(ring, (1 + i * 4) * 4), buf, 4);
+
+        rvvm_info("3DSTATE_VERTEX_BUFFERS cmd read 4 dwords: 0x%x 0x%x 0x%x 0x%x", buf[0], buf[1], buf[2], buf[3]);
 
         uint32_t binding = (buf[0] >> 26) & 0x3F;
         if (binding >= XE2_SHADER_MAX_BINDINGS) {
@@ -4564,6 +4558,25 @@ static inline void xe2_3dstate_vertex_buffers_cmd(xe2_dev_t* xe2, xe2_submit_ctx
         if (binding + 1 > vertex->buffer_count) {
             vertex->buffer_count = binding + 1;
         }
+        // Sanity check. This command sometimes behaves in strange way.
+        // I don't know why this looks so corrupted.
+        //
+        // 0xfffffffefff7516c:  0x00000020 : Dword 3
+        //     Buffer Size: 32
+        // vertex buffer 0, size 36
+        //   buffer contents unavailable
+        // vertex buffer 0, size 36
+        //   buffer contents unavailable
+        // vertex buffer 0, size 36
+        //   buffer contents unavailable
+        if (vertex->buffer[binding].addr.addr < 0x1000) {
+            rvvm_info("3DSTATE_VERTEX_BUFFERS suspicious PPGTT translated address: 0x%lx",
+                      vertex->buffer[binding].addr.addr);
+            continue;
+        }
+
+        rvvm_info("3DSTATE_VERTEX_BUFFERS cmd (addr: 0x%lx, ppgtt: 0x%lx, size: 0x%x)",
+                  xe2_addr_63_6_mask(buf[1], buf[2]), vertex->buffer[binding].addr.addr, vertex->buffer[binding].size);
 
         // Print first submitted vertices to prove it works. Since big
         // amount of them is passed, we should consider deferring access
@@ -4587,24 +4600,23 @@ static inline void xe2_3dstate_vertex_buffers_cmd(xe2_dev_t* xe2, xe2_submit_ctx
 }
 
 static inline void xe2_3dstate_parse_binding_table_entry(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
-                                                         xe2_dma_addr_t dma, xe2_shader_kind_t kind)
+                                                         xe2_dma_addr_t dma, xe2_shader_kind_t kind, uint32_t index)
 {
-    uint32_t payload[14] = {0};
-    xe2_dma_read_many(xe2, dma, payload, STATIC_ARRAY_SIZE(payload));
-    for (size_t i = 0; i < STATIC_ARRAY_SIZE(payload); ++i) {
-        rvvm_info("Binding table pointers [%zu]: 0x%x", i, payload[i]);
-    }
+    uint32_t buf[16] = {0};
+    xe2_dma_read_many(xe2, dma, buf, 16);
 
-    // Temporary zero index.
-    xe2_surface_state_t* surface = &ctx->d3d.surface[kind][0];
+    xe2_surface_state_t* surface = &ctx->d3d.surface[kind][index];
 
-    surface->isl_format = xe2_reg_field_get(xe2_reg_genmask(26, 18), payload[0]);
-    surface->tile_mode  = xe2_reg_field_get(xe2_reg_genmask(13, 12), payload[0]);
-    surface->width      = xe2_reg_field_get(xe2_reg_genmask(13, 0), payload[2]);
-    surface->height     = xe2_reg_field_get(xe2_reg_genmask(29, 16), payload[2]);
-    surface->pitch      = xe2_reg_field_get(xe2_reg_genmask(17, 0), payload[3]);
-    surface->base       = xe2_ppgtt_translate(xe2, pdp4, xe2_concat_lohi(payload[8], payload[9]));
+    surface->isl_format = (buf[0] >> 18) & 0x1FF;
+    surface->tile_mode  = (buf[0] >> 12) & 0x3;
+    surface->width      = (buf[2] & 0x3FFF) + 1;
+    surface->height     = ((buf[2] >> 16) & 0x3FFF) + 1;
+    surface->pitch      = (buf[3] & 0x3FFFF) + 1;
+    rvvm_addr_t base_va = xe2_addr_63_12_mask(buf[8], buf[9]);
+    surface->base       = xe2_ppgtt_translate(xe2, pdp4, base_va);
     surface->valid      = !!surface->base.addr;
+
+    xe2_surface_print(xe2_shader_kind_to_string(kind), surface);
 }
 
 static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
@@ -4613,46 +4625,54 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
     xe2_shader_kind_t kind   = xe2_binding_table_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
     const char*       name   = xe2_shader_kind_to_string(kind);
     uint32_t          cmd[2] = {0};
+    xe2_dma_read_many(xe2, ring, cmd, 2);
 
-    xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+    rvvm_info("3DSTATE_BINDING_TABLE_POINTERS_*S: 0x%x 0x%x", cmd[0], cmd[1]);
 
-    rvvm_addr_t bt_offset               = cmd[1] & xe2_reg_genmask(20, 5);
+    uint32_t bt_offset                  = cmd[1] & 0x001FFFE0u;
     ctx->d3d.binding_table_offset[kind] = bt_offset;
 
-    rvvm_addr_t    binding_table_va    = ctx->addr_binding_table_base + bt_offset;
-    xe2_dma_addr_t binding_table_dma   = xe2_ppgtt_translate(xe2, pdp4, binding_table_va);
-    uint32_t       binding_table_entry = xe2_dma_read_32(xe2, binding_table_dma, 0);
-
-    rvvm_info(" ");
-    rvvm_info("Binding table pointers (%s): Offset: 0x%lx", name, bt_offset);
-    rvvm_info("Binding table pointers (%s): Base VA: 0x%lx", name, ctx->addr_binding_table_base);
-    rvvm_info("Binding table pointers (%s): BT VA: 0x%lx", name, binding_table_va);
-    rvvm_info("Binding table pointers (%s): BT DMA: 0x%lx", name, binding_table_dma.addr);
-    rvvm_info("Binding table pointers (%s): Entry: 0x%x", name, binding_table_entry);
-
-    rvvm_addr_t    surface_state_va  = ctx->addr_surf_state + binding_table_entry;
-    xe2_dma_addr_t surface_state_dma = xe2_ppgtt_translate(xe2, pdp4, surface_state_va);
-
-    rvvm_info("Binding table pointers (%s): Surface state VA: 0x%lx", name, surface_state_va);
-    rvvm_info("Binding table pointers (%s): Surface state DMA: 0x%lx", name, surface_state_dma.addr);
-
-    if (unlikely(surface_state_dma.addr < 0x100)) {
-        rvvm_warn("Binding table pointers (%s): Suspicious surface state DMA: 0x%lx", name, surface_state_dma.addr);
+    if (!ctx->addr_binding_table_base || !ctx->addr_surf_state) {
+        rvvm_warn("Binding table (%s): missing pool/SSBA (bt=0x%lx ss=0x%lx)", name,
+                  (unsigned long)ctx->addr_binding_table_base, (unsigned long)ctx->addr_surf_state);
         return;
     }
 
-    rvvm_info("Binding table pointers (%s): Count: %u", name, ctx->d3d.binding_table_entry_count[kind]);
+    rvvm_addr_t    bt_va  = ctx->addr_binding_table_base + bt_offset;
+    xe2_dma_addr_t bt_dma = xe2_ppgtt_translate(xe2, pdp4, bt_va);
+    if (!bt_dma.addr) {
+        rvvm_warn("Binding table (%s): BT VA 0x%lx not present", name, (unsigned long)bt_va);
+        return;
+    }
+    rvvm_info("3DSTATE_BINDING_TABLE_POINTERS_*S: 0x%lx -> 0x%lu", bt_va, bt_dma.addr);
 
-    if (ctx->d3d.binding_table_entry_count[kind] > 0) {
-        xe2_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, surface_state_dma, kind);
+    uint32_t count = ctx->d3d.binding_table_entry_count[kind];
+    if (count > XE2_MAX_BOUND_SURFACES) {
+        count = XE2_MAX_BOUND_SURFACES;
+    }
 
-        xe2_surface_print(name, &ctx->d3d.surface[kind][0]);
+    memset(ctx->d3d.surface[kind], 0, sizeof(ctx->d3d.surface[kind]));
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t entry  = xe2_dma_read_32(xe2, bt_dma, i * 4);
+        uint32_t ss_off = entry & 0xFFFFFFE0u;
+        if (!ss_off && i > 0) {
+            continue;
+        }
+
+        rvvm_addr_t    ss_va  = ctx->addr_surf_state + ss_off;
+        xe2_dma_addr_t ss_dma = xe2_ppgtt_translate(xe2, pdp4, ss_va);
+        if (!ss_dma.addr || ss_dma.addr < 0x100) {
+            rvvm_warn("Binding table (%s)[%u]: entry=0x%x ss_va=0x%lx bad DMA", name, i, entry, (unsigned long)ss_va);
+            continue;
+        }
+        xe2_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, ss_dma, kind, i);
     }
 }
 
 static inline void xe2_3dstate_base_address_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring)
 {
-    // discard flags (MOCS, modify, enable).
+    // Discard flags (MOCS, modify, enable).
     //
     // I assume, these addresses are per-LRC. So we need to store them
     // accordingly. Store XE2_MAX_CONTEXTS addresses rather senseless,
