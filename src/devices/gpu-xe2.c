@@ -4098,7 +4098,7 @@ static void xe2_print_decompiled_shader(xe2_dev_t* xe2, xe2_dma_addr_t dma)
         uint32_t op = xe2_dma_read_32(xe2, dma, i * 4);
         code[i]     = op;
         if (op == 0U) {
-            if (++zeros >= 4 && len > 0) {
+            if (++zeros >= 2 && len > 0) {
                 break;
             }
         } else {
