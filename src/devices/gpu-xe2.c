@@ -1683,9 +1683,6 @@ static void xe2_remove(rvvm_reg_dev_t* dev)
 
     // Tear the renderer down first: it owns a worker thread that blits
     // into the framebuffer memory freed further down.
-    //
-    // BUG: Corrupted synchronization, render is hangs in
-    // "in progress state" while destroyed.
     gpu_vulkan_destroy(xe2->vulkan_ctx);
 
     xe2->vulkan_ctx = NULL;
@@ -4296,44 +4293,218 @@ static uint32_t xe2_topology_to_vulkan(uint32_t topology)
     }
 }
 
-static inline void xe2_surface_print(const char* name, xe2_surface_state_t* surface)
+static const char* xe2_tile_mode_name(uint32_t tm)
 {
-    if (surface->valid) {
-        rvvm_info(" | (%s) ISL format:        %u", name, surface->isl_format);
-        rvvm_info(" | (%s) Tile mode:         %u", name, surface->tile_mode);
-        rvvm_info(" | (%s) Width/Height:      %u/%u", name, surface->width, surface->height);
-        rvvm_info(" | (%s) Pitch:             %u", name, surface->pitch);
-    } else {
-        rvvm_info(" | (%s) ... Empty", name);
+    switch (tm) {
+        case 0:
+            return "LINEAR";
+        case 1:
+            return "WMAJOR";
+        case 2:
+            return "XMAJOR";
+        case 3:
+            return "YMAJOR/TILE4";
+        default:
+            return "?";
     }
 }
 
-static inline void xe2_3dprimitive_print(xe2_submit_ctx_t* ctx)
+static inline void xe2_surface_print(const char* name, uint32_t index, const xe2_surface_state_t* surface)
 {
-    rvvm_info("3DPRIMITIVE state dump");
-    rvvm_info(" Surface states:");
+    if (surface->valid) {
+        rvvm_info(" |   (%s [%u]) ISL format:        %u", name, index, surface->isl_format);
+        rvvm_info(" |   (%s [%u]) Tile mode:         %u (%s)", name, index, surface->tile_mode,
+                  xe2_tile_mode_name(surface->tile_mode));
+        rvvm_info(" |   (%s [%u]) Width/Height:      %u/%u", name, index, surface->width, surface->height);
+        rvvm_info(" |   (%s [%u]) Pitch:             %u", name, index, surface->pitch);
+    } else {
+        rvvm_info(" |   (%s [%u]) ... Empty", name, index);
+    }
+}
 
-    if (ctx->d3d.shader[XE2_SHADER_PS].enabled) {
-        xe2_surface_print("PS", &ctx->d3d.surface[XE2_SHADER_PS][0]);
+static const char* xe2_topology_name(uint32_t topo)
+{
+    switch (topo) {
+        case 0x01:
+            return "POINTLIST";
+        case 0x02:
+            return "LINELIST";
+        case 0x03:
+            return "LINESTRIP";
+        case 0x04:
+            return "TRILIST";
+        case 0x05:
+            return "TRISTRIP";
+        case 0x06:
+            return "TRIFAN";
+        case 0x07:
+            return "QUADLIST";
+        case 0x08:
+            return "QUADSTRIP";
+        case 0x09:
+            return "LINELIST_ADJ";
+        case 0x0A:
+            return "LINESTRIP_ADJ";
+        case 0x0B:
+            return "TRILIST_ADJ";
+        case 0x0C:
+            return "TRISTRIP_ADJ";
+        case 0x0D:
+            return "TRISTRIP_REVERSE";
+        case 0x0E:
+            return "POLYGON";
+        case 0x0F:
+            return "RECTLIST";
+        case 0x10:
+            return "LINELOOP";
+        default:
+            return "UNKNOWN";
     }
-    if (ctx->d3d.shader[XE2_SHADER_VS].enabled) {
-        xe2_surface_print("VS", &ctx->d3d.surface[XE2_SHADER_VS][0]);
-    }
-    if (ctx->d3d.shader[XE2_SHADER_HS].enabled) {
-        xe2_surface_print("HS", &ctx->d3d.surface[XE2_SHADER_HS][0]);
-    }
-    if (ctx->d3d.shader[XE2_SHADER_DS].enabled) {
-        xe2_surface_print("DS", &ctx->d3d.surface[XE2_SHADER_DS][0]);
-    }
-    if (ctx->d3d.shader[XE2_SHADER_GS].enabled) {
-        xe2_surface_print("GS", &ctx->d3d.surface[XE2_SHADER_GS][0]);
-    }
+}
 
-    rvvm_info(" (PS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_PS].enabled);
-    rvvm_info(" (VS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_VS].enabled);
-    rvvm_info(" (HS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_HS].enabled);
-    rvvm_info(" (DS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_DS].enabled);
-    rvvm_info(" (GS) Shader enabled? %d", ctx->d3d.shader[XE2_SHADER_GS].enabled);
+static inline void xe2_3dprimitive_print_cmd(const xe2_submit_ctx_t* ctx, const uint32_t* cmd)
+{
+    bool     indexed        = (cmd[1] >> 8) & 1;
+    uint32_t vertex_count   = cmd[2];
+    uint32_t start_vertex   = cmd[3];
+    uint32_t instance_count = cmd[4] ? cmd[4] : 1;
+    uint32_t start_instance = cmd[5];
+    int32_t  base_vertex    = (int32_t)cmd[6];
+
+    const xe2_3dstate_t*      d3d = &ctx->d3d;
+    const xe2_vertex_input_t* vi  = &d3d->vertex_input;
+
+    rvvm_info(" Draw:");
+    rvvm_info(" | indexed          = %s", indexed ? "yes (INDEXED)" : "no (SEQUENTIAL)");
+    rvvm_info(" | topology         = 0x%02x (%s)  -> vk %u", vi->topology, xe2_topology_name(vi->topology),
+              xe2_topology_to_vulkan(vi->topology));
+    rvvm_info(" | vertex_count     = %u", vertex_count);
+    rvvm_info(" | start_vertex     = %u", start_vertex);
+    rvvm_info(" | instance_count   = %u", instance_count);
+    rvvm_info(" | start_instance   = %u", start_instance);
+    rvvm_info(" | base_vertex      = %d", base_vertex);
+}
+
+static inline void xe2_3dprimitive_print_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex_input_t* vi)
+{
+    rvvm_info(" Vertex buffers (%u):", vi->buffer_count);
+    for (uint32_t i = 0; i < vi->buffer_count; ++i) {
+        const xe2_vertex_buffer_t* vb = &vi->buffer[i];
+        // Sanity check. This command sometimes behaves in strange way.
+        // I don't know why this looks so corrupted.
+        //
+        // 0xfffffffefff7516c:  0x00000020 : Dword 3
+        //     Buffer Size: 32
+        // vertex buffer 0, size 36
+        //   buffer contents unavailable
+        // vertex buffer 0, size 36
+        //   buffer contents unavailable
+        // vertex buffer 0, size 36
+        //   buffer contents unavailable
+        if (vb->addr.addr < 0x1000) {
+            rvvm_info(" | [%u]  <invalid>", i);
+            continue;
+        }
+        rvvm_info(" | [%u]  addr=0x%" PRIx64 "  stride=%u  size=%u", i, vb->addr.addr, vb->stride, vb->size);
+
+        if (vb->size >= 12) {
+            uint32_t buffers[30] = {0};
+            uint32_t size        = EVAL_MIN(STATIC_ARRAY_SIZE(buffers), vb->size / 4);
+            xe2_dma_read_many(xe2, vb->addr, buffers, STATIC_ARRAY_SIZE(buffers));
+
+            for (uint32_t j = 0; j + 2 < size; j += 3) {
+                float x, y, z;
+                memcpy(&x, &buffers[j + 0], sizeof(x));
+                memcpy(&y, &buffers[j + 1], sizeof(y));
+                memcpy(&z, &buffers[j + 2], sizeof(z));
+                char dump[128] = {0};
+                sprintf(dump, " | Vertex[%u]: %.3f %.3f %.3f", j / 3, (double)x, (double)y, (double)z);
+                rvvm_info("%s", dump);
+            }
+        }
+    }
+}
+
+static inline void xe2_3dprimitive_print_shaders(const xe2_3dstate_t* d3d)
+{
+    static const struct {
+        xe2_shader_kind_t kind;
+        const char*       name;
+    } stages[] = {
+        {XE2_SHADER_VS, "VS"},
+        {XE2_SHADER_HS, "HS"},
+        {XE2_SHADER_DS, "DS"},
+        {XE2_SHADER_GS, "GS"},
+        {XE2_SHADER_PS, "PS"},
+    };
+
+    for (size_t s = 0; s < STATIC_ARRAY_SIZE(stages); ++s) {
+        xe2_shader_kind_t         kind = stages[s].kind;
+        const char*               name = stages[s].name;
+        const xe2_shader_stage_t* sh   = &d3d->shader[kind];
+        const xe2_push_const_t*   pc   = &d3d->consts[kind];
+
+        rvvm_info(" Stage %s:", name);
+        rvvm_info(" | enabled      = %d", sh->enabled);
+        rvvm_info(" | spirv        = %p  (%u words)", sh->spirv, sh->spirv_nwords);
+        rvvm_info(" | push consts  = %u bytes  dirty=%d", pc->nbytes, pc->dirty);
+
+        if (pc->nbytes) {
+            const uint8_t* p    = (const uint8_t*)pc->payload;
+            uint32_t       dump = EVAL_MIN(pc->nbytes, 64u);
+            char           line[128];
+            for (uint32_t off = 0; off < dump; off += 16) {
+                int len  = 0;
+                len     += sprintf(line + len, "     %04x:", off);
+                for (uint32_t i = 0; i < 16 && off + i < dump; ++i) {
+                    len += sprintf(line + len, " %02x", p[off + i]);
+                }
+                rvvm_info("%s", line);
+            }
+            if (pc->nbytes > 64) {
+                rvvm_info("     ... (%u more bytes)", pc->nbytes - 64);
+            }
+        }
+
+        uint32_t bt_count = d3d->binding_table_entry_count[kind];
+        rvvm_info(" | binding table entries = %u  (offset 0x%x)", bt_count, d3d->binding_table_offset[kind]);
+
+        for (uint32_t t = 0; /* t < bt_count && */ t < XE2_MAX_BOUND_SURFACES; ++t) {
+            xe2_surface_print(name, t, &d3d->surface[kind][t]);
+        }
+    }
+}
+
+static inline void xe2_3dprimitive_print_base_addresses(xe2_submit_ctx_t* ctx)
+{
+    rvvm_info(" Base addresses:");
+    rvvm_info(" | general_state     = 0x%lx", ctx->addr_general_state);
+    rvvm_info(" | surface_state     = 0x%lx", ctx->addr_surf_state);
+    rvvm_info(" | dynamic_state     = 0x%lx", ctx->addr_dynamic_state);
+    rvvm_info(" | instruction       = 0x%lx", ctx->addr_instr);
+    rvvm_info(" | binding_table     = 0x%lx", ctx->addr_binding_table_base);
+    rvvm_info(" | bindless_surface  = 0x%lx", ctx->addr_bindless_surface);
+    rvvm_info(" | bindless_sampler  = 0x%lx", ctx->addr_bindless_sampler);
+}
+
+// BUG: No XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BUFFER?
+// BUG: No XE2_GFXPIPE_CMD_3DSTATE_WM_HZ_OP?
+// BUG: No XE2_GFXPIPE_CMD_3DSTATE_VERTEX_ELEMENTS?
+// BUG: PS shader is broken, not compiled.
+
+// Smokin' weed with you 'cause you've taught me to
+static inline void xe2_3dprimitive_print(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, const uint32_t* cmd)
+{
+    const xe2_3dstate_t*      d3d = &ctx->d3d;
+    const xe2_vertex_input_t* vi  = &d3d->vertex_input;
+
+    rvvm_info("========== 3DPRIMITIVE aggregate dump ==========");
+    xe2_3dprimitive_print_cmd(ctx, cmd);
+    xe2_3dprimitive_print_vertex_buffers(xe2, vi);
+    xe2_3dprimitive_print_shaders(d3d);
+    xe2_3dprimitive_print_base_addresses(ctx);
+    rvvm_info(" Index buffer:  <not decoded yet>");
+    rvvm_info("================================================");
 }
 
 // Turn the accumulated 3D state into a draw for the Vulkan backend.
@@ -4346,7 +4517,7 @@ static inline void xe2_3dprimitive_print(xe2_submit_ctx_t* ctx)
 // screen.
 static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd)
 {
-    xe2_3dprimitive_print(ctx);
+    xe2_3dprimitive_print(xe2, ctx, cmd);
 
     bool     indexed        = (cmd[1] >> 8) & 1; // VertexAccessType
     uint32_t vertex_count   = cmd[2];
@@ -4552,47 +4723,12 @@ static inline void xe2_3dstate_vertex_buffers_cmd(xe2_dev_t* xe2, xe2_submit_ctx
         if (binding >= XE2_SHADER_MAX_BINDINGS) {
             continue;
         }
+        rvvm_addr_t phys               = xe2_addr_63_6_mask(buf[1], buf[2]);
         vertex->buffer[binding].stride = (buf[0] >> 0) & 0xFFF;
-        vertex->buffer[binding].addr   = xe2_ppgtt_translate(xe2, pdp4, xe2_addr_63_6_mask(buf[1], buf[2]));
+        vertex->buffer[binding].addr   = xe2_ppgtt_translate(xe2, pdp4, phys);
         vertex->buffer[binding].size   = buf[3];
         if (binding + 1 > vertex->buffer_count) {
             vertex->buffer_count = binding + 1;
-        }
-        // Sanity check. This command sometimes behaves in strange way.
-        // I don't know why this looks so corrupted.
-        //
-        // 0xfffffffefff7516c:  0x00000020 : Dword 3
-        //     Buffer Size: 32
-        // vertex buffer 0, size 36
-        //   buffer contents unavailable
-        // vertex buffer 0, size 36
-        //   buffer contents unavailable
-        // vertex buffer 0, size 36
-        //   buffer contents unavailable
-        if (vertex->buffer[binding].addr.addr < 0x1000) {
-            rvvm_info("3DSTATE_VERTEX_BUFFERS suspicious PPGTT translated address: 0x%lx",
-                      vertex->buffer[binding].addr.addr);
-            continue;
-        }
-
-        rvvm_info("3DSTATE_VERTEX_BUFFERS cmd (addr: 0x%lx, ppgtt: 0x%lx, size: 0x%x)",
-                  xe2_addr_63_6_mask(buf[1], buf[2]), vertex->buffer[binding].addr.addr, vertex->buffer[binding].size);
-
-        // Print first submitted vertices to prove it works. Since big
-        // amount of them is passed, we should consider deferring access
-        // to them somewhere near Vulkan renderer.
-        {
-            uint32_t buffers[16] = {0};
-            xe2_dma_read_many(xe2, vertex->buffer[binding].addr, buffers, STATIC_ARRAY_SIZE(buffers));
-            for (uint32_t j = 0; j + 2 < STATIC_ARRAY_SIZE(buffers); j += 3) {
-                float x, y, z;
-                memcpy(&x, &buffers[j + 0], sizeof(x));
-                memcpy(&y, &buffers[j + 1], sizeof(y));
-                memcpy(&z, &buffers[j + 2], sizeof(z));
-                char dump[128] = {0};
-                sprintf(dump, "Vertex[%u]: %.3f %.3f %.3f", j / 3, (double)x, (double)y, (double)z);
-                rvvm_info("%s", dump);
-            }
         }
     }
 
@@ -4616,7 +4752,16 @@ static inline void xe2_3dstate_parse_binding_table_entry(xe2_dev_t* xe2, xe2_sub
     surface->base       = xe2_ppgtt_translate(xe2, pdp4, base_va);
     surface->valid      = !!surface->base.addr;
 
-    xe2_surface_print(xe2_shader_kind_to_string(kind), surface);
+    rvvm_info("Received binding table entry [%u - %s][%u]:", kind, xe2_shader_kind_to_string(kind), index);
+    rvvm_info("  isl_format = 0x%x", surface->isl_format);
+    rvvm_info("  tile_mode  = %u", surface->tile_mode);
+    rvvm_info("  width      = %u", surface->width);
+    rvvm_info("  height     = %u", surface->height);
+    rvvm_info("  pitch      = %u", surface->pitch);
+    rvvm_info("  base       = 0x%lx (0x%lx)", surface->base.addr, base_va);
+    rvvm_info("  valid      = %u", surface->valid);
+
+    xe2_surface_print(xe2_shader_kind_to_string(kind), index, surface);
 }
 
 static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
@@ -4627,7 +4772,8 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
     uint32_t          cmd[2] = {0};
     xe2_dma_read_many(xe2, ring, cmd, 2);
 
-    rvvm_info("3DSTATE_BINDING_TABLE_POINTERS_*S: 0x%x 0x%x", cmd[0], cmd[1]);
+    rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s (cmd): [0]=0x%x [1]=0x%x", xe2_shader_kind_to_string(kind), cmd[0],
+              cmd[1]);
 
     uint32_t bt_offset                  = cmd[1] & 0x001FFFE0u;
     ctx->d3d.binding_table_offset[kind] = bt_offset;
@@ -4644,7 +4790,8 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
         rvvm_warn("Binding table (%s): BT VA 0x%lx not present", name, (unsigned long)bt_va);
         return;
     }
-    rvvm_info("3DSTATE_BINDING_TABLE_POINTERS_*S: 0x%lx -> 0x%lu", bt_va, bt_dma.addr);
+    rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: VA:0x%lx -(PPGTT)-> DMA:0x%lx", xe2_shader_kind_to_string(kind),
+              bt_va, bt_dma.addr);
 
     uint32_t count = ctx->d3d.binding_table_entry_count[kind];
     if (count > XE2_MAX_BOUND_SURFACES) {
@@ -4662,10 +4809,15 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
 
         rvvm_addr_t    ss_va  = ctx->addr_surf_state + ss_off;
         xe2_dma_addr_t ss_dma = xe2_ppgtt_translate(xe2, pdp4, ss_va);
+        rvvm_warn("Binding table (%s)[%u]: entry=0x%x ss_va=0x%lx, ss_dma=0x%lx", name, i, entry, ss_va, ss_dma.addr);
         if (!ss_dma.addr || ss_dma.addr < 0x100) {
-            rvvm_warn("Binding table (%s)[%u]: entry=0x%x ss_va=0x%lx bad DMA", name, i, entry, (unsigned long)ss_va);
+            rvvm_warn("Binding table bad DMA");
             continue;
         }
+        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: Entry = 0x%x", xe2_shader_kind_to_string(kind), entry);
+        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: DMA:0x%lx -> GUEST:0x%lx", xe2_shader_kind_to_string(kind), ss_va,
+                  ss_dma.addr);
+
         xe2_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, ss_dma, kind, i);
     }
 }
