@@ -1951,19 +1951,27 @@ static inline uint32_t xe2_dma_read_32(xe2_dev_t* xe2, xe2_dma_addr_t dma, size_
     }
 }
 
-static inline void xe2_dma_read_many(xe2_dev_t* xe2, xe2_dma_addr_t dma, void* out, uint32_t n)
+// \return Was successfully read or not.
+static inline bool xe2_dma_read_many(xe2_dev_t* xe2, xe2_dma_addr_t dma, void* out, uint32_t n)
 {
     uint32_t total = n * sizeof(uint32_t);
 
     if (dma.type == XE2_MEM_LMEM) {
         if (unlikely(dma.addr + total > XE2_VRAM_SIZE)) {
-            return;
+            rvvm_warn("Xe2 DMA (LMEM) read out of range, 0x%lx + %u > VRAM size: %u", dma.addr, total, XE2_VRAM_SIZE);
+            return 0;
         }
         memcpy(out, xe2->vram + dma.addr, total);
+        return 1;
     } else {
-        uint32_t* ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr, 4);
-        memcpy(out, ptr, total);
+        uint32_t* ptr = rvvm_pci_get_dma(xe2->pci_func, dma.addr, total);
+        if (likely(ptr)) {
+            memcpy(out, ptr, total);
+        } else {
+            rvvm_warn("Xe2 DMA (SMEM) read failed, address: 0x%lx", dma.addr);
+        }
         rvvm_pci_end_dma(xe2->pci_func, ptr);
+        return !!ptr;
     }
 }
 
@@ -2016,15 +2024,21 @@ static void xe2_dma_write_32(xe2_dev_t* xe2, xe2_dma_addr_t dma, size_t off, uin
 // Add/subtract an offset to the DMA address. DMA type left unchanged.
 static inline xe2_dma_addr_t xe2_dma_offset(xe2_dma_addr_t dma, ssize_t off)
 {
-    return (xe2_dma_addr_t) {.addr = dma.addr + off, .type = dma.type};
+    return (xe2_dma_addr_t) {
+        .addr = dma.addr + off,
+        .type = dma.type,
+    };
 }
 
 static rvvm_addr_t xe2_read_pte_lmem(xe2_dev_t* xe2, rvvm_addr_t phys_addr)
 {
     // Table levels (PML4/PDPT/PD/PT) are always LMEM-resident.
-    xe2_dma_addr_t dma = {.addr = phys_addr & ~0xFFFULL, .type = XE2_MEM_LMEM};
-    uint32_t       lo  = xe2_dma_read_32(xe2, dma, phys_addr & 0xFFFULL);
-    uint32_t       hi  = xe2_dma_read_32(xe2, dma, (phys_addr & 0xFFFULL) + 4);
+    xe2_dma_addr_t dma = {
+        .addr = phys_addr & ~0xFFFULL,
+        .type = XE2_MEM_LMEM,
+    };
+    uint32_t lo = xe2_dma_read_32(xe2, dma, phys_addr & 0xFFFULL);
+    uint32_t hi = xe2_dma_read_32(xe2, dma, (phys_addr & 0xFFFULL) + 4);
     return xe2_concat_lohi(lo, hi);
 }
 
@@ -2036,7 +2050,10 @@ static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t* xe2, rvvm_addr_t ggtt
 
     if (unlikely(!(pte & 1))) {
         rvvm_warn("PTE 0x%" PRIu64 " is invalid!", pte);
-        return (xe2_dma_addr_t) {.addr = 0, .type = 0};
+        return (xe2_dma_addr_t) {
+            .addr = 0,
+            .type = 0,
+        };
     }
 
     return (xe2_dma_addr_t) {
@@ -2078,6 +2095,7 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PML4e not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
+    rvvm_info("PPGTT translation (1): pml4e: 0x%lx", pml4e);
 
     rvvm_addr_t pdpt_addr = (pml4e & ~0xFFFULL) + pdpt_idx * 8;
     rvvm_addr_t pdpte     = xe2_read_pte_lmem(xe2, pdpt_addr);
@@ -2085,6 +2103,7 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PDPTe not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
+    rvvm_info("PPGTT translation (2): pdpte: 0x%lx", pdpte);
 
     // 1 GiB huge page
     if (pdpte & (1 << 7)) {
@@ -2101,6 +2120,7 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PDE not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
+    rvvm_info("PPGTT translation (3): pde: 0x%lx", pde);
 
     // 2 MiB huge page
     if (likely(pde & (1 << 7))) {
@@ -2117,6 +2137,9 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PTE not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
+    rvvm_info("PPGTT translation (4): pte: 0x%lx", pte);
+    rvvm_info("PPGTT translation (5): result: 0x%llx", (pte & ~0xFFFULL) + offset);
+
     return (xe2_dma_addr_t) {
         .addr = (pte & ~0xFFFULL) + offset,
         .type = (pte & (1 << 11)) ? XE2_MEM_LMEM : XE2_MEM_SMEM,
@@ -3843,7 +3866,9 @@ static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_
 
     for (uint32_t i = 0; i < limit; ++i) {
         xe2_qword_t qw = {0};
-        xe2_dma_read_many(xe2, xe2_dma_offset(dma, off), &qw, sizeof(qw) / sizeof(uint32_t));
+        if (!xe2_dma_read_many(xe2, xe2_dma_offset(dma, off), &qw, sizeof(qw) / sizeof(uint32_t))) {
+            continue;
+        }
         if (qw.hi == 0U) {
             if (++zeros >= 4 && len > 0) {
                 break;
@@ -4410,7 +4435,9 @@ static inline void xe2_3dprimitive_print_vertex_buffers(xe2_dev_t* xe2, const xe
         if (vb->size >= 12) {
             uint32_t buffers[30] = {0};
             uint32_t size        = EVAL_MIN(STATIC_ARRAY_SIZE(buffers), vb->size / 4);
-            xe2_dma_read_many(xe2, vb->addr, buffers, STATIC_ARRAY_SIZE(buffers));
+            if (!xe2_dma_read_many(xe2, vb->addr, buffers, STATIC_ARRAY_SIZE(buffers))) {
+                continue;
+            }
 
             for (uint32_t j = 0; j + 2 < size; j += 3) {
                 float x, y, z;
@@ -4636,7 +4663,10 @@ static inline void xe2_gfxpipe_pipe_control_cmd(xe2_dev_t* xe2, xe2_dma_addr_t r
 static inline void xe2_3dstate_ps_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
 {
     uint32_t cmd[12] = {0};
-    xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
     rvvm_addr_t addr_kernel[] = {
         xe2_addr_63_6_mask(cmd[1], cmd[2]),
         xe2_addr_63_6_mask(cmd[8], cmd[9]),
@@ -4660,7 +4690,10 @@ static inline void xe2_3dstate_ps_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
 static inline void xe2_3dstate_vs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
 {
     uint32_t cmd[9] = {0};
-    xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
     bool enable = cmd[7] & 1;
     if (enable) {
         rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
@@ -4676,7 +4709,10 @@ static inline void xe2_3dstate_vs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
 static inline void xe2_3dstate_gs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
 {
     uint32_t cmd[10] = {0};
-    xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
     bool enable = cmd[7] & 1;
     if (enable) {
         rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
@@ -4692,7 +4728,10 @@ static inline void xe2_3dstate_gs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
 static inline void xe2_3dstate_hs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4, xe2_dma_addr_t ring)
 {
     uint32_t cmd[9] = {0};
-    xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
     bool enable = (cmd[2] >> 31) & 1;
     if (enable) {
         rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[3], cmd[4]);
@@ -4715,7 +4754,9 @@ static inline void xe2_3dstate_vertex_buffers_cmd(xe2_dev_t* xe2, xe2_submit_ctx
 
     for (size_t i = 0; i < total; ++i) {
         uint32_t buf[4] = {0};
-        xe2_dma_read_many(xe2, xe2_dma_offset(ring, (1 + i * 4) * 4), buf, 4);
+        if (!xe2_dma_read_many(xe2, xe2_dma_offset(ring, (1 + i * 4) * 4), buf, 4)) {
+            continue;
+        }
 
         rvvm_info("3DSTATE_VERTEX_BUFFERS cmd read 4 dwords: 0x%x 0x%x 0x%x 0x%x", buf[0], buf[1], buf[2], buf[3]);
 
@@ -4739,7 +4780,9 @@ static inline void xe2_3dstate_parse_binding_table_entry(xe2_dev_t* xe2, xe2_sub
                                                          xe2_dma_addr_t dma, xe2_shader_kind_t kind, uint32_t index)
 {
     uint32_t buf[16] = {0};
-    xe2_dma_read_many(xe2, dma, buf, 16);
+    if (!xe2_dma_read_many(xe2, dma, buf, 16)) {
+        return;
+    }
 
     xe2_surface_state_t* surface = &ctx->d3d.surface[kind][index];
 
@@ -4770,7 +4813,9 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
     xe2_shader_kind_t kind   = xe2_binding_table_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
     const char*       name   = xe2_shader_kind_to_string(kind);
     uint32_t          cmd[2] = {0};
-    xe2_dma_read_many(xe2, ring, cmd, 2);
+    if (!xe2_dma_read_many(xe2, ring, cmd, 2)) {
+        return;
+    }
 
     rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s (cmd): [0]=0x%x [1]=0x%x", xe2_shader_kind_to_string(kind), cmd[0],
               cmd[1]);
@@ -4790,7 +4835,7 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
         rvvm_warn("Binding table (%s): BT VA 0x%lx not present", name, (unsigned long)bt_va);
         return;
     }
-    rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: VA:0x%lx -(PPGTT)-> DMA:0x%lx", xe2_shader_kind_to_string(kind),
+    rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: VA: 0x%lx -(PPGTT)-> DMA: 0x%lx", xe2_shader_kind_to_string(kind),
               bt_va, bt_dma.addr);
 
     uint32_t count = ctx->d3d.binding_table_entry_count[kind];
@@ -4809,14 +4854,16 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
 
         rvvm_addr_t    ss_va  = ctx->addr_surf_state + ss_off;
         xe2_dma_addr_t ss_dma = xe2_ppgtt_translate(xe2, pdp4, ss_va);
-        rvvm_warn("Binding table (%s)[%u]: entry=0x%x ss_va=0x%lx, ss_dma=0x%lx", name, i, entry, ss_va, ss_dma.addr);
-        if (!ss_dma.addr || ss_dma.addr < 0x100) {
+        rvvm_info("Binding table (%s)[%u]: entry: 0x%x, ss_va: 0x%lx, ss_dma: 0x%lx", name, i, entry, ss_va,
+                  ss_dma.addr);
+        if (!ss_dma.addr) {
             rvvm_warn("Binding table bad DMA");
+            ctx->d3d.surface[kind][i].valid = 0;
             continue;
         }
-        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: Entry = 0x%x", xe2_shader_kind_to_string(kind), entry);
-        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: DMA:0x%lx -> GUEST:0x%lx", xe2_shader_kind_to_string(kind), ss_va,
-                  ss_dma.addr);
+        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: entry: 0x%x", xe2_shader_kind_to_string(kind), entry);
+        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: DMA: 0x%lx -> GUEST: 0x%lx", xe2_shader_kind_to_string(kind),
+                  ss_va, ss_dma.addr);
 
         xe2_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, ss_dma, kind, i);
     }
@@ -4830,7 +4877,10 @@ static inline void xe2_3dstate_base_address_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t
     // accordingly. Store XE2_MAX_CONTEXTS addresses rather senseless,
     // find optimized approach.
     uint32_t cmd[21] = {0};
-    xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
     ctx->addr_general_state    = xe2_addr_63_12_mask(cmd[1], cmd[2]);
     ctx->addr_surf_state       = xe2_addr_63_12_mask(cmd[4], cmd[5]);
     ctx->addr_dynamic_state    = xe2_addr_63_12_mask(cmd[6], cmd[7]);
@@ -4881,7 +4931,9 @@ static inline uint32_t xe2_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe
 
         case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POOL_ALLOC: {
             uint32_t cmd[4] = {0};
-            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+            if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+                break;
+            }
             ctx->addr_binding_table_base = xe2_addr_63_12_mask(cmd[1], cmd[2]);
             rvvm_info("BINDING_TABLE_POOL_ALLOC base: 0x%lx", ctx->addr_binding_table_base);
             break;
@@ -4895,21 +4947,27 @@ static inline uint32_t xe2_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe
             xe2_shader_kind_t kind = xe2_constant_cmd_to_stage(XE2_GFXPIPE_OPCODES_MASKED(op));
 
             uint32_t cmd[XE2_CONST_CMD_DWORDS] = {0};
-            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+            if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+                break;
+            }
             xe2_3dstate_constant(xe2, ctx, kind, pdp4, cmd);
             break;
         }
 
         case XE2_GFXPIPE_CMD_3DSTATE_VF_TOPOLOGY: {
             uint32_t cmd[2] = {0};
-            xe2_dma_read_many(xe2, ring, cmd, 2);
+            if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+                break;
+            }
             ctx->d3d.vertex_input.topology = cmd[1] & 0x3F; // PRIM_TOPOLOGY_TYPE enum
             ctx->d3d.ff_dirty              = true;
             break;
         }
         case XE2_GFXPIPE_CMD_3DPRIMITIVE: {
             uint32_t cmd[7] = {0};
-            xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd));
+            if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+                break;
+            }
             xe2_3dprimitive(xe2, ctx, cmd);
             break;
         }
