@@ -4824,7 +4824,7 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
     ctx->d3d.binding_table_offset[kind] = bt_offset;
 
     if (!ctx->addr_binding_table_base || !ctx->addr_surf_state) {
-        rvvm_warn("Binding table (%s): missing pool/SSBA (bt=0x%lx ss=0x%lx)", name,
+        rvvm_warn("3DSTATE_BINDING_TABLE_POINTERS (%s): missing pool/SSBA (bt: 0x%lx ss: 0x%lx)", name,
                   (unsigned long)ctx->addr_binding_table_base, (unsigned long)ctx->addr_surf_state);
         return;
     }
@@ -4832,7 +4832,7 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
     rvvm_addr_t    bt_va  = ctx->addr_binding_table_base + bt_offset;
     xe2_dma_addr_t bt_dma = xe2_ppgtt_translate(xe2, pdp4, bt_va);
     if (!bt_dma.addr) {
-        rvvm_warn("Binding table (%s): BT VA 0x%lx not present", name, (unsigned long)bt_va);
+        rvvm_warn("Binding table (%s): BT VA 0x%lx not present", name, bt_va);
         return;
     }
     rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: VA: 0x%lx -(PPGTT)-> DMA: 0x%lx", xe2_shader_kind_to_string(kind),
@@ -4854,16 +4854,13 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
 
         rvvm_addr_t    ss_va  = ctx->addr_surf_state + ss_off;
         xe2_dma_addr_t ss_dma = xe2_ppgtt_translate(xe2, pdp4, ss_va);
-        rvvm_info("Binding table (%s)[%u]: entry: 0x%x, ss_va: 0x%lx, ss_dma: 0x%lx", name, i, entry, ss_va,
-                  ss_dma.addr);
+        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s [%u]: entry: 0x%x, ss_va: 0x%lx, ss_dma: 0x%lx", name, i, entry,
+                  ss_va, ss_dma.addr);
         if (!ss_dma.addr) {
             rvvm_warn("Binding table bad DMA");
             ctx->d3d.surface[kind][i].valid = 0;
             continue;
         }
-        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: entry: 0x%x", xe2_shader_kind_to_string(kind), entry);
-        rvvm_info("3DSTATE_BINDING_TABLE_POINTERS %s: DMA: 0x%lx -> GUEST: 0x%lx", xe2_shader_kind_to_string(kind),
-                  ss_va, ss_dma.addr);
 
         xe2_3dstate_parse_binding_table_entry(xe2, ctx, pdp4, ss_dma, kind, i);
     }
