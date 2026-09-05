@@ -2067,6 +2067,34 @@ static inline xe2_dma_addr_t xe2_ggtt_translate(xe2_dev_t* xe2, rvvm_addr_t ggtt
 //
 // I hope this translation will not be used in GPU rendering hotspots due
 // to ton branching and lookups.
+//
+// BUG: Important thing spotted. When rendering enabled (3DPRIMITIVE),
+//      emulator receives binding tables:
+//      - Received binding table entry [4 - XE2_SHADER_PS][0]:
+//      -   isl_format = 0x0
+//      -   tile_mode  = 0
+//      -   width      = 1
+//      -   height     = 1
+//      -   pitch      = 1
+//      -   base       = 0x0 (0x0)
+//      -   valid      = 0
+//      ...
+//      Next it suddenly  starts to receive correct
+//      data through PPGTT:
+//      Received binding table entry [4 - XE2_SHADER_PS][0]:
+//        isl_format = 0xc0
+//        tile_mode  = 0
+//        width      = 1920
+//        height     = 1080
+//        pitch      = 7680
+//        base       = 0x3800000 (0xfffffffefe000000)
+//        valid      = 1
+//      ...
+//      This tells us that PPGTT path is correct. But somewhere
+//      between memory gets corrupted. We should double-check
+//      GUC TLB invalidation request. For now we report it as
+//      done unconditionally without any reasonable waiting
+//      for memory.
 static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp4, rvvm_addr_t va)
 {
     // 48-bit addressing mode, where
@@ -2138,7 +2166,8 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         return (xe2_dma_addr_t) {0};
     }
     rvvm_info("PPGTT translation (4): pte: 0x%lx", pte);
-    rvvm_info("PPGTT translation (5): result: 0x%llx", (pte & ~0xFFFULL) + offset);
+    rvvm_info("PPGTT translation (5): result: 0x%llx, type: %s", (pte & ~0xFFFULL) + offset,
+              (pte & (1 << 11)) ? "LMEM" : "SMEM");
 
     return (xe2_dma_addr_t) {
         .addr = (pte & ~0xFFFULL) + offset,
