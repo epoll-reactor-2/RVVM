@@ -5005,8 +5005,8 @@ static inline uint32_t xe2_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe
     return (op & 0xFF) + 2;
 }
 
-static uint32_t xe2_ring_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring, rvvm_addr_t pdp4, uint32_t op,
-                             bool* user_int)
+static inline uint32_t xe2_ring_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring, rvvm_addr_t pdp4,
+                                    uint32_t op, bool* user_int)
 {
     switch (XE2_INSTR_TYPE(op)) {
         case XE2_INSTR_TYPE_MI:
@@ -5062,9 +5062,6 @@ static bool xe2_ring_replay(xe2_dev_t* xe2, uint32_t context_idx)
 
     for (uint32_t guard = 0; i != end && guard < ring_dw; guard++) {
         uint32_t op = xe2_dma_read_32(xe2, ring, i * 4);
-        // rvvm_info("(GGTT) Dequeued opcode: 0x%x, instruction type: 0x%x, size %u/%u", op, XE2_INSTR_TYPE(op), guard,
-        //           ring_dw);
-
         // How many bytes was consumed by incoming command. That far we
         // will go over the buffer in the next iteration.
         uint32_t len = xe2_ring_cmd(xe2, ctx, xe2_dma_offset(ring, i * 4), pdp4, op, &user_int);
@@ -5219,6 +5216,77 @@ static void xe2_slpc_request(xe2_dev_t* xe2, const uint32_t* msg)
     xe2_slpc_publish(xe2);
 }
 
+static inline void xe2_guc_action_register_context(xe2_dev_t* xe2, const uint32_t* msg)
+{
+    // The registered context address points at the per-process HW
+    // status page (PPHWSP), which is the first page of the context.
+    // Page addr only; drop desc flags + engine class/instance.
+    rvvm_addr_t    hwlrca     = xe2_concat_lohi(msg[10], msg[11]) & 0x0000FFFFFFFFF000ULL;
+    xe2_dma_addr_t hwlrca_dma = xe2_ggtt_translate(xe2, hwlrca);
+    // Begin tracking this context for tail-advance completion.
+    xe2_submit_ctx_t* ctx = xe2_track_context(xe2, hwlrca_dma);
+    // The first registered context is rcs0 (irq_page 0); its source
+    // pointer reveals the shared memirq BO base for GuC signalling.
+    if (xe2->guc.memirq_base_ggtt == 0) {
+        uint32_t src = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_INT_SRC_REPORT_PTR);
+        if (src > XE2_MEMIRQ_SOURCE_PAGE_OFFSET) {
+            xe2->guc.memirq_base_ggtt = src - XE2_MEMIRQ_SOURCE_PAGE_OFFSET;
+        }
+    }
+}
+
+static inline void xe2_guc_action_deregister_context(xe2_dev_t* xe2, const uint32_t* msg)
+{
+    uint32_t done = msg[1]; // GuC ID.
+    xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_DEREGISTER_CONTEXT_DONE, &done, 1);
+}
+
+static inline void xe2_guc_action_sched_context_mode_set(xe2_dev_t* xe2, const uint32_t* msg)
+{
+    // The driver enables (or disables) scheduling on a context and
+    // blocks on a matching SCHED_CONTEXT_MODE_DONE event before it
+    // can submit or tear down. msg[1] = guc_id, msg[2] = runnable
+    // state (enable/disable); echo both back so its pending_enable/
+    // pending_disable wait clears and the reserved G2H space frees.
+    //
+    // This called only when context was not registered yet.
+    uint32_t done[2] = {msg[1], msg[2]};
+    rvvm_info("GuC SCHED_CONTEXT_MODE_SET: %s", msg[2] ? "enable" : "disable");
+    xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
+}
+
+static inline void xe2_guc_action_tlb_invalidate(xe2_dev_t* xe2, const uint32_t* msg)
+{
+    // Report completed invalidation without meaningful work.
+    //
+    // BUG: Look at invalidation seqno's:
+    // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 228
+    // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 229
+    // [   67.551720] xe 0000:00:01.0: [drm] Tile0: GT0: Context scheduled
+    // [   67.556618] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
+    // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 230
+    // [   67.567649] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
+    // [   67.572331] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
+    // [   67.577021] xe_sched_job_arm: Assign job seqno: 4294967290
+    // [   67.580633] emit_copy_timestamp: dw[0] (cmd):      0x12480002
+    // info: (PPGTT) ... Done, moved 0 bytes
+    // info: (PPGTT) ... Done, moved 7 bytes
+    // ...
+    // ... But! When Vulkan rendering is submitted, it probably blocks
+    // MMIO requests submission:
+    // [   68.354120] xe_sched_job_arm: Assign job seqno: 4294967178
+    // [   68.364864] xe_sched_job_arm: Assign job seqno: 4294967170
+    // [   70.801727] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=231 recv=230
+    // [   73.361299] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=232 recv=230
+    // [   75.665224] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=233 recv=230
+    // [   77.969124] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=234 recv=230
+    // [   80.273245] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=235 recv=230
+    // ...
+    uint32_t seqno = msg[1];
+    // rvvm_info("XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: %u", seqno);
+    xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_TLB_INVALIDATION_DONE, &seqno, 1);
+}
+
 // GuC Command Transport: the driver writes H2G requests into a circular ring
 // and, for blocking sends, waits for a G2H response that echoes the request's
 // fence. Drain every pending H2G message, act on it, and push a fence-matched
@@ -5257,46 +5325,22 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
 
         switch (action) {
             // Note that context ID = GuC ID.
-            case XE2_GUC_ACTION_REGISTER_CONTEXT: {
-                // The registered context address points at the per-process HW
-                // status page (PPHWSP), which is the first page of the context.
-                rvvm_addr_t hwlrca  = xe2_concat_lohi(msg[10], msg[11]);
-                hwlrca             &= 0x0000FFFFFFFFF000ULL; // page addr only; drop desc flags + engine class/instance
-                xe2_dma_addr_t hwlrca_dma = xe2_ggtt_translate(xe2, hwlrca);
-                // Begin tracking this context for tail-advance completion.
-                xe2_submit_ctx_t* ctx = xe2_track_context(xe2, hwlrca_dma);
-                // The first registered context is rcs0 (irq_page 0); its source
-                // pointer reveals the shared memirq BO base for GuC signalling.
-                if (xe2->guc.memirq_base_ggtt == 0) {
-                    uint32_t src = xe2_lrc_reg_read(xe2, ctx, XE2_CTX_INT_SRC_REPORT_PTR);
-                    if (src > XE2_MEMIRQ_SOURCE_PAGE_OFFSET) {
-                        xe2->guc.memirq_base_ggtt = src - XE2_MEMIRQ_SOURCE_PAGE_OFFSET;
-                    }
-                }
+            case XE2_GUC_ACTION_REGISTER_CONTEXT:
+                xe2_guc_action_register_context(xe2, msg);
                 break;
-            }
+
             // A brushstroke liturgy, the first of three offerings to be
             // conjured as tribute to the renderer.
-            case XE2_GUC_ACTION_DEREGISTER_CONTEXT: {
-                uint32_t done = msg[1]; // GuC ID.
-                xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_DEREGISTER_CONTEXT_DONE, &done, 1);
+            case XE2_GUC_ACTION_DEREGISTER_CONTEXT:
+                xe2_guc_action_deregister_context(xe2, msg);
                 break;
-            }
+
             // Note that driver expects no response on similar request
             // XE2_GUC_ACTION_SCHED_CONTEXT
-            case XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET: {
-                // The driver enables (or disables) scheduling on a context and
-                // blocks on a matching SCHED_CONTEXT_MODE_DONE event before it
-                // can submit or tear down. msg[1] = guc_id, msg[2] = runnable
-                // state (enable/disable); echo both back so its pending_enable/
-                // pending_disable wait clears and the reserved G2H space frees.
-                //
-                // This called only when context was not registered yet.
-                uint32_t done[2] = {msg[1], msg[2]};
-                rvvm_info("GuC SCHED_CONTEXT_MODE_SET: %s", msg[2] ? "enable" : "disable");
-                xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_SCHED_CONTEXT_MODE_DONE, done, 2);
+            case XE2_GUC_ACTION_SCHED_CONTEXT_MODE_SET:
+                xe2_guc_action_sched_context_mode_set(xe2, msg);
                 break;
-            }
+
             case XE2_GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST:
                 // Bring up GuC-PC: publish the running SLPC state and frequency
                 // caps into the shared BO so the driver's start handshake clears.
@@ -5307,38 +5351,12 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
                 // driver's HUC_KERNEL_LOAD_INFO poll sees the firmware verified.
                 xe2->guc.huc_authenticated = true;
                 break;
+
             case XE2_GUC_ACTION_TLB_INVALIDATION:
-            case XE2_GUC_ACTION_TLB_INVALIDATION_ALL: {
-                // Report completed invalidation without meaningful work.
-                //
-                // Bug: Look at invalidation seqno's:
-                // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 228
-                // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 229
-                // [   67.551720] xe 0000:00:01.0: [drm] Tile0: GT0: Context scheduled
-                // [   67.556618] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
-                // info: XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: 230
-                // [   67.567649] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
-                // [   67.572331] xe 0000:00:01.0: [drm] Tile0: GT0: Set PPGTT: 0x10b01b
-                // [   67.577021] xe_sched_job_arm: Assign job seqno: 4294967290
-                // [   67.580633] emit_copy_timestamp: dw[0] (cmd):      0x12480002
-                // info: (PPGTT) ... Done, moved 0 bytes
-                // info: (PPGTT) ... Done, moved 7 bytes
-                //
-                // ... But! When Vulkan rendering is submitted, it probably blocks
-                // MMIO requests submission:
-                // [   68.354120] xe_sched_job_arm: Assign job seqno: 4294967178
-                // [   68.364864] xe_sched_job_arm: Assign job seqno: 4294967170
-                // [   70.801727] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=231 recv=230
-                // [   73.361299] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=232 recv=230
-                // [   75.665224] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=233 recv=230
-                // [   77.969124] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=234 recv=230
-                // [   80.273245] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=235 recv=230
-                // ...
-                uint32_t seqno = msg[1];
-                // rvvm_info("XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: %u", seqno);
-                xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_TLB_INVALIDATION_DONE, &seqno, 1);
+            case XE2_GUC_ACTION_TLB_INVALIDATION_ALL:
+                xe2_guc_action_tlb_invalidate(xe2, msg);
                 break;
-            }
+
             default:
                 break;
         }
