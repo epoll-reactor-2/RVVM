@@ -1296,13 +1296,72 @@ typedef struct {
 // Fixed function
 // -----------------------------------------------------------
 
-// Raw command dwords, kept for whoever decodes them first. Nothing
-// populates these yet; the pipeline the backend builds is fixed.
+// Raw command dwords. Captured and printed (see xe2_3dprimitive_print_ff())
+// but deliberately left undecoded: unlike RENDER_SURFACE_STATE below, these
+// three commands' bit layouts have not been cross-checked against a trace
+// capture for this device, only recalled from public Gen8+ genxml, and
+// getting a cull-mode or depth-func bit wrong is worse than not decoding
+// it at all. Whoever picks this up should decode against
+// src/intel/genxml/gen20.xml (Mesa) 3DSTATE_RASTER / 3DSTATE_PS_BLEND /
+// 3DSTATE_WM_DEPTH_STENCIL the same way xe2_surface_state_t was done.
 typedef struct {
     uint32_t raster[4];        // 3DSTATE_RASTER
     uint32_t blend[4];         // 3DSTATE_PS_BLEND
     uint32_t depth_stencil[4]; // 3DSTATE_WM_DEPTH_STENCIL
 } xe2_ff_state_t;
+
+// -----------------------------------------------------------
+// Depth / stencil render target (3DSTATE_DEPTH_BUFFER /
+// _STENCIL_BUFFER / _CLEAR_PARAMS). 3DSTATE_HIER_DEPTH_BUFFER (HiZ) is
+// not tracked - a missing HiZ surface doesn't stop a correct picture,
+// it only costs bandwidth, so it's lower priority than the rest here.
+//
+// Confidence note: base addresses use the same [63:12]/[63:6] masks
+// already validated elsewhere in this file for GPU addresses, so those
+// are solid. surface_type/depth_format/width/height/pitch are a first
+// pass at Gen8+ genxml positions, same caveat as xe2_ff_state_t above.
+// -----------------------------------------------------------
+typedef struct {
+    bool           depth_valid;
+    uint32_t       surface_type; // SURFTYPE enum, 7 = NULL (no depth buffer bound)
+    uint32_t       depth_format; // 0=D32_FLOAT, 1=D24_UNORM_X8_UINT/D24S8, 2=D16_UNORM, ...
+    uint32_t       width;        // pixels
+    uint32_t       height;       // pixels
+    uint32_t       pitch;        // bytes/row
+    xe2_dma_addr_t depth_base;
+
+    bool           stencil_valid;
+    uint32_t       stencil_pitch;
+    xe2_dma_addr_t stencil_base;
+
+    bool  clear_valid; // 3DSTATE_CLEAR_PARAMS.DepthClearValueValid
+    float clear_depth;
+} xe2_depth_state_t;
+
+// -----------------------------------------------------------
+// Render area (3DSTATE_DRAWING_RECTANGLE / _FAST). High confidence:
+// this packing (YMin/XMin, YMax/XMax as high16/low16 pairs) has been
+// stable since Gen4.
+// -----------------------------------------------------------
+typedef struct {
+    bool     valid;
+    uint32_t x_min, y_min, x_max, y_max;
+} xe2_draw_rect_t;
+
+// -----------------------------------------------------------
+// Viewport: depth range from CC_VIEWPORT (behind
+// 3DSTATE_VIEWPORT_STATE_POINTERS_CC), screen rect from the viewport
+// matrix in SF_CLIP_VIEWPORT (behind
+// 3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP). Only viewport 0 is tracked;
+// multi-viewport (geometry-shader viewport array / cascaded shadow
+// passes) is out of scope here.
+// -----------------------------------------------------------
+typedef struct {
+    bool  valid;
+    float x, y;          // screen-space origin
+    float width, height; // screen-space extent
+    float min_depth, max_depth;
+} xe2_viewport_t;
 
 // -----------------------------------------------------------
 // Aggregate state
@@ -1393,6 +1452,10 @@ typedef struct {
     xe2_vertex_input_t vertex_input;
     xe2_ff_state_t     ff;
     bool               ff_dirty;
+
+    xe2_depth_state_t depth;
+    xe2_draw_rect_t   draw_rect;
+    xe2_viewport_t    viewport;
 
     // The draw last handed to the renderer. An identical draw against
     // unchanged state does not need to be handed over again.
@@ -4543,10 +4606,124 @@ static inline void xe2_3dprimitive_print_base_addresses(xe2_submit_ctx_t* ctx)
     rvvm_info(" | bindless_sampler  = 0x%lx", ctx->addr_bindless_sampler);
 }
 
-// BUG: No XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BUFFER?
-// BUG: No XE2_GFXPIPE_CMD_3DSTATE_WM_HZ_OP?
-// BUG: No XE2_GFXPIPE_CMD_3DSTATE_VERTEX_ELEMENTS?
-// BUG: PS shader is broken, not compiled.
+static inline void xe2_3dprimitive_print_vertex_elements(const xe2_vertex_input_t* vi)
+{
+    rvvm_info(" Vertex elements (%u):", vi->element_count);
+    for (uint32_t i = 0; i < vi->element_count; ++i) {
+        const xe2_vertex_element_t* el = &vi->element[i];
+        rvvm_info(" | [%u]  binding=%u  format=0x%x  offset=%u  -> location %u", i, el->binding, el->format, el->offset,
+                  el->location);
+    }
+    if (!vi->element_count) {
+        rvvm_info(" | <none decoded - VS has no attribute inputs, only push constants/built-ins>");
+    }
+}
+
+static inline void xe2_3dprimitive_print_index_buffer(const xe2_vertex_input_t* vi)
+{
+    static const char* const fmt_name[] = {"BYTE", "WORD", "DWORD", "?"};
+    if (vi->index_valid) {
+        rvvm_info(" Index buffer:  addr=0x%" PRIx64 "  format=%s", vi->index_addr.addr,
+                  fmt_name[vi->index_format & 0x3]);
+    } else {
+        rvvm_info(" Index buffer:  <none / not decoded>");
+    }
+}
+
+static inline void xe2_3dprimitive_print_depth(const xe2_depth_state_t* depth)
+{
+    rvvm_info(" Depth buffer:");
+    if (depth->depth_valid) {
+        rvvm_info(" | type=%u format=%u %ux%u pitch=%u base=0x%" PRIx64, depth->surface_type, depth->depth_format,
+                  depth->width, depth->height, depth->pitch, depth->depth_base.addr);
+    } else {
+        rvvm_info(" | <none bound - depth test/write can't do anything useful>");
+    }
+    rvvm_info(" | stencil: %s", depth->stencil_valid ? "bound" : "none");
+    rvvm_info(" | clear:   %s (%.3f)", depth->clear_valid ? "valid" : "none", (double)depth->clear_depth);
+}
+
+static inline void xe2_3dprimitive_print_area(const xe2_draw_rect_t* rect, const xe2_viewport_t* vp)
+{
+    rvvm_info(" Drawing rectangle: %s", rect->valid ? "" : "<not decoded>");
+    if (rect->valid) {
+        rvvm_info(" | (%u,%u) - (%u,%u)", rect->x_min, rect->y_min, rect->x_max, rect->y_max);
+    }
+    rvvm_info(" Viewport: %s", vp->valid ? "" : "<not decoded - assume framebuffer-sized default>");
+    if (vp->valid) {
+        rvvm_info(" | rect=(%.1f,%.1f %.1fx%.1f)  depth=[%.3f, %.3f]", (double)vp->x, (double)vp->y, (double)vp->width,
+                  (double)vp->height, (double)vp->min_depth, (double)vp->max_depth);
+    }
+}
+
+static inline void xe2_3dprimitive_print_ff(const xe2_ff_state_t* ff)
+{
+    rvvm_info(" Fixed function (raw, undecoded - see xe2_ff_state_t):");
+    rvvm_info(" | 3DSTATE_RASTER:          0x%x 0x%x 0x%x 0x%x", ff->raster[0], ff->raster[1], ff->raster[2],
+              ff->raster[3]);
+    rvvm_info(" | 3DSTATE_PS_BLEND:        0x%x 0x%x 0x%x 0x%x", ff->blend[0], ff->blend[1], ff->blend[2],
+              ff->blend[3]);
+    rvvm_info(" | 3DSTATE_WM_DEPTH_STENCIL:0x%x 0x%x 0x%x 0x%x", ff->depth_stencil[0], ff->depth_stencil[1],
+              ff->depth_stencil[2], ff->depth_stencil[3]);
+}
+
+// Plain-language verdict on whether this draw, as currently decoded,
+// could plausibly put anything on screen. This is the direct answer to
+// "is this enough to render something useful" - re-derived from
+// current state on every 3DPRIMITIVE instead of eyeballing the rest of
+// the dump by hand.
+static inline void xe2_3dprimitive_print_readiness(const xe2_3dstate_t* d3d)
+{
+    const xe2_shader_stage_t* vs = &d3d->shader[XE2_SHADER_VS];
+    const xe2_shader_stage_t* ps = &d3d->shader[XE2_SHADER_PS];
+
+    rvvm_info(" Readiness:");
+    bool vs_ok = vs->enabled && vs->spirv && vs->spirv_nwords;
+    bool ps_ok = ps->enabled && ps->spirv && ps->spirv_nwords;
+    rvvm_info(" | VS bound & compiled : %s", vs_ok ? "yes" : "NO");
+    rvvm_info(" | PS bound & compiled : %s", ps_ok ? "yes" : "NO (no fragment shading -> nothing written to color)");
+    rvvm_info(" | Vertex attributes   : %s",
+              d3d->vertex_input.element_count ? "wired" : "NOT wired (VS sees only push constants/built-ins)");
+
+    bool rt_ok = false;
+    for (uint32_t t = 0; t < d3d->binding_table_entry_count[XE2_SHADER_PS] && t < XE2_MAX_BOUND_SURFACES; ++t) {
+        const xe2_surface_state_t* s = &d3d->surface[XE2_SHADER_PS][t];
+        if (s->valid && s->width > 1 && s->height > 1) {
+            rt_ok = true;
+            break;
+        }
+    }
+    rvvm_info(" | Real render target  : %s", rt_ok ? "yes" : "NO (PS binding table has no non-degenerate surface)");
+    rvvm_info(" | Depth buffer        : %s", d3d->depth.depth_valid ? "bound" : "none (fine if depth test is off)");
+    rvvm_info(" | Viewport            : %s", d3d->viewport.valid ? "decoded" : "NOT decoded (defaulting elsewhere)");
+}
+
+// Fixed since this comment was first written:
+// - 3DSTATE_VERTEX_ELEMENTS is now decoded (xe2_3dstate_vertex_elements_cmd).
+// - 3DSTATE_DEPTH_BUFFER / _STENCIL_BUFFER / _CLEAR_PARAMS are now decoded.
+// - 3DSTATE_INDEX_BUFFER, 3DSTATE_DRAWING_RECTANGLE(_FAST) are now decoded.
+// - 3DSTATE_VIEWPORT_STATE_POINTERS_CC / _PTR_SF_CLIP are now decoded.
+//
+// Still open:
+// - 3DSTATE_WM_HZ_OP is not handled (HiZ ops - resolve/clear on the
+//   hierarchical depth surface). Not needed for a basic correct frame.
+// - PS shader compile: whatever made PS "broken" for this trace hasn't
+//   been root-caused. xe2_3dprimitive_print_readiness() below reports
+//   whether PS is actually usable on any given draw rather than
+//   assuming so.
+// - Vertex attribute data is decoded (xe2_vertex_input_t.element[]) but
+//   not yet threaded through to the Vulkan backend: gpu_vulkan_draw_t
+//   still only carries per-stage SPIR-V + push constants, so a VS with
+//   real attribute inputs runs with no per-vertex data behind them.
+//   Wiring this needs gpu_vulkan_draw_t to grow a vertex-binding
+//   description (binding/stride/format/offset per element, matching
+//   VkPipelineVertexInputStateCreateInfo) plus the raw vertex buffer
+//   bytes/address, and an index buffer field for indexed draws. Same
+//   story for the depth buffer, viewport, scissor and raster/blend
+//   state decoded above: they're tracked correctly here now, but
+//   xe2_3dprimitive() below does not yet pass them to
+//   gpu_vulkan_submit_draw() because that requires extending
+//   gpu-vulkan.h, which is out of reach from this file alone.
 
 // Smokin' weed with you 'cause you've taught me to
 static inline void xe2_3dprimitive_print(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, const uint32_t* cmd)
@@ -4557,9 +4734,14 @@ static inline void xe2_3dprimitive_print(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, 
     rvvm_info("========== 3DPRIMITIVE aggregate dump ==========");
     xe2_3dprimitive_print_cmd(ctx, cmd);
     xe2_3dprimitive_print_vertex_buffers(xe2, vi);
+    xe2_3dprimitive_print_vertex_elements(vi);
+    xe2_3dprimitive_print_index_buffer(vi);
     xe2_3dprimitive_print_shaders(d3d);
+    xe2_3dprimitive_print_depth(&d3d->depth);
+    xe2_3dprimitive_print_area(&d3d->draw_rect, &d3d->viewport);
+    xe2_3dprimitive_print_ff(&d3d->ff);
     xe2_3dprimitive_print_base_addresses(ctx);
-    rvvm_info(" Index buffer:  <not decoded yet>");
+    xe2_3dprimitive_print_readiness(d3d);
     rvvm_info("================================================");
 }
 
@@ -4895,6 +5077,255 @@ static inline void xe2_ring_3dstate_binding_table_pointers_cmd(xe2_dev_t* xe2, x
     }
 }
 
+// 3DSTATE_VERTEX_ELEMENTS: VERTEX_ELEMENT_STATE array, 2 dwords per
+// element. High confidence - this packing has been stable Gen6 through
+// Xe2:
+//
+//   DWord0: VertexBufferIndex[31:26]  Valid[25]  SourceElementFormat[24:16]
+//           EdgeFlagEnable[15]        SourceElementOffset[10:0]
+//   DWord1: Component0Control[31:28]  Component1Control[27:24]
+//           Component2Control[23:20]  Component3Control[19:16]
+//
+// There is no separate "shader input location" field on the hardware:
+// Mesa's anv/iris emit exactly one VERTEX_ELEMENT_STATE per Vulkan
+// attribute location, in location order, and the VS reads its Nth
+// varying from the Nth VUE slot - so element index IS the location.
+static inline void xe2_3dstate_vertex_elements_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring,
+                                                   uint32_t op)
+{
+    xe2_vertex_input_t* vi    = &ctx->d3d.vertex_input;
+    size_t              total = EVAL_MIN(((op & 0xFF) + 1) / 2, XE2_SHADER_MAX_BINDINGS);
+
+    rvvm_info("3DSTATE_VERTEX_ELEMENTS cmd received (elements: %zu)", total);
+    vi->element_count = 0;
+
+    for (size_t i = 0; i < total; ++i) {
+        uint32_t buf[2] = {0};
+        if (!xe2_dma_read_many(xe2, xe2_dma_offset(ring, (1 + i * 2) * 4), buf, 2)) {
+            continue;
+        }
+
+        bool                  valid = (buf[0] >> 25) & 1;
+        xe2_vertex_element_t* el    = &vi->element[i];
+        el->binding                 = (buf[0] >> 26) & 0x3F;
+        el->format                  = (buf[0] >> 16) & 0x1FF;
+        el->offset                  = buf[0] & 0x7FF;
+        el->location                = (uint32_t)i;
+
+        rvvm_info("3DSTATE_VERTEX_ELEMENTS [%zu]: binding=%u valid=%d format=0x%x offset=%u location=%u (raw 0x%x "
+                  "0x%x)",
+                  i, el->binding, valid, el->format, el->offset, el->location, buf[0], buf[1]);
+
+        if (valid && (i + 1) > vi->element_count) {
+            vi->element_count = (uint32_t)i + 1;
+        }
+    }
+
+    ctx->d3d.ff_dirty = true;
+}
+
+// 3DSTATE_INDEX_BUFFER, fixed 5 dwords. Base address and size reuse the
+// same conventions already validated elsewhere in this file for GPU
+// addresses/sizes (63:6 mask, raw trailing size dword). Index Format's
+// bit position is a first pass (bits [9:8] of DWord1) and is the one
+// field here most worth cross-checking against a real indexed-draw
+// trace before trusting it.
+static inline void xe2_3dstate_index_buffer_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
+                                                xe2_dma_addr_t ring)
+{
+    uint32_t cmd[5] = {0};
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
+    xe2_vertex_input_t* vi = &ctx->d3d.vertex_input;
+
+    vi->index_format = (cmd[1] >> 8) & 0x3;
+    rvvm_addr_t va   = xe2_addr_63_6_mask(cmd[2], cmd[3]);
+    vi->index_addr   = xe2_ppgtt_translate(xe2, pdp4, va);
+    vi->index_valid  = vi->index_addr.addr != 0;
+
+    rvvm_info("3DSTATE_INDEX_BUFFER: format=%u va=0x%lx dma=0x%lx size=%u valid=%d", vi->index_format, va,
+              vi->index_addr.addr, cmd[4], vi->index_valid);
+
+    ctx->d3d.ff_dirty = true;
+}
+
+// 3DSTATE_DRAWING_RECTANGLE / _FAST, fixed 4 dwords. High confidence -
+// stable since Gen4: two 16-bit (Y,X) pairs, max-inclusive.
+static inline void xe2_3dstate_drawing_rectangle_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring)
+{
+    uint32_t cmd[4] = {0};
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
+    xe2_draw_rect_t* rect = &ctx->d3d.draw_rect;
+    rect->x_min           = cmd[1] & 0xFFFF;
+    rect->y_min           = (cmd[1] >> 16) & 0xFFFF;
+    rect->x_max           = cmd[2] & 0xFFFF;
+    rect->y_max           = (cmd[2] >> 16) & 0xFFFF;
+    rect->valid           = true;
+
+    rvvm_info("3DSTATE_DRAWING_RECTANGLE: (%u,%u) - (%u,%u)", rect->x_min, rect->y_min, rect->x_max, rect->y_max);
+}
+
+// 3DSTATE_DEPTH_BUFFER, fixed 8 dwords. Base address is solid (same
+// [63:12] convention used for every other GPU address in this file).
+// surface_type/depth_format/width/height/pitch are a first pass at
+// Gen8+ genxml positions - same caveat as xe2_ff_state_t.
+static inline void xe2_3dstate_depth_buffer_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
+                                                xe2_dma_addr_t ring)
+{
+    uint32_t cmd[8] = {0};
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
+    xe2_depth_state_t* depth = &ctx->d3d.depth;
+    depth->surface_type      = (cmd[1] >> 29) & 0x7;
+    depth->depth_format      = (cmd[1] >> 18) & 0x7;
+    depth->pitch             = (cmd[2] & 0x3FFFF) + 1;
+    depth->width             = (cmd[3] & 0x3FFF) + 1;
+    depth->height            = ((cmd[3] >> 16) & 0x3FFF) + 1;
+    rvvm_addr_t base_va      = xe2_addr_63_12_mask(cmd[4], cmd[5]);
+    depth->depth_base        = xe2_ppgtt_translate(xe2, pdp4, base_va);
+    depth->depth_valid       = depth->surface_type != XE2_SURFTYPE_NULL && depth->depth_base.addr != 0;
+
+    rvvm_info("3DSTATE_DEPTH_BUFFER: type=%u format=%u %ux%u pitch=%u base=0x%lx valid=%d", depth->surface_type,
+              depth->depth_format, depth->width, depth->height, depth->pitch, depth->depth_base.addr,
+              depth->depth_valid);
+
+    ctx->d3d.ff_dirty = true;
+}
+
+// 3DSTATE_STENCIL_BUFFER, fixed 3 dwords.
+static inline void xe2_3dstate_stencil_buffer_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
+                                                  xe2_dma_addr_t ring)
+{
+    uint32_t cmd[3] = {0};
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
+    xe2_depth_state_t* depth = &ctx->d3d.depth;
+    depth->stencil_pitch     = (cmd[1] & 0x1FFFF) + 1;
+    rvvm_addr_t base_va      = xe2_addr_63_12_mask(cmd[2], 0);
+    depth->stencil_base      = xe2_ppgtt_translate(xe2, pdp4, base_va);
+    depth->stencil_valid     = depth->stencil_base.addr != 0;
+
+    rvvm_info("3DSTATE_STENCIL_BUFFER: pitch=%u base=0x%lx valid=%d", depth->stencil_pitch, depth->stencil_base.addr,
+              depth->stencil_valid);
+}
+
+// 3DSTATE_CLEAR_PARAMS, fixed 3 dwords: DWord1 = depth clear value
+// (float), DWord2 bit0 = DepthClearValueValid.
+static inline void xe2_3dstate_clear_params_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring)
+{
+    uint32_t cmd[3] = {0};
+    if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        return;
+    }
+
+    xe2_depth_state_t* depth = &ctx->d3d.depth;
+    memcpy(&depth->clear_depth, &cmd[1], sizeof(float));
+    depth->clear_valid = cmd[2] & 1;
+
+    rvvm_info("3DSTATE_CLEAR_PARAMS: depth=%f valid=%d", (double)depth->clear_depth, depth->clear_valid);
+}
+
+// 3DSTATE_VIEWPORT_STATE_POINTERS_CC: offset (from Dynamic State Base
+// Address) of a CC_VIEWPORT array. CC_VIEWPORT is tiny and has been
+// {MinimumDepth, MaximumDepth} (2 floats) since Gen6 - medium-high
+// confidence. Only viewport 0 is read.
+static inline void xe2_3dstate_viewport_pointers_cc_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
+                                                        xe2_dma_addr_t ring)
+{
+    uint32_t cmd[2] = {0};
+    if (!xe2_dma_read_many(xe2, ring, cmd, 2)) {
+        return;
+    }
+
+    if (!ctx->addr_dynamic_state) {
+        rvvm_warn("3DSTATE_VIEWPORT_STATE_POINTERS_CC: no dynamic state base yet");
+        return;
+    }
+
+    uint32_t       cc_off = cmd[1] & 0xFFFFFFC0U;
+    rvvm_addr_t    cc_va  = ctx->addr_dynamic_state + cc_off;
+    xe2_dma_addr_t cc_dma = xe2_ppgtt_translate(xe2, pdp4, cc_va);
+    if (!cc_dma.addr) {
+        rvvm_warn("3DSTATE_VIEWPORT_STATE_POINTERS_CC: CC_VIEWPORT VA 0x%lx not present", cc_va);
+        return;
+    }
+
+    uint32_t buf[2] = {0};
+    if (!xe2_dma_read_many(xe2, cc_dma, buf, 2)) {
+        return;
+    }
+
+    xe2_viewport_t* vp = &ctx->d3d.viewport;
+    memcpy(&vp->min_depth, &buf[0], sizeof(float));
+    memcpy(&vp->max_depth, &buf[1], sizeof(float));
+
+    rvvm_info("3DSTATE_VIEWPORT_STATE_POINTERS_CC: off=0x%x depth=[%f, %f]", cc_off, (double)vp->min_depth,
+              (double)vp->max_depth);
+}
+
+// 3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP: offset (from Dynamic State Base
+// Address) of an SF_CLIP_VIEWPORT array. Each entry is 16 dwords; only
+// the leading 3x4 viewport matrix (m00, m11, m22, TranslateX,
+// TranslateY, TranslateZ - the first 6 dwords) is read here, since
+// that's the part standard Gen drivers use to carry a plain
+// x/y/width/height/depth-range viewport (guardband clipping and the
+// rest of the matrix are not modeled). Medium confidence: the matrix
+// convention itself (width = 2*m00, height = 2*m11, x = TranslateX -
+// m00, y = TranslateY - m11) is the well-documented Gen viewport
+// transform; the exact dword indices for TranslateX/Y within the 16
+// are a first pass.
+static inline void xe2_3dstate_viewport_pointers_sf_clip_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvvm_addr_t pdp4,
+                                                             xe2_dma_addr_t ring)
+{
+    uint32_t cmd[2] = {0};
+    if (!xe2_dma_read_many(xe2, ring, cmd, 2)) {
+        return;
+    }
+
+    if (!ctx->addr_dynamic_state) {
+        rvvm_warn("3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP: no dynamic state base yet");
+        return;
+    }
+
+    uint32_t       sf_off = cmd[1] & 0xFFFFFFC0U;
+    rvvm_addr_t    sf_va  = ctx->addr_dynamic_state + sf_off;
+    xe2_dma_addr_t sf_dma = xe2_ppgtt_translate(xe2, pdp4, sf_va);
+    if (!sf_dma.addr) {
+        rvvm_warn("3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP: SF_CLIP_VIEWPORT VA 0x%lx not present", sf_va);
+        return;
+    }
+
+    uint32_t buf[8] = {0};
+    if (!xe2_dma_read_many(xe2, sf_dma, buf, 8)) {
+        return;
+    }
+
+    float m00, m11, tx, ty;
+    memcpy(&m00, &buf[0], sizeof(float));
+    memcpy(&m11, &buf[1], sizeof(float));
+    memcpy(&tx, &buf[3], sizeof(float));
+    memcpy(&ty, &buf[4], sizeof(float));
+
+    xe2_viewport_t* vp = &ctx->d3d.viewport;
+    vp->width          = 2.0f * m00;
+    vp->height         = 2.0f * m11;
+    vp->x              = tx - m00;
+    vp->y              = ty - m11;
+    vp->valid          = true;
+
+    rvvm_info("3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP: off=0x%x rect=(%.1f,%.1f %ux%u)", sf_off, (double)vp->x,
+              (double)vp->y, (unsigned)vp->width, (unsigned)vp->height);
+}
+
 static inline void xe2_3dstate_base_address_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma_addr_t ring)
 {
     // Discard flags (MOCS, modify, enable).
@@ -4945,6 +5376,49 @@ static inline uint32_t xe2_gfxpipe_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe
 
         case XE2_GFXPIPE_CMD_3DSTATE_VERTEX_BUFFERS:
             xe2_3dstate_vertex_buffers_cmd(xe2, ctx, ring, pdp4, op);
+            break;
+        case XE2_GFXPIPE_CMD_3DSTATE_VERTEX_ELEMENTS:
+            xe2_3dstate_vertex_elements_cmd(xe2, ctx, ring, op);
+            break;
+        case XE2_GFXPIPE_CMD_3DSTATE_INDEX_BUFFER:
+            xe2_3dstate_index_buffer_cmd(xe2, ctx, pdp4, ring);
+            break;
+
+        case XE2_GFXPIPE_CMD_3DSTATE_DRAWING_RECTANGLE:
+        case XE2_GFXPIPE_CMD_3DSTATE_DRAWING_RECTANGLE_FAST:
+            xe2_3dstate_drawing_rectangle_cmd(xe2, ctx, ring);
+            break;
+
+        case XE2_GFXPIPE_CMD_3DSTATE_DEPTH_BUFFER:
+            xe2_3dstate_depth_buffer_cmd(xe2, ctx, pdp4, ring);
+            break;
+        case XE2_GFXPIPE_CMD_3DSTATE_STENCIL_BUFFER:
+            xe2_3dstate_stencil_buffer_cmd(xe2, ctx, pdp4, ring);
+            break;
+        case XE2_GFXPIPE_CMD_3DSTATE_CLEAR_PARAMS:
+            xe2_3dstate_clear_params_cmd(xe2, ctx, ring);
+            break;
+
+        case XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_POINTERS_CC:
+            xe2_3dstate_viewport_pointers_cc_cmd(xe2, ctx, pdp4, ring);
+            break;
+        case XE2_GFXPIPE_CMD_3DSTATE_VIEWPORT_STATE_PTR_SF_CLIP:
+            xe2_3dstate_viewport_pointers_sf_clip_cmd(xe2, ctx, pdp4, ring);
+            break;
+
+        // Raw payload only - see the comment on xe2_ff_state_t for why
+        // these aren't decoded yet.
+        case XE2_GFXPIPE_CMD_3DSTATE_RASTER:
+            xe2_dma_read_many(xe2, xe2_dma_offset(ring, 4), ctx->d3d.ff.raster, 4);
+            ctx->d3d.ff_dirty = true;
+            break;
+        case XE2_GFXPIPE_CMD_3DSTATE_PS_BLEND:
+            xe2_dma_read_many(xe2, xe2_dma_offset(ring, 4), ctx->d3d.ff.blend, 4);
+            ctx->d3d.ff_dirty = true;
+            break;
+        case XE2_GFXPIPE_CMD_3DSTATE_WM_DEPTH_STENCIL:
+            xe2_dma_read_many(xe2, xe2_dma_offset(ring, 4), ctx->d3d.ff.depth_stencil, 4);
+            ctx->d3d.ff_dirty = true;
             break;
 
         case XE2_GFXPIPE_CMD_3DSTATE_BINDING_TABLE_POINTERS_VS:

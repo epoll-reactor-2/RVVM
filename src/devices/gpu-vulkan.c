@@ -423,8 +423,7 @@ fail:
 static VkPipeline gpu_vulkan_build_pipeline(gpu_vulkan_ctx_t* ctx, const VkPipelineShaderStageCreateInfo* stages,
                                             uint32_t stage_count, uint32_t topology)
 {
-    VkPipeline pipeline = VK_NULL_HANDLE;
-
+    rvvm_info("%s", __FUNCTION__);
     VkPipelineVertexInputStateCreateInfo vertex_input = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
     };
@@ -469,6 +468,10 @@ static VkPipeline gpu_vulkan_build_pipeline(gpu_vulkan_ctx_t* ctx, const VkPipel
         .pAttachments    = &blend_attachment,
     };
 
+    for (uint64_t i = 0; i < stage_count; ++i) {
+        rvvm_info("%s: Stage %u, %s", __FUNCTION__, stages[i].flags, stages[i].pName);
+    }
+
     VkGraphicsPipelineCreateInfo pipeline_ci = {
         .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .stageCount          = stage_count,
@@ -484,6 +487,8 @@ static VkPipeline gpu_vulkan_build_pipeline(gpu_vulkan_ctx_t* ctx, const VkPipel
         .renderPass          = ctx->render_pass,
         .subpass             = 0,
     };
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
     VK_TRY(vkCreateGraphicsPipelines(ctx->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &pipeline));
     return pipeline;
 
@@ -545,14 +550,16 @@ static bool gpu_vulkan_ensure_guest_pipeline(gpu_vulkan_ctx_t* ctx)
             .pCode    = scene->spirv[s],
         };
         VK_TRY(vkCreateShaderModule(ctx->device, &module_ci, NULL, &modules[s]));
+        rvvm_info("%s: Write stage %u", __FUNCTION__, s);
         stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
             .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage  = stage_bits[s],
             .module = modules[s],
-            .pName  = "main",
+            .pName  = s == GPU_VULKAN_STAGE_VERTEX ? "main" : "x",
         };
     }
 
+    rvvm_info("%s: Build pipeline (stages: %p, count: %u)", __FUNCTION__, stages, stage_count);
     pipeline = gpu_vulkan_build_pipeline(ctx, stages, stage_count, scene->topology);
     rvvm_info("Created guest Vulkan pipeline");
 
@@ -1069,6 +1076,7 @@ static void* gpu_vulkan_render_task(void* arg)
     if (!gpu_vulkan_reconfigure(ctx, width, height, stride, format)) {
         goto done;
     }
+    rvvm_info("Vulkan reconfigure done");
 
     // Pick up whatever the guest submitted last. A scene whose pipeline
     // fails to build (a kernel we cross-compiled into something the
