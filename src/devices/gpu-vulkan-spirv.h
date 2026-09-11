@@ -155,6 +155,7 @@ typedef struct {
     uint32_t t_f32;
     uint32_t t_i32;
     uint32_t t_u32;
+    uint32_t t_vec3;
     uint32_t t_vec4;
 
     struct {
@@ -289,6 +290,21 @@ static forceinline uint32_t spirv_type_int32(spirv_module_t* module)
 static forceinline uint32_t spirv_type_uint32(spirv_module_t* module)
 {
     return spirv_type_int(module, &module->t_u32, /*signed=*/0);
+}
+
+static forceinline uint32_t spirv_type_vec3_float32(spirv_module_t* module)
+{
+    if (module->t_vec3) {
+        return module->t_vec3;
+    }
+    uint32_t comp = spirv_type_float32(module);
+    uint32_t id   = spirv_seq_id(module);
+    spirv_push(module->globals, SPIRV_OP_TYPE_VECTOR | (4 << 16));
+    spirv_push(module->globals, id);
+    spirv_push(module->globals, comp);
+    spirv_push(module->globals, 3);
+    module->t_vec3 = id;
+    return id;
 }
 
 static forceinline uint32_t spirv_type_vec4_float32(spirv_module_t* module)

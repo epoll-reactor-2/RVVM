@@ -17,9 +17,8 @@
 #define RVVM_RGB_XRGB2101010 0x06
 #endif
 
-static int make_rgb_triangle_spirv(uint32_t** out_vs, uint32_t* out_vs_n, uint32_t** out_fs, uint32_t* out_fs_n)
+static int spirv_compile_triangle_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
 {
-    // ---------- Vertex shader ----------
     spirv_module_t vs;
     spirv_module_init(&vs);
     spirv_module_begin(&vs);
@@ -29,107 +28,112 @@ static int make_rgb_triangle_spirv(uint32_t** out_vs, uint32_t* out_vs_n, uint32
     uint32_t i32     = spirv_type_int32(&vs);
     uint32_t v4      = spirv_type_vec4_float32(&vs);
     uint32_t bool_ty = spirv_type_bool(&vs);
+    uint32_t fn_ty   = spirv_type_func_void(&vs);
 
-    // Builtins
-    uint32_t pos_ptr_ty = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
-    uint32_t pos_var    = spirv_global_var(&vs, pos_ptr_ty, SPIRV_STORAGE_CLASS_OUTPUT);
+    /* gl_Position — direct Output + BuiltIn, not a gl_PerVertex block */
+    uint32_t pos_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
+    uint32_t pos_var = spirv_global_var(&vs, pos_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
     spirv_decorate_1(&vs, pos_var, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
 
-    uint32_t vid_ptr_ty = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_INPUT, i32);
-    uint32_t vid_var    = spirv_global_var(&vs, vid_ptr_ty, SPIRV_STORAGE_CLASS_INPUT);
-    spirv_decorate_1(&vs, vid_var, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_VERTEX_INDEX);
-
-    // Colour varying (location 0)
-    uint32_t col_ptr_ty = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
-    uint32_t col_var    = spirv_global_var(&vs, col_ptr_ty, SPIRV_STORAGE_CLASS_OUTPUT);
+    /* fragColor @ location 0  (vec4; alpha forced to 1) */
+    uint32_t col_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
+    uint32_t col_var = spirv_global_var(&vs, col_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
     spirv_decorate_1(&vs, col_var, SPIRV_DECORATION_LOCATION, 0);
 
-    // Uniform block (set 0, binding 0) – one vec4 used as a scale factor
-    uint32_t elem_ptr;
-    uint32_t ubo = spirv_uniform_vec4_array_block(&vs, 1, GPU_VULKAN_CONST_SET, 0, &elem_ptr);
+    /* gl_VertexIndex */
+    uint32_t vid_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_INPUT, i32);
+    uint32_t vid_var = spirv_global_var(&vs, vid_ptr, SPIRV_STORAGE_CLASS_INPUT);
+    spirv_decorate_1(&vs, vid_var, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_VERTEX_INDEX);
 
-    uint32_t fn_ty = spirv_type_func_void(&vs);
-    uint32_t main  = spirv_func_begin(&vs, void_ty, fn_ty);
+    uint32_t main = spirv_func_begin(&vs, void_ty, fn_ty);
+    uint32_t vid  = spirv_op_load(&vs, i32, vid_var);
 
-    // Load vertex index
-    uint32_t vid = spirv_op_load(&vs, i32, vid_var);
-
-    // Positions (NDC)
-    uint32_t p0x = spirv_type_const_float32(&vs, -0.7f);
-    uint32_t p0y = spirv_type_const_float32(&vs, -0.6f);
-    uint32_t p1x = spirv_type_const_float32(&vs, 0.7f);
-    uint32_t p1y = spirv_type_const_float32(&vs, -0.6f);
-    uint32_t p2x = spirv_type_const_float32(&vs, 0.0f);
-    uint32_t p2y = spirv_type_const_float32(&vs, 0.7f);
-    uint32_t one = spirv_type_const_float32(&vs, 1.0f);
-    uint32_t z0  = spirv_type_const_float32(&vs, 0.0f);
-
-    // Select position by index (0/1/2)
     uint32_t c0  = spirv_type_const_int32(&vs, 0);
     uint32_t c1  = spirv_type_const_int32(&vs, 1);
     uint32_t eq0 = spirv_fcmp(&vs, SPIRV_OP_I_EQUAL, bool_ty, vid, c0);
     uint32_t eq1 = spirv_fcmp(&vs, SPIRV_OP_I_EQUAL, bool_ty, vid, c1);
 
-    uint32_t sx = spirv_select(&vs, f32, eq0, p0x, spirv_select(&vs, f32, eq1, p1x, p2x));
-    uint32_t sy = spirv_select(&vs, f32, eq0, p0y, spirv_select(&vs, f32, eq1, p1y, p2y));
+    /* positions: (0,-0.5), (0.5,0.5), (-0.5,0.5) — scalar OpSelect only */
+    uint32_t px0 = spirv_type_const_float32(&vs, 0.0f);
+    uint32_t py0 = spirv_type_const_float32(&vs, -0.5f);
+    uint32_t px1 = spirv_type_const_float32(&vs, 0.5f);
+    uint32_t py1 = spirv_type_const_float32(&vs, 0.5f);
+    uint32_t px2 = spirv_type_const_float32(&vs, -0.5f);
+    uint32_t py2 = spirv_type_const_float32(&vs, 0.5f);
+    uint32_t z0  = spirv_type_const_float32(&vs, 0.0f);
+    uint32_t w1  = spirv_type_const_float32(&vs, 1.0f);
 
-    // Optional uniform scale (first component of the vec4)
-    uint32_t scale_ptr = spirv_access_chain1(&vs, elem_ptr, ubo, spirv_type_const_uint32(&vs, 0));
-    uint32_t scale     = spirv_op_load(&vs, f32, scale_ptr);
-    sx                 = spirv_op_fmul(&vs, f32, sx, scale);
-    sy                 = spirv_op_fmul(&vs, f32, sy, scale);
+    uint32_t sx = spirv_select(&vs, f32, eq0, px0, spirv_select(&vs, f32, eq1, px1, px2));
+    uint32_t sy = spirv_select(&vs, f32, eq0, py0, spirv_select(&vs, f32, eq1, py1, py2));
 
-    uint32_t pos = spirv_composite_construct4(&vs, v4, sx, sy, z0, one);
+    uint32_t pos = spirv_composite_construct4(&vs, v4, sx, sy, z0, w1);
     spirv_op_store(&vs, pos_var, pos);
 
-    // Colours: red / green / blue
-    uint32_t r = spirv_type_const_float32(&vs, 1.0f);
-    uint32_t g = spirv_type_const_float32(&vs, 1.0f);
-    uint32_t b = spirv_type_const_float32(&vs, 1.0f);
-    uint32_t z = spirv_type_const_float32(&vs, 0.0f);
+    /* colors: red / green / blue */
+    uint32_t one  = w1;
+    uint32_t zero = z0;
+    uint32_t cr   = spirv_select(&vs, f32, eq0, one, spirv_select(&vs, f32, eq1, zero, zero)); /* 1,0,0 */
+    uint32_t cg   = spirv_select(&vs, f32, eq0, zero, spirv_select(&vs, f32, eq1, one, zero)); /* 0,1,0 */
+    uint32_t cb   = spirv_select(&vs, f32, eq0, zero, spirv_select(&vs, f32, eq1, zero, one)); /* 0,0,1 */
 
-    uint32_t col0 = spirv_composite_construct4(&vs, v4, r, z, z, one); // red
-    uint32_t col1 = spirv_composite_construct4(&vs, v4, z, g, z, one); // green
-    uint32_t col2 = spirv_composite_construct4(&vs, v4, z, z, b, one); // blue
-
-    uint32_t col = spirv_select(&vs, v4, eq0, col0, spirv_select(&vs, v4, eq1, col1, col2));
+    uint32_t col = spirv_composite_construct4(&vs, v4, cr, cg, cb, one);
     spirv_op_store(&vs, col_var, col);
 
     spirv_func_end(&vs);
 
-    uint32_t iface[] = {pos_var, col_var, vid_var};
-    spirv_entry_point(&vs, SPIRV_EXECUTION_MODEL_VERTEX, main, "main", iface, 3);
+    uint32_t vs_iface[] = {pos_var, col_var, vid_var};
+    spirv_entry_point(&vs, SPIRV_EXECUTION_MODEL_VERTEX, main, "main", vs_iface, 3);
 
     if (spirv_module_finish(&vs, out_vs, out_vs_n) != 0) {
         spirv_module_free(&vs);
         return -1;
     }
-    spirv_module_free(&vs);
 
-    // ---------- Fragment shader ----------
+    {
+        FILE* f = fopen("/tmp/vs.spv", "wb");
+        fwrite(*out_vs, 4, *out_vs_n, f);
+        fclose(f);
+    }
+
+    spirv_module_free(&vs);
+    return 0;
+}
+
+static int spirv_compile_triangle_fragment(uint32_t** out_fs, uint32_t* out_fs_n)
+{
     spirv_module_t fs;
     spirv_module_init(&fs);
     spirv_module_begin(&fs);
 
-    void_ty = spirv_type_void(&fs);
-    f32     = spirv_type_float32(&fs);
-    v4      = spirv_type_vec4_float32(&fs);
+    uint32_t void_ty = spirv_type_void(&fs);
+    uint32_t fn_ty   = spirv_type_func_void(&fs);
+    uint32_t f32     = spirv_type_float32(&fs);
 
-    // Input colour (location 0)
-    uint32_t in_col_ptr = spirv_type_ptr(&fs, SPIRV_STORAGE_CLASS_INPUT, v4);
-    uint32_t in_col     = spirv_global_var(&fs, in_col_ptr, SPIRV_STORAGE_CLASS_INPUT);
-    spirv_decorate_1(&fs, in_col, SPIRV_DECORATION_LOCATION, 0);
-
-    // Output FragColor (location 0)
-    uint32_t out_col_ptr = spirv_type_ptr(&fs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
-    uint32_t out_col     = spirv_global_var(&fs, out_col_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
+    /* outColor : Output v4float, Location 0 */
+    uint32_t v4      = spirv_type_vec4_float32(&fs);
+    uint32_t out_ptr = spirv_type_ptr(&fs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
+    uint32_t out_col = spirv_global_var(&fs, out_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
     spirv_decorate_1(&fs, out_col, SPIRV_DECORATION_LOCATION, 0);
+    spirv_name(&fs, out_col, "outColor");
 
-    fn_ty = spirv_type_func_void(&fs);
-    main  = spirv_func_begin(&fs, void_ty, fn_ty);
+    /* fragColor : Input v3float, Location 0 */
+    uint32_t v3     = spirv_type_vec3_float32(&fs);
+    uint32_t in_ptr = spirv_type_ptr(&fs, SPIRV_STORAGE_CLASS_INPUT, v3);
+    uint32_t in_col = spirv_global_var(&fs, in_ptr, SPIRV_STORAGE_CLASS_INPUT);
+    spirv_decorate_1(&fs, in_col, SPIRV_DECORATION_LOCATION, 0);
+    spirv_name(&fs, in_col, "fragColor");
 
-    uint32_t c = spirv_op_load(&fs, v4, in_col);
-    spirv_op_store(&fs, out_col, c);
+    uint32_t main = spirv_func_begin(&fs, void_ty, fn_ty);
+    spirv_name(&fs, main, "main");
+
+    /* outColor = vec4(fragColor, 1.0); */
+    uint32_t rgb  = spirv_op_load(&fs, v3, in_col);
+    uint32_t r    = spirv_composite_extract1(&fs, f32, rgb, 0);
+    uint32_t g    = spirv_composite_extract1(&fs, f32, rgb, 1);
+    uint32_t b    = spirv_composite_extract1(&fs, f32, rgb, 2);
+    uint32_t a    = spirv_type_const_float32(&fs, 1.0f);
+    uint32_t rgba = spirv_composite_construct4(&fs, v4, r, g, b, a);
+    spirv_op_store(&fs, out_col, rgba);
 
     spirv_func_end(&fs);
 
@@ -139,10 +143,23 @@ static int make_rgb_triangle_spirv(uint32_t** out_vs, uint32_t* out_vs_n, uint32
 
     if (spirv_module_finish(&fs, out_fs, out_fs_n) != 0) {
         spirv_module_free(&fs);
-        free(*out_vs);
         return -1;
     }
+    {
+        FILE* f = fopen("/tmp/fs.spv", "wb");
+        fwrite(*out_fs, 4, *out_fs_n, f);
+        fclose(f);
+    }
     spirv_module_free(&fs);
+    return 0;
+}
+
+// Note that Vulkan so debug-friendly that in case of SPIR-V typo (wrong index et cetera)
+// it just segfaults at vkCreateGraphicsPipelines().
+static int spirv_compile_triangle(uint32_t** out_vs, uint32_t* out_vs_n, uint32_t** out_fs, uint32_t* out_fs_n)
+{
+    spirv_compile_triangle_vertex(out_vs, out_vs_n);
+    spirv_compile_triangle_fragment(out_fs, out_fs_n);
     return 0;
 }
 
@@ -177,7 +194,7 @@ int main(void)
     // Generate shaders
     uint32_t *vs = NULL, *fs = NULL;
     uint32_t  vs_n = 0, fs_n = 0;
-    if (make_rgb_triangle_spirv(&vs, &vs_n, &fs, &fs_n) != 0) {
+    if (spirv_compile_triangle(&vs, &vs_n, &fs, &fs_n) != 0) {
         fprintf(stderr, "SPIR-V generation failed\n");
         return 1;
     }
@@ -191,12 +208,15 @@ int main(void)
     draw.stage[GPU_VULKAN_STAGE_VERTEX].constants    = consts;
     draw.stage[GPU_VULKAN_STAGE_VERTEX].const_bytes  = sizeof(float);
 
-    draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv        = fs;
-    draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords = fs_n;
+    // BUG: Segfaults when enabled.
+    // draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv        = fs;
+    // draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords = fs_n;
 
     draw.topology       = GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST;
     draw.vertex_count   = 3;
     draw.instance_count = 1;
+    draw.first_vertex   = 0;
+    draw.first_instance = 0;
 
     /* Mirror xe2: only mark the scene live after a successful submit.
      * Scanout/render_frame is then allowed to page-flip into vram. */
@@ -248,8 +268,8 @@ int main(void)
         rvvm_rgb_t out_format = 0;
         bool       have_frame = false;
 
+        rvvm_info("It");
         if (draw_submitted) {
-
             have_frame = gpu_vulkan_render_frame(ctx, W, H, vram, bufsz, stride, RVVM_RGB_XRGB8888, &out_width,
                                                  &out_height, &out_stride, &out_format);
         }

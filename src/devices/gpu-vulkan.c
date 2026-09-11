@@ -549,13 +549,15 @@ static bool gpu_vulkan_ensure_guest_pipeline(gpu_vulkan_ctx_t* ctx)
             .codeSize = scene->spirv_nwords[s] * sizeof(uint32_t),
             .pCode    = scene->spirv[s],
         };
+        rvvm_info("Submit SPIR-V: %p", scene->spirv[s]);
         VK_TRY(vkCreateShaderModule(ctx->device, &module_ci, NULL, &modules[s]));
         rvvm_info("%s: Write stage %u", __FUNCTION__, s);
+        // Entry point name confirmed to be "main" for each kind of shader.
         stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
             .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage  = stage_bits[s],
             .module = modules[s],
-            .pName  = s == GPU_VULKAN_STAGE_VERTEX ? "main" : "x",
+            .pName  = "main",
         };
     }
 
