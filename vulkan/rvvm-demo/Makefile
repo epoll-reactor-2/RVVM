@@ -1,6 +1,11 @@
 all:
 	gcc -O0 -ggdb ../../src/devices/gpu-vulkan.c main.c ../../src/util/*.c -I../../src -I../../src/util -I../../include -I../../src/devices -lvulkan -lSDL2
 
+# This environment variable needed to change renderer. My host
+# Vega 8 is buggy and segfaults during pipeline creation.
+run:
+	VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json ./a.out
+
 .PHONY: compare
 compare:
 	@zsh -c 'make all'

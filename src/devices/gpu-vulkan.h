@@ -16,6 +16,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <stddef.h>
 #include <stdint.h>
 
+// Important note. If you will suddenly encounter silent segfaults in
+// functions like vkCreateGraphicsPipelines(), vkQueueSubmit() or others,
+// it is a strong signal that your native Vulkan backend is buggy (like
+// mine AMD RADV). Try launch your application with environment variable
+// VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json or other.
+
 typedef struct gpu_vulkan_ctx_t gpu_vulkan_ctx_t;
 
 gpu_vulkan_ctx_t* gpu_vulkan_create(void);
@@ -95,23 +101,17 @@ typedef struct {
     uint32_t first_instance;
 } gpu_vulkan_draw_t;
 
-/*
- * Hand a draw to the renderer.
- *
- * The draw is copied and kept as the scene the backend renders from that
- * point on; the next render tick picks it up. A later submission
- * replaces it, so a guest issuing several draws per frame currently gets
- * the last one - there is no command list yet.
- *
- * Returns false when the draw carries no vertex shader - a graphics
- * pipeline cannot be built without one - in which case the backend keeps
- * rendering whatever it had.
- */
+// Hand a draw to the renderer.
+//
+// The draw is copied and kept as the scene the backend renders from that
+// point on; the next render tick picks it up. A later submission
+// replaces it, so a guest issuing several draws per frame currently gets
+// the last one - there is no command list yet.
+//
+// Returns false when the draw carries no vertex shader - a graphics
+// pipeline cannot be built without one - in which case the backend keeps
+// rendering whatever it had.
 bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw);
-
-// -----------------------------------------------------------
-// Scanout
-// -----------------------------------------------------------
 
 bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t* ctx, uint32_t width, uint32_t height, uint8_t* dst, size_t dst_size,
                              uint32_t stride, rvvm_rgb_t format, uint32_t* out_width, uint32_t* out_height,

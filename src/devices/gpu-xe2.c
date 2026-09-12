@@ -3545,8 +3545,8 @@ static uint32_t xe2_brw_3_src_vstride(uint32_t hstride)
     return hstride ? hstride * 8 : 0;
 }
 
-/* MATH function control sits in the low bits of the conditional modifier /
- * shared control field on Xe2; fall back to bits of dword0 when needed. */
+// MATH function control sits in the low bits of the conditional modifier
+// shared control field on Xe2; fall back to bits of dword0 when needed.
 static inline uint32_t xe2_brw_math_fc(const xe2_qword_t* qw)
 {
     // Cond modifier [95:92] often carries FC for MATH.
