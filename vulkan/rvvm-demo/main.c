@@ -202,8 +202,10 @@ int main(void)
     }
 
     // Generate shaders
-    uint32_t *vs = NULL, *fs = NULL;
-    uint32_t  vs_n = 0, fs_n = 0;
+    uint32_t* vs   = NULL;
+    uint32_t* fs   = NULL;
+    uint32_t  vs_n = 0;
+    uint32_t  fs_n = 0;
     if (spirv_compile_shader(&vs, &vs_n, &fs, &fs_n) != 0) {
         fprintf(stderr, "SPIR-V generation failed\n");
         return 1;
