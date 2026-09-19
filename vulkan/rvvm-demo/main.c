@@ -28,6 +28,24 @@ static void spirv_dump_disk(const char* path, const uint32_t* spirv, uint32_t n)
     fclose(f);
 }
 
+static void spirv_read_disk(const char* path, uint32_t** out, uint32_t* n)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        rvvm_fatal("fopen(): %s", strerror(errno));
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    *out = safe_calloc(1, size);
+    fread(*out, 1, size, f);
+    fclose(f);
+    *n = size / 4;
+
+    rvvm_info("Read %s: %u bytes", path, *n);
+}
+
 // #version 450
 //
 // vec2 positions[3] = vec2[](
@@ -73,8 +91,8 @@ static int spirv_compile_triangle_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
     uint32_t vid  = spirv_op_load(&vs, i32, vid_var);
     uint32_t c0   = spirv_type_const_int32(&vs, 0);
     uint32_t c1   = spirv_type_const_int32(&vs, 1);
-    uint32_t eq0  = spirv_fcmp(&vs, SPIRV_OP_I_EQUAL, bool_ty, vid, c0);
-    uint32_t eq1  = spirv_fcmp(&vs, SPIRV_OP_I_EQUAL, bool_ty, vid, c1);
+    uint32_t eq0  = spirv_cmp(&vs, SPIRV_OP_I_EQUAL, bool_ty, vid, c0);
+    uint32_t eq1  = spirv_cmp(&vs, SPIRV_OP_I_EQUAL, bool_ty, vid, c1);
     uint32_t px0  = spirv_type_const_float32(&vs, 0.0f);
     uint32_t py0  = spirv_type_const_float32(&vs, -0.5f);
     uint32_t px1  = spirv_type_const_float32(&vs, 0.5f);
@@ -165,26 +183,35 @@ static int spirv_compile_triangle_fragment(uint32_t** out_fs, uint32_t* out_fs_n
 // it just segfaults at vkCreateGraphicsPipelines().
 static int spirv_compile_shader(uint32_t** out_vs, uint32_t* out_vs_n, uint32_t** out_fs, uint32_t* out_fs_n)
 {
+#if 1
+    spirv_read_disk("/home/fuck/git/RVVM/vulkan/draw/vert.spv", out_vs, out_vs_n);
+    spirv_read_disk("/home/fuck/git/RVVM/vulkan/draw/frag.spv", out_fs, out_fs_n);
+#else
     spirv_compile_triangle_vertex(out_vs, out_vs_n);
     spirv_compile_triangle_fragment(out_fs, out_fs_n);
+#endif
     return 0;
 }
 
 #define W 800
 #define H 600
 
-int main(void)
-{
-    rvvm_set_loglevel(LOG_INFO);
+typedef struct {
+    SDL_Window*   win;
+    SDL_Texture*  texture;
+    SDL_Renderer* renderer;
+} sdl_window_t;
 
+static int sdl_create_window(sdl_window_t* win)
+{
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
 
-    SDL_Window* win = SDL_CreateWindow("RVVM Vulkan RGB triangle", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H,
-                                       SDL_WINDOW_SHOWN);
-    if (!win) {
+    win->win = SDL_CreateWindow("RVVM Vulkan RGB triangle", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H,
+                                SDL_WINDOW_SHOWN);
+    if (!win->win) {
         fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         return 1;
     }
@@ -192,8 +219,28 @@ int main(void)
     // When SDL_RENDERER_ACCELERATED is enabled, it crashes Wayland compositor but
     // works under Xorg. I assume SDL then conflicts with our Vulkan driver
     // attempting to acquire same GPU as SDL does.
-    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
-    SDL_Texture*  tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, W, H);
+    win->renderer = SDL_CreateRenderer(win->win, -1, SDL_RENDERER_SOFTWARE);
+    win->texture  = SDL_CreateTexture(win->renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, W, H);
+
+    return 0;
+}
+
+static void sdl_destroy_window(sdl_window_t* win)
+{
+    SDL_DestroyTexture(win->texture);
+    SDL_DestroyRenderer(win->renderer);
+    SDL_DestroyWindow(win->win);
+    SDL_Quit();
+}
+
+int main(void)
+{
+    rvvm_set_loglevel(LOG_INFO);
+
+    sdl_window_t win = {0};
+    if (sdl_create_window(&win) < 0) {
+        return -1;
+    }
 
     gpu_vulkan_ctx_t* ctx = gpu_vulkan_create();
     if (!ctx) {
@@ -275,20 +322,20 @@ int main(void)
         if (have_frame && out_width && out_height && out_stride) {
             void* pixels;
             int   pitch;
-            if (SDL_LockTexture(tex, NULL, &pixels, &pitch) == 0) {
+            if (SDL_LockTexture(win.texture, NULL, &pixels, &pitch) == 0) {
                 const uint32_t copy_w    = out_width < W ? out_width : W;
                 const uint32_t copy_h    = out_height < H ? out_height : H;
                 const size_t   row_bytes = (size_t)copy_w * 4;
                 for (uint32_t y = 0; y < copy_h; y++) {
                     memcpy((uint8_t*)pixels + (size_t)y * (size_t)pitch, vram + (size_t)y * out_stride, row_bytes);
                 }
-                SDL_UnlockTexture(tex);
+                SDL_UnlockTexture(win.texture);
             }
         }
 
-        SDL_RenderClear(ren);
-        SDL_RenderCopy(ren, tex, NULL, NULL);
-        SDL_RenderPresent(ren);
+        SDL_RenderClear(win.renderer);
+        SDL_RenderCopy(win.renderer, win.texture, NULL, NULL);
+        SDL_RenderPresent(win.renderer);
         // Sleep ~16ms to acquire 60Hz rate ~> 1000/60.
         SDL_Delay(16);
     }
@@ -297,9 +344,7 @@ int main(void)
     free(vs);
     free(fs);
     gpu_vulkan_destroy(ctx);
-    SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
-    SDL_DestroyWindow(win);
-    SDL_Quit();
+    sdl_destroy_window(&win);
+
     return 0;
 }

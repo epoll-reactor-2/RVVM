@@ -247,9 +247,10 @@ static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t* ctx)
         .pApplicationName = "xe2-scanout-renderer",
         .apiVersion       = VK_API_VERSION_1_3,
     };
+    // No extensions: no surface/presentation is ever used.
     VkInstanceCreateInfo inst_ci = {
-        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app_info,
-        // No extensions: no surface/presentation is ever used.
+        .sType            = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &app_info,
     };
     VK_TRY(vkCreateInstance(&inst_ci, NULL, &ctx->instance));
 
@@ -261,6 +262,11 @@ static bool gpu_vulkan_create_instance_and_device(gpu_vulkan_ctx_t* ctx)
     }
     VkPhysicalDevice* devices = safe_calloc(sizeof(VkPhysicalDevice), dev_count);
     vkEnumeratePhysicalDevices(ctx->instance, &dev_count, devices);
+    for (size_t i = 0; i < dev_count; ++i) {
+        VkPhysicalDeviceProperties property = {0};
+        vkGetPhysicalDeviceProperties(devices[i], &property);
+        rvvm_info("Vulkan detected physical GPU: %s", property.deviceName);
+    }
 
     int graphics_family = -1;
     for (uint32_t i = 0; i < dev_count && graphics_family < 0; i++) {
@@ -358,7 +364,7 @@ static bool gpu_vulkan_create_render_pass(gpu_vulkan_ctx_t* ctx, VkFormat vk_for
         .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
         // Land directly in a copy-source layout: no manual barrier needed
         // before vkCmdCopyImageToBuffer after the render pass ends.
-        .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
     };
     VkAttachmentReference color_ref = {
         .attachment = 0,
@@ -544,11 +550,14 @@ static VkPipeline gpu_vulkan_build_pipeline(gpu_vulkan_ctx_t* ctx, const VkPipel
         .viewportCount = 1,
         .scissorCount  = 1,
     };
-    VkDynamicState                   dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic_state     = {
-            .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-            .dynamicStateCount = 2,
-            .pDynamicStates    = dynamic_states,
+    VkDynamicState dynamic_states[2] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+    };
+    VkPipelineDynamicStateCreateInfo dynamic_state = {
+        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2,
+        .pDynamicStates    = dynamic_states,
     };
 
     VkPipelineRasterizationStateCreateInfo rasterizer = {
@@ -717,7 +726,7 @@ bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw
     // hold it across allocations.
     gpu_vulkan_scene_t scene = {
         .topology
-        = (draw->topology <= GPU_VULKAN_TOPOLOGY_TRIANGLE_FAN) ? draw->topology : GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST,
+        = draw->topology <= GPU_VULKAN_TOPOLOGY_TRIANGLE_FAN ? draw->topology : GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST,
         .vertex_count   = draw->vertex_count,
         .instance_count = draw->instance_count ? draw->instance_count : 1,
         .first_vertex   = draw->first_vertex,
