@@ -71,12 +71,29 @@ typedef enum {
     GPU_VULKAN_TOPOLOGY_TRIANGLE_FAN   = 5,
 } gpu_vulkan_topology_t;
 
-// Every stage gets its constants bound as a uniform block of this size,
-// at descriptor set GPU_VULKAN_CONST_SET, binding = the stage index. A
-// shader handed to gpu_vulkan_submit_draw() must declare its block to
-// match; the emulated device does that in gpu-xe2-shader.h.
-#define GPU_VULKAN_CONST_SET   0
-#define GPU_VULKAN_CONST_BYTES 1024
+// Shader constants.
+//
+// Every programmable stage owns one uniform block of GPU_VULKAN_CONST_BYTES
+// bytes, bound at descriptor set GPU_VULKAN_CONST_SET, binding
+// GPU_VULKAN_CONST_BINDING(stage). The backend treats it as an opaque byte
+// image: whatever the caller hands over is copied verbatim, so the shader
+// alone decides how those bytes are interpreted. It must declare the block
+// with an explicit layout (std140 / ArrayStride + Offset decorations) and a
+// size of at most GPU_VULKAN_CONST_BYTES; the emulated device does that in
+// gpu-xe2-shader.h, and spirv_uniform_vec4_array_block() in
+// gpu-vulkan-spirv.h declares "vec4 c[N]" in which element i, component j is
+// dword (i * 4 + j) of the block.
+//
+// There are two ways to feed the block:
+//   1. gpu_vulkan_stage_desc_t.constants - the whole block, as part of a
+//      draw. Everything past const_bytes (and the whole block when NULL) is
+//      zero.
+//   2. gpu_vulkan_update_constants() - patch a byte range of the current
+//      block without resubmitting the draw. This is the per-frame path:
+//      no SPIR-V copy, no pipeline lookup, just a memcpy.
+#define GPU_VULKAN_CONST_SET            0
+#define GPU_VULKAN_CONST_BYTES          1024
+#define GPU_VULKAN_CONST_BINDING(stage) ((uint32_t)(stage))
 
 typedef struct {
     // SPIR-V module for this stage. NULL leaves the stage disabled.
@@ -85,8 +102,10 @@ typedef struct {
     const uint32_t* spirv;
     uint32_t        spirv_nwords;
 
-    // Contents of the stage's uniform block. Anything past const_bytes
-    // reads back as zero.
+    // Contents of the stage's uniform block, see "Shader constants" above.
+    // Anything past const_bytes (and everything when constants is NULL)
+    // reads back as zero; const_bytes beyond GPU_VULKAN_CONST_BYTES is
+    // truncated.
     const void* constants;
     uint32_t    const_bytes;
 } gpu_vulkan_stage_desc_t;
@@ -112,6 +131,11 @@ typedef struct {
 // pipeline cannot be built without one - in which case the backend keeps
 // rendering whatever it had.
 bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw);
+
+// Overwrite sized memory region treated as uniform buffer. Shader's uniform buffer's
+// size must comply with buffer size reported to Vulkan with `vkBindBufferMemory()`.
+bool gpu_vulkan_update_constants(gpu_vulkan_ctx_t* ctx, gpu_vulkan_stage_t stage, uint32_t offset, const void* data,
+                                 uint32_t size);
 
 bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t* ctx, uint32_t width, uint32_t height, uint8_t* dst, size_t dst_size,
                              uint32_t stride, rvvm_rgb_t format, uint32_t* out_width, uint32_t* out_height,

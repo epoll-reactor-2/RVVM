@@ -137,13 +137,15 @@ static const char* gpu_vulkan_result_to_string(VkResult result)
         }                                                                                                              \
     } while (0)
 
+#define GPU_VULKAN_ALL_STAGES ((1u << GPU_VULKAN_STAGE_COUNT) - 1u)
+
 // A draw as the renderer keeps it: everything the caller passed to
-// gpu_vulkan_submit_draw(), copied, so nothing here can be recompiled or
-// freed underneath the render thread.
+// gpu_vulkan_submit_draw() except the constants (those have their own
+// path, see gpu_vulkan_ctx_t), copied, so nothing here can be recompiled
+// or freed underneath the render thread.
 typedef struct {
     uint32_t* spirv[GPU_VULKAN_STAGE_COUNT]; // Owned.
     uint32_t  spirv_nwords[GPU_VULKAN_STAGE_COUNT];
-    uint8_t   constants[GPU_VULKAN_STAGE_COUNT][GPU_VULKAN_CONST_BYTES];
 
     uint32_t topology;
     uint32_t vertex_count;
@@ -176,6 +178,20 @@ struct gpu_vulkan_ctx_t {
     VkBuffer              const_buffer[GPU_VULKAN_STAGE_COUNT];
     VkDeviceMemory        const_memory[GPU_VULKAN_STAGE_COUNT];
     void*                 const_mapped[GPU_VULKAN_STAGE_COUNT];
+
+    // Host-side life of a constant block:
+    //   device thread: submit_draw()/update_constants() -> const_shadow
+    //   render thread: take_scene() snapshots dirty stages -> const_stage
+    //                  upload_constants() const_stage -> const_mapped
+    // const_shadow/const_dirty are guarded by draw_lock. const_stage and
+    // const_upload belong to the render thread; the snapshot exists so the
+    // lock is never held across writes to mapped (possibly write-combined)
+    // memory. const_upload survives tasks that bail out early, so a
+    // snapshot is never lost. Bit i of the masks == stage i.
+    uint8_t  const_shadow[GPU_VULKAN_STAGE_COUNT][GPU_VULKAN_CONST_BYTES];
+    uint32_t const_dirty;
+    uint8_t  const_stage[GPU_VULKAN_STAGE_COUNT][GPU_VULKAN_CONST_BYTES];
+    uint32_t const_upload;
 
     // Scene handoff. The device thread publishes into `pending`, the
     // render worker takes it over into `active` at the top of a task.
@@ -362,9 +378,7 @@ static bool gpu_vulkan_create_render_pass(gpu_vulkan_ctx_t* ctx, VkFormat vk_for
         .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-        // Land directly in a copy-source layout: no manual barrier needed
-        // before vkCmdCopyImageToBuffer after the render pass ends.
-        .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        .finalLayout    = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
     };
     VkAttachmentReference color_ref = {
         .attachment = 0,
@@ -504,20 +518,12 @@ static bool gpu_vulkan_create_const_layout(gpu_vulkan_ctx_t* ctx)
     // The bindings never move afterwards, so this is the only update.
     vkUpdateDescriptorSets(ctx->device, GPU_VULKAN_STAGE_COUNT, writes, 0, NULL);
 
-    VkPushConstantRange push_range = {
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset     = 0,
-        .size       = sizeof(float),
-    };
+    // Constants only ever travel through the uniform blocks above - no
+    // push constants, so every stage sees the same, size-bounded interface.
     VkPipelineLayoutCreateInfo layout_ci = {
         .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
         .pSetLayouts    = &ctx->const_set_layout,
-        // Only the built-in fragment shader uses this (its animation
-        // clock); guest shaders take everything through the uniform
-        // blocks above.
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges    = &push_range,
     };
     VK_TRY(vkCreatePipelineLayout(ctx->device, &layout_ci, NULL, &ctx->pipeline_layout));
     return true;
@@ -723,7 +729,11 @@ bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw
     }
 
     // Build the copy outside the lock - the device thread should not
-    // hold it across allocations.
+    // hold it across allocations. The constants are staged here too and
+    // published together with the scene, so the renderer never pairs new
+    // shaders with the previous draw's constants.
+    uint8_t consts[GPU_VULKAN_STAGE_COUNT][GPU_VULKAN_CONST_BYTES] = {0};
+
     gpu_vulkan_scene_t scene = {
         .topology
         = draw->topology <= GPU_VULKAN_TOPOLOGY_TRIANGLE_FAN ? draw->topology : GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST,
@@ -744,7 +754,7 @@ bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw
         }
         if (desc->constants && desc->const_bytes) {
             uint32_t nbytes = (desc->const_bytes > GPU_VULKAN_CONST_BYTES) ? GPU_VULKAN_CONST_BYTES : desc->const_bytes;
-            memcpy(scene.constants[s], desc->constants, nbytes);
+            memcpy(consts[s], desc->constants, nbytes);
         }
     }
 
@@ -756,12 +766,45 @@ bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw
     }
     ctx->pending       = scene;
     ctx->pending_valid = true;
+    // A draw defines its constant blocks entirely: stages it carries no
+    // constants for are zeroed, not left over from the previous draw.
+    memcpy(ctx->const_shadow, consts, sizeof(consts));
+    ctx->const_dirty = GPU_VULKAN_ALL_STAGES;
     spin_unlock(&ctx->draw_lock);
     return true;
 }
 
-// Moves a newly submitted scene into the renderer's own copy. Returns
-// whether a guest scene is available to draw at all.
+bool gpu_vulkan_update_constants(gpu_vulkan_ctx_t* ctx, gpu_vulkan_stage_t stage, uint32_t offset, const void* data,
+                                 uint32_t size)
+{
+    if (unlikely(!ctx || atomic_load_uint8_relax(&ctx->shutting_down))) {
+        return false;
+    }
+    if (unlikely((uint32_t)stage >= GPU_VULKAN_STAGE_COUNT || (!data && size))) {
+        rvvm_warn("%s: bad stage %d or data %p", __FUNCTION__, (int)stage, data);
+        return false;
+    }
+    // Written so that offset + size cannot wrap.
+    if (unlikely(size > GPU_VULKAN_CONST_BYTES || offset > GPU_VULKAN_CONST_BYTES - size)) {
+        rvvm_warn("%s: range [%u, %u + %u) exceeds %u bytes", __FUNCTION__, offset, offset, size,
+                  GPU_VULKAN_CONST_BYTES);
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+
+    spin_lock(&ctx->draw_lock);
+    memcpy(&ctx->const_shadow[stage][offset], data, size);
+    ctx->const_dirty |= 1u << stage;
+    spin_unlock(&ctx->draw_lock);
+    return true;
+}
+
+// Moves a newly submitted scene into the renderer's own copy, together
+// with a snapshot of whichever constant blocks changed since the last
+// task - one critical section, so scene and constants stay a matching
+// pair. Returns whether a guest scene is available to draw at all.
 static bool gpu_vulkan_take_scene(gpu_vulkan_ctx_t* ctx)
 {
     spin_lock(&ctx->draw_lock);
@@ -774,8 +817,29 @@ static bool gpu_vulkan_take_scene(gpu_vulkan_ctx_t* ctx)
         ctx->pending_valid = false;
         memset(&ctx->pending, 0, sizeof(ctx->pending));
     }
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        if (ctx->const_dirty & (1u << s)) {
+            memcpy(ctx->const_stage[s], ctx->const_shadow[s], GPU_VULKAN_CONST_BYTES);
+        }
+    }
+    ctx->const_upload |= ctx->const_dirty;
+    ctx->const_dirty   = 0;
     spin_unlock(&ctx->draw_lock);
     return ctx->active_valid;
+}
+
+// Writes the snapshotted constant blocks into the mapped uniform buffers
+// the descriptor set points at. Render thread only, and only between
+// fence waits, so the GPU is never reading a buffer while it is written;
+// HOST_COHERENT memory plus vkQueueSubmit() make the writes visible.
+static void gpu_vulkan_upload_constants(gpu_vulkan_ctx_t* ctx)
+{
+    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
+        if ((ctx->const_upload & (1u << s)) && ctx->const_mapped[s]) {
+            memcpy(ctx->const_mapped[s], ctx->const_stage[s], GPU_VULKAN_CONST_BYTES);
+        }
+    }
+    ctx->const_upload = 0;
 }
 
 static bool gpu_vulkan_create_command_and_sync(gpu_vulkan_ctx_t* ctx)
@@ -795,7 +859,9 @@ static bool gpu_vulkan_create_command_and_sync(gpu_vulkan_ctx_t* ctx)
     };
     VK_TRY(vkAllocateCommandBuffers(ctx->device, &alloc_info, &ctx->command_buffer));
 
-    VkFenceCreateInfo fence_ci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFenceCreateInfo fence_ci = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+    };
     VK_TRY(vkCreateFence(ctx->device, &fence_ci, NULL, &ctx->fence));
     return true;
 fail:
@@ -1203,14 +1269,10 @@ static void* gpu_vulkan_render_task(void* arg)
         goto done;
     }
 
-    // Publish the constants of the active scene into the uniform blocks
-    // the shaders read. Nothing else touches these buffers, and the
-    // previous frame's fence has already been waited on.
-    for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
-        if (ctx->const_mapped[s]) {
-            memcpy(ctx->const_mapped[s], ctx->active.constants[s], GPU_VULKAN_CONST_BYTES);
-        }
-    }
+    // Publish whatever constants changed into the uniform blocks the
+    // shaders read. Nothing else touches these buffers, and the previous
+    // frame's fence has already been waited on.
+    gpu_vulkan_upload_constants(ctx);
 
     vkResetCommandBuffer(ctx->command_buffer, 0);
     VkCommandBufferBeginInfo begin_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};

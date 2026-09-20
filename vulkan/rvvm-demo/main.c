@@ -18,6 +18,13 @@
 #define RVVM_RGB_XRGB2101010 0x06
 #endif
 
+// 1: load precompiled vert.spv/frag.spv instead of building the shaders in
+// this file. Such a fragment shader must declare the same constant block as
+// spirv_compile_triangle_fragment() below (GLSL given in its comment).
+#ifndef DEMO_SHADERS_FROM_DISK
+#define DEMO_SHADERS_FROM_DISK 0
+#endif
+
 static void spirv_dump_disk(const char* path, const uint32_t* spirv, uint32_t n)
 {
     FILE* f = fopen(path, "wb");
@@ -28,6 +35,7 @@ static void spirv_dump_disk(const char* path, const uint32_t* spirv, uint32_t n)
     fclose(f);
 }
 
+#if DEMO_SHADERS_FROM_DISK
 static void spirv_read_disk(const char* path, uint32_t** out, uint32_t* n)
 {
     FILE* f = fopen(path, "rb");
@@ -45,6 +53,7 @@ static void spirv_read_disk(const char* path, uint32_t** out, uint32_t* n)
 
     rvvm_info("Read %s: %u bytes", path, *n);
 }
+#endif
 
 // #version 450
 //
@@ -75,13 +84,14 @@ static int spirv_compile_triangle_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
     uint32_t void_ty = spirv_type_void(&vs);
     uint32_t f32     = spirv_type_float32(&vs);
     uint32_t i32     = spirv_type_int32(&vs);
+    uint32_t v3      = spirv_type_vec3_float32(&vs);
     uint32_t v4      = spirv_type_vec4_float32(&vs);
     uint32_t bool_ty = spirv_type_bool(&vs);
     uint32_t fn_ty   = spirv_type_func_void(&vs);
     uint32_t pos_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
     uint32_t pos_var = spirv_global_var(&vs, pos_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
     spirv_decorate_1(&vs, pos_var, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
-    uint32_t col_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
+    uint32_t col_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v3);
     uint32_t col_var = spirv_global_var(&vs, col_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
     spirv_decorate_1(&vs, col_var, SPIRV_DECORATION_LOCATION, 0);
     uint32_t vid_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_INPUT, i32);
@@ -110,7 +120,7 @@ static int spirv_compile_triangle_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
     uint32_t cr   = spirv_select(&vs, f32, eq0, one, spirv_select(&vs, f32, eq1, zero, zero)); /* 1,0,0 */
     uint32_t cg   = spirv_select(&vs, f32, eq0, zero, spirv_select(&vs, f32, eq1, one, zero)); /* 0,1,0 */
     uint32_t cb   = spirv_select(&vs, f32, eq0, zero, spirv_select(&vs, f32, eq1, zero, one)); /* 0,0,1 */
-    uint32_t col  = spirv_composite_construct4(&vs, v4, cr, cg, cb, one);
+    uint32_t col  = spirv_op_3(&vs, SPIRV_OP_COMPOSITE_CONSTRUCT, v3, cr, cg, cb);
     spirv_op_store(&vs, col_var, col);
     spirv_func_end(&vs);
 
@@ -127,13 +137,50 @@ static int spirv_compile_triangle_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
     return 0;
 }
 
+// Fragment stage constants, as this driver lays them out. The block is raw
+// bytes to the backend; dword 0 is c[0].x in the shader below. Everything
+// else in the block stays zero.
+typedef struct {
+    float hue; // Hue rotation angle, radians.
+} triangle_frag_consts_t;
+
+_Static_assert(sizeof(triangle_frag_consts_t) <= GPU_VULKAN_CONST_BYTES, "constants do not fit the block");
+
+// Dot product of a constant 3-vector row with (r, g, b): 3 fmul + 2 fadd.
+static uint32_t spirv_row3(spirv_module_t* m, uint32_t f32, uint32_t k0, uint32_t k1, uint32_t k2, uint32_t r,
+                           uint32_t g, uint32_t b)
+{
+    uint32_t t0 = spirv_op_fmul(m, f32, k0, r);
+    uint32_t t1 = spirv_op_fmul(m, f32, k1, g);
+    uint32_t t2 = spirv_op_fmul(m, f32, k2, b);
+    return spirv_op_fadd(m, f32, spirv_op_fadd(m, f32, t0, t1), t2);
+}
+
 // #version 450
 //
 // layout(location = 0)  in vec3 fragColor;
 // layout(location = 0) out vec4 outColor;
 //
+// // Descriptor set GPU_VULKAN_CONST_SET, binding GPU_VULKAN_CONST_BINDING(
+// // GPU_VULKAN_STAGE_FRAGMENT) == 4. GPU_VULKAN_CONST_BYTES / 16 == 64.
+// layout(set = 0, binding = 4, std140) uniform FragConsts {
+//     vec4 c[64];
+// };
+//
 // void main() {
-//     outColor = vec4(fragColor, 1.0);
+//     float a = c[0].x;         // triangle_frag_consts_t.hue
+//     float k = cos(a);
+//     float s = sin(a);
+//     float d = (1.0 + 2.0 * k) / 3.0;
+//     float e = (1.0 - k) / 3.0;
+//     float f = s * 0.57735027; // s / sqrt(3)
+//     vec3  p = fragColor;
+//
+//     // Rotation of the color around the gray axis (1, 1, 1).
+//     outColor = vec4(d       * p.r + (e - f) * p.g + (e + f) * p.b,
+//                     (e + f) * p.r + d       * p.g + (e - f) * p.b,
+//                     (e - f) * p.r + (e + f) * p.g + d       * p.b,
+//                     1.0);
 // }
 static int spirv_compile_triangle_fragment(uint32_t** out_fs, uint32_t* out_fs_n)
 {
@@ -154,14 +201,45 @@ static int spirv_compile_triangle_fragment(uint32_t** out_fs, uint32_t* out_fs_n
     uint32_t in_col = spirv_global_var(&fs, in_ptr, SPIRV_STORAGE_CLASS_INPUT);
     spirv_decorate_1(&fs, in_col, SPIRV_DECORATION_LOCATION, 0);
     spirv_name(&fs, in_col, "fragColor");
+
+    // The stage's constant block: "vec4 c[GPU_VULKAN_CONST_BYTES / 16]" at
+    // the set/binding the backend binds it to. Not part of the entry point
+    // interface (SPIR-V 1.3 lists only Input/Output variables).
+    uint32_t c_elem_ptr = 0;
+    uint32_t c_var      = spirv_uniform_vec4_array_block(&fs, GPU_VULKAN_CONST_BYTES / 16, GPU_VULKAN_CONST_SET,
+                                                         GPU_VULKAN_CONST_BINDING(GPU_VULKAN_STAGE_FRAGMENT), &c_elem_ptr);
+    spirv_name(&fs, c_var, "consts");
+
     uint32_t main = spirv_func_begin(&fs, void_ty, fn_ty);
     spirv_name(&fs, main, "main");
+
+    // a = c[0].x  (block member 0, array element 0, vector component 0)
+    uint32_t zero   = spirv_type_const_uint32(&fs, 0);
+    uint32_t idx[3] = {zero, zero, zero};
+    uint32_t a_ptr  = spirv_access_chain(&fs, c_elem_ptr, c_var, idx, 3);
+    uint32_t a      = spirv_op_load(&fs, f32, a_ptr);
+
+    uint32_t one     = spirv_type_const_float32(&fs, 1.0f);
+    uint32_t two     = spirv_type_const_float32(&fs, 2.0f);
+    uint32_t third   = spirv_type_const_float32(&fs, 1.0f / 3.0f);
+    uint32_t inv_sq3 = spirv_type_const_float32(&fs, 0.57735027f);
+
+    uint32_t k   = spirv_ext_inst1(&fs, f32, SPIRV_GLSL_STD450_COS, a);
+    uint32_t s   = spirv_ext_inst1(&fs, f32, SPIRV_GLSL_STD450_SIN, a);
+    uint32_t d   = spirv_op_fmul(&fs, f32, spirv_op_fadd(&fs, f32, one, spirv_op_fmul(&fs, f32, two, k)), third);
+    uint32_t e   = spirv_op_fmul(&fs, f32, spirv_op_fsub(&fs, f32, one, k), third);
+    uint32_t f   = spirv_op_fmul(&fs, f32, s, inv_sq3);
+    uint32_t emf = spirv_op_fsub(&fs, f32, e, f);
+    uint32_t epf = spirv_op_fadd(&fs, f32, e, f);
+
     uint32_t rgb  = spirv_op_load(&fs, v3, in_col);
     uint32_t r    = spirv_composite_extract1(&fs, f32, rgb, 0);
     uint32_t g    = spirv_composite_extract1(&fs, f32, rgb, 1);
     uint32_t b    = spirv_composite_extract1(&fs, f32, rgb, 2);
-    uint32_t a    = spirv_type_const_float32(&fs, 1.0f);
-    uint32_t rgba = spirv_composite_construct4(&fs, v4, r, g, b, a);
+    uint32_t ro   = spirv_row3(&fs, f32, d, emf, epf, r, g, b);
+    uint32_t go   = spirv_row3(&fs, f32, epf, d, emf, r, g, b);
+    uint32_t bo   = spirv_row3(&fs, f32, emf, epf, d, r, g, b);
+    uint32_t rgba = spirv_composite_construct4(&fs, v4, ro, go, bo, one);
     spirv_op_store(&fs, out_col, rgba);
     spirv_func_end(&fs);
 
@@ -183,12 +261,16 @@ static int spirv_compile_triangle_fragment(uint32_t** out_fs, uint32_t* out_fs_n
 // it just segfaults at vkCreateGraphicsPipelines().
 static int spirv_compile_shader(uint32_t** out_vs, uint32_t* out_vs_n, uint32_t** out_fs, uint32_t* out_fs_n)
 {
-#if 1
+#if DEMO_SHADERS_FROM_DISK
     spirv_read_disk("/home/fuck/git/RVVM/vulkan/draw/vert.spv", out_vs, out_vs_n);
     spirv_read_disk("/home/fuck/git/RVVM/vulkan/draw/frag.spv", out_fs, out_fs_n);
 #else
-    spirv_compile_triangle_vertex(out_vs, out_vs_n);
-    spirv_compile_triangle_fragment(out_fs, out_fs_n);
+    if (spirv_compile_triangle_vertex(out_vs, out_vs_n) < 0) {
+        return -1;
+    }
+    if (spirv_compile_triangle_fragment(out_fs, out_fs_n) < 0) {
+        return -1;
+    }
 #endif
     return 0;
 }
@@ -258,13 +340,18 @@ int main(void)
         return 1;
     }
 
-    // No constants used. Could be submitted via draw.stage[....].constants/const_bytes.
+    triangle_frag_consts_t fragment_consts = {
+        .hue = 0.0f,
+    };
+
     gpu_vulkan_draw_t draw                           = {0};
     draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv        = vs;
     draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords = vs_n;
 
     draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv        = fs;
     draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords = fs_n;
+    draw.stage[GPU_VULKAN_STAGE_FRAGMENT].constants    = &fragment_consts;
+    draw.stage[GPU_VULKAN_STAGE_FRAGMENT].const_bytes  = sizeof(fragment_consts);
 
     draw.topology       = GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST;
     draw.vertex_count   = 3;
@@ -306,6 +393,18 @@ int main(void)
             if (e.type == SDL_QUIT) {
                 running = false;
             }
+        }
+
+#define TAU 6.28318530718f
+        // Advance the animation and hand the new value to the backend; the
+        // next render tick picks it up. No draw resubmission involved.
+        fragment_consts.hue += 0.05f;
+        if (fragment_consts.hue >= TAU) {
+            fragment_consts.hue -= TAU;
+        }
+        if (!gpu_vulkan_update_constants(ctx, GPU_VULKAN_STAGE_FRAGMENT, 0, &fragment_consts,
+                                         sizeof(fragment_consts))) {
+            fprintf(stderr, "update_constants failed\n");
         }
 
         uint32_t   out_width  = 0;
