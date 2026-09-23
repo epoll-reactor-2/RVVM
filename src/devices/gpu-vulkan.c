@@ -152,6 +152,19 @@ typedef struct {
     uint32_t instance_count;
     uint32_t first_vertex;
     uint32_t first_instance;
+
+    // Vertex input, deep-copied like spirv[] above.
+    uint8_t*                   vertex_data[GPU_VULKAN_MAX_VERTEX_BINDINGS]; // Owned.
+    uint32_t                   vertex_size[GPU_VULKAN_MAX_VERTEX_BINDINGS];
+    uint32_t                   vertex_stride[GPU_VULKAN_MAX_VERTEX_BINDINGS];
+    uint32_t                   vertex_binding_count;
+    gpu_vulkan_vertex_attrib_t vertex_attrib[GPU_VULKAN_MAX_VERTEX_ATTRIBS];
+    uint32_t                   vertex_attrib_count;
+
+    uint8_t* index_data; // Owned, NULL for a non-indexed draw.
+    uint32_t index_size;
+    uint32_t index_type;
+    int32_t  vertex_offset;
 } gpu_vulkan_scene_t;
 
 struct gpu_vulkan_ctx_t {
@@ -192,6 +205,17 @@ struct gpu_vulkan_ctx_t {
     uint32_t const_dirty;
     uint8_t  const_stage[GPU_VULKAN_STAGE_COUNT][GPU_VULKAN_CONST_BYTES];
     uint32_t const_upload;
+
+    // Vertex/index buffers for the active scene. Render thread only,
+    // (re)sized in gpu_vulkan_upload_vertex_input() right before they're
+    // bound; *_cap tracks the allocated size so an equal-or-smaller next
+    // draw reuses the allocation instead of recreating it every frame.
+    VkBuffer       vertex_buffer[GPU_VULKAN_MAX_VERTEX_BINDINGS];
+    VkDeviceMemory vertex_memory[GPU_VULKAN_MAX_VERTEX_BINDINGS];
+    VkDeviceSize   vertex_buffer_cap[GPU_VULKAN_MAX_VERTEX_BINDINGS];
+    VkBuffer       index_buffer;
+    VkDeviceMemory index_memory;
+    VkDeviceSize   index_buffer_cap;
 
     // Scene handoff. The device thread publishes into `pending`, the
     // render worker takes it over into `active` at the top of a task.
@@ -423,6 +447,64 @@ static uint32_t gpu_vulkan_find_memory_type(VkPhysicalDevice phys, uint32_t type
     return UINT32_MAX;
 }
 
+// (Re)creates *buf/*mem if *cap is too small, then uploads `size` bytes
+// of `data` into it. Host-visible + coherent, mapped/unmapped per call:
+// vertex/index data changes shape every draw, unlike the persistently
+// mapped constant buffers above, so there is no steady-state mapping to
+// keep around.
+static bool gpu_vulkan_upload_host_buffer(gpu_vulkan_ctx_t* ctx, VkBuffer* buf, VkDeviceMemory* mem, VkDeviceSize* cap,
+                                          VkBufferUsageFlags usage, const void* data, VkDeviceSize size)
+{
+    if (size == 0) {
+        return true;
+    }
+    if (size > *cap) {
+        if (*buf) {
+            vkDestroyBuffer(ctx->device, *buf, NULL);
+        }
+        if (*mem) {
+            vkFreeMemory(ctx->device, *mem, NULL);
+        }
+        *buf = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        *cap = 0;
+
+        VkBufferCreateInfo buf_ci = {
+            .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size        = size,
+            .usage       = usage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        };
+        VK_TRY(vkCreateBuffer(ctx->device, &buf_ci, NULL, buf));
+
+        VkMemoryRequirements req = {0};
+        vkGetBufferMemoryRequirements(ctx->device, *buf, &req);
+        uint32_t mem_type
+            = gpu_vulkan_find_memory_type(ctx->physical_device, req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mem_type == UINT32_MAX) {
+            goto fail;
+        }
+        VkMemoryAllocateInfo alloc = {
+            .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize  = req.size,
+            .memoryTypeIndex = mem_type,
+        };
+        VK_TRY(vkAllocateMemory(ctx->device, &alloc, NULL, mem));
+        VK_TRY(vkBindBufferMemory(ctx->device, *buf, *mem, 0));
+        *cap = req.size;
+    }
+
+    void* mapped = NULL;
+    VK_TRY(vkMapMemory(ctx->device, *mem, 0, size, 0, &mapped));
+    memcpy(mapped, data, size);
+    vkUnmapMemory(ctx->device, *mem);
+    return true;
+
+fail:
+    return false;
+}
+
 // Uniform block layout shared by every pipeline: one binding per
 // programmable stage, at the set and size gpu-vulkan.h documents. A
 // cross-compiled guest shader declares exactly this, so its constant
@@ -533,15 +615,38 @@ fail:
 }
 
 // Builds a graphics pipeline around already-created shader modules.
-// Everything not covered by the arguments is fixed: no vertex input
-// (neither the built-in scene nor a cross-compiled kernel declares
-// vertex attributes), dynamic viewport/scissor, no depth or blending.
+// Vertex input matches the scene's binding strides and attribute table
+// (empty when the scene has none, e.g. a VS that generates its own
+// geometry from gl_VertexIndex). Everything else is fixed: dynamic
+// viewport/scissor, no depth or blending.
 static VkPipeline gpu_vulkan_build_pipeline(gpu_vulkan_ctx_t* ctx, const VkPipelineShaderStageCreateInfo* stages,
-                                            uint32_t stage_count, uint32_t topology)
+                                            uint32_t stage_count, uint32_t topology, const gpu_vulkan_scene_t* scene)
 {
     rvvm_info("%s", __FUNCTION__);
+
+    VkVertexInputBindingDescription binding_desc[GPU_VULKAN_MAX_VERTEX_BINDINGS] = {0};
+    for (uint32_t i = 0; i < scene->vertex_binding_count; i++) {
+        binding_desc[i] = (VkVertexInputBindingDescription) {
+            .binding   = i,
+            .stride    = scene->vertex_stride[i],
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+    }
+    VkVertexInputAttributeDescription attrib_desc[GPU_VULKAN_MAX_VERTEX_ATTRIBS] = {0};
+    for (uint32_t i = 0; i < scene->vertex_attrib_count; i++) {
+        attrib_desc[i] = (VkVertexInputAttributeDescription) {
+            .location = scene->vertex_attrib[i].location,
+            .binding  = scene->vertex_attrib[i].binding,
+            .format   = (VkFormat)scene->vertex_attrib[i].format,
+            .offset   = scene->vertex_attrib[i].offset,
+        };
+    }
     VkPipelineVertexInputStateCreateInfo vertex_input = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount   = scene->vertex_binding_count,
+        .pVertexBindingDescriptions      = binding_desc,
+        .vertexAttributeDescriptionCount = scene->vertex_attrib_count,
+        .pVertexAttributeDescriptions    = attrib_desc,
     };
     VkPipelineInputAssemblyStateCreateInfo input_assembly = {
         .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -615,9 +720,12 @@ fail:
     return VK_NULL_HANDLE;
 }
 
-// Identity of a scene as far as pipeline construction is concerned:
-// the shader modules and the topology. Constants deliberately do not
-// take part - they change every frame and never invalidate a pipeline.
+// Identity of a scene as far as pipeline construction is concerned: the
+// shader modules, the topology, and the vertex input layout (baked into
+// VkPipelineVertexInputStateCreateInfo, so a layout change needs a new
+// pipeline same as new SPIR-V does). Constants and the raw vertex/index
+// bytes deliberately do not take part - they change every frame and
+// never invalidate a pipeline.
 static uint64_t gpu_vulkan_scene_key(const gpu_vulkan_scene_t* scene)
 {
     uint64_t hash = 0xCBF29CE484222325ULL; // FNV-1a
@@ -626,6 +734,17 @@ static uint64_t gpu_vulkan_scene_key(const gpu_vulkan_scene_t* scene)
             hash = (hash ^ scene->spirv[s][i]) * 0x100000001B3ULL;
         }
         hash = (hash ^ scene->spirv_nwords[s]) * 0x100000001B3ULL;
+    }
+    for (uint32_t i = 0; i < scene->vertex_binding_count; i++) {
+        hash = (hash ^ scene->vertex_stride[i]) * 0x100000001B3ULL;
+    }
+    for (uint32_t i = 0; i < scene->vertex_attrib_count; i++) {
+        const gpu_vulkan_vertex_attrib_t* a = &scene->vertex_attrib[i];
+
+        hash = (hash ^ a->location) * 0x100000001B3ULL;
+        hash = (hash ^ a->binding) * 0x100000001B3ULL;
+        hash = (hash ^ a->format) * 0x100000001B3ULL;
+        hash = (hash ^ a->offset) * 0x100000001B3ULL;
     }
     return (hash ^ scene->topology) * 0x100000001B3ULL;
 }
@@ -681,7 +800,7 @@ static bool gpu_vulkan_ensure_guest_pipeline(gpu_vulkan_ctx_t* ctx)
     }
 
     rvvm_info("%s: Build pipeline (stages: %p, count: %u)", __FUNCTION__, stages, stage_count);
-    pipeline = gpu_vulkan_build_pipeline(ctx, stages, stage_count, scene->topology);
+    pipeline = gpu_vulkan_build_pipeline(ctx, stages, stage_count, scene->topology, scene);
     rvvm_info("Created guest Vulkan pipeline");
 
 fail:
@@ -711,6 +830,10 @@ static void gpu_vulkan_scene_free(gpu_vulkan_scene_t* scene)
     for (uint32_t s = 0; s < GPU_VULKAN_STAGE_COUNT; s++) {
         free(scene->spirv[s]);
     }
+    for (uint32_t i = 0; i < GPU_VULKAN_MAX_VERTEX_BINDINGS; i++) {
+        free(scene->vertex_data[i]);
+    }
+    free(scene->index_data);
     memset(scene, 0, sizeof(*scene));
 }
 
@@ -757,6 +880,27 @@ bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw
             memcpy(consts[s], desc->constants, nbytes);
         }
     }
+
+    const gpu_vulkan_vertex_input_t* vi = &draw->vertex;
+    scene.vertex_binding_count          = EVAL_MIN(vi->binding_count, GPU_VULKAN_MAX_VERTEX_BINDINGS);
+    for (uint32_t i = 0; i < scene.vertex_binding_count; i++) {
+        const gpu_vulkan_vertex_binding_t* b = &vi->binding[i];
+        scene.vertex_stride[i]               = b->stride;
+        if (b->data && b->size) {
+            scene.vertex_data[i] = safe_malloc(b->size);
+            memcpy(scene.vertex_data[i], b->data, b->size);
+            scene.vertex_size[i] = b->size;
+        }
+    }
+    scene.vertex_attrib_count = EVAL_MIN(vi->attrib_count, GPU_VULKAN_MAX_VERTEX_ATTRIBS);
+    memcpy(scene.vertex_attrib, vi->attrib, scene.vertex_attrib_count * sizeof(vi->attrib[0]));
+    if (vi->index_data && vi->index_size) {
+        scene.index_data = safe_malloc(vi->index_size);
+        memcpy(scene.index_data, vi->index_data, vi->index_size);
+        scene.index_size = vi->index_size;
+        scene.index_type = vi->index_type;
+    }
+    scene.vertex_offset = vi->vertex_offset;
 
     spin_lock(&ctx->draw_lock);
     // An unconsumed scene is replaced wholesale: the renderer only ever
@@ -840,6 +984,33 @@ static void gpu_vulkan_upload_constants(gpu_vulkan_ctx_t* ctx)
         }
     }
     ctx->const_upload = 0;
+}
+
+// Materializes the active scene's vertex/index bytes into real Vulkan
+// buffers. Render thread only, called once per task right before the
+// draw is recorded - same slot in the pipeline as upload_constants()
+// above, just for data vkCmdBindVertexBuffers()/vkCmdBindIndexBuffer()
+// need instead of a descriptor set.
+static bool gpu_vulkan_upload_vertex_input(gpu_vulkan_ctx_t* ctx)
+{
+    const gpu_vulkan_scene_t* scene = &ctx->active;
+    for (uint32_t i = 0; i < scene->vertex_binding_count; i++) {
+        if (!scene->vertex_data[i] || !scene->vertex_size[i]) {
+            continue;
+        }
+        if (!gpu_vulkan_upload_host_buffer(ctx, &ctx->vertex_buffer[i], &ctx->vertex_memory[i],
+                                           &ctx->vertex_buffer_cap[i], VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                           scene->vertex_data[i], scene->vertex_size[i])) {
+            return false;
+        }
+    }
+    if (scene->index_data && scene->index_size) {
+        if (!gpu_vulkan_upload_host_buffer(ctx, &ctx->index_buffer, &ctx->index_memory, &ctx->index_buffer_cap,
+                                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT, scene->index_data, scene->index_size)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool gpu_vulkan_create_command_and_sync(gpu_vulkan_ctx_t* ctx)
@@ -975,6 +1146,20 @@ void gpu_vulkan_destroy(gpu_vulkan_ctx_t* ctx)
         if (ctx->const_memory[s]) {
             vkFreeMemory(ctx->device, ctx->const_memory[s], NULL);
         }
+    }
+    for (uint32_t i = 0; i < GPU_VULKAN_MAX_VERTEX_BINDINGS; i++) {
+        if (ctx->vertex_buffer[i]) {
+            vkDestroyBuffer(ctx->device, ctx->vertex_buffer[i], NULL);
+        }
+        if (ctx->vertex_memory[i]) {
+            vkFreeMemory(ctx->device, ctx->vertex_memory[i], NULL);
+        }
+    }
+    if (ctx->index_buffer) {
+        vkDestroyBuffer(ctx->device, ctx->index_buffer, NULL);
+    }
+    if (ctx->index_memory) {
+        vkFreeMemory(ctx->device, ctx->index_memory, NULL);
     }
     if (ctx->const_pool) {
         // Frees the set allocated from it.
@@ -1273,6 +1458,10 @@ static void* gpu_vulkan_render_task(void* arg)
     // shaders read. Nothing else touches these buffers, and the previous
     // frame's fence has already been waited on.
     gpu_vulkan_upload_constants(ctx);
+    if (!gpu_vulkan_upload_vertex_input(ctx)) {
+        rvvm_warn("Failed to upload vertex/index buffers");
+        goto done;
+    }
 
     vkResetCommandBuffer(ctx->command_buffer, 0);
     VkCommandBufferBeginInfo begin_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1308,8 +1497,22 @@ static void* gpu_vulkan_render_task(void* arg)
     vkCmdBindPipeline(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->guest_pipeline);
     vkCmdBindDescriptorSets(ctx->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ctx->pipeline_layout,
                             GPU_VULKAN_CONST_SET, 1, &ctx->const_set, 0, NULL);
-    vkCmdDraw(ctx->command_buffer, ctx->active.vertex_count, ctx->active.instance_count, ctx->active.first_vertex,
-              ctx->active.first_instance);
+    if (!!ctx->active.vertex_binding_count) {
+        VkBuffer     buffers[GPU_VULKAN_MAX_VERTEX_BINDINGS];
+        VkDeviceSize offsets[GPU_VULKAN_MAX_VERTEX_BINDINGS] = {0};
+        for (uint32_t i = 0; i < ctx->active.vertex_binding_count; i++) {
+            buffers[i] = ctx->vertex_buffer[i];
+        }
+        vkCmdBindVertexBuffers(ctx->command_buffer, 0, ctx->active.vertex_binding_count, buffers, offsets);
+    }
+    if (ctx->active.index_data && ctx->index_buffer) {
+        vkCmdBindIndexBuffer(ctx->command_buffer, ctx->index_buffer, 0, (VkIndexType)ctx->active.index_type);
+        vkCmdDrawIndexed(ctx->command_buffer, ctx->active.vertex_count, ctx->active.instance_count,
+                         ctx->active.first_vertex, ctx->active.vertex_offset, ctx->active.first_instance);
+    } else {
+        vkCmdDraw(ctx->command_buffer, ctx->active.vertex_count, ctx->active.instance_count, ctx->active.first_vertex,
+                  ctx->active.first_instance);
+    }
     vkCmdEndRenderPass(ctx->command_buffer);
     // finalLayout already leaves the image in TRANSFER_SRC_OPTIMAL.
 

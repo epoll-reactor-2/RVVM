@@ -1,5 +1,5 @@
 all:
-	gcc -O0 -ggdb ../../src/devices/gpu-vulkan.c main.c ../../src/util/*.c -I../../src -I../../src/util -I../../include -I../../src/devices -lvulkan -lSDL2
+	gcc -O0 -ggdb ../../src/devices/gpu-vulkan.c main.c ../../src/util/*.c -I../../src -I../../src/util -I../../include -I../../src/devices -lvulkan -lSDL2 -lm
 
 # This environment variable needed to change renderer. My host
 # Vega 8 is buggy and segfaults during pipeline creation.

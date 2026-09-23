@@ -57,23 +57,14 @@ static void spirv_read_disk(const char* path, uint32_t** out, uint32_t* n)
 
 // #version 450
 //
-// vec2 positions[3] = vec2[](
-//     vec2( 0.0, -0.5),
-//     vec2( 0.5,  0.5),
-//     vec2(-0.5,  0.5)
-// );
-//
-// vec3 colors[3] = vec3[](
-//     vec3(1.0, 0.0, 0.0),
-//     vec3(0.0, 1.0, 0.0),
-//     vec3(0.0, 0.0, 1.0)
-// );
+// layout(location = 0) in vec3 inPosition; // binding 0 - see triangle_positions[] below.
+// layout(location = 1) in vec3 inColor;    // binding 1 - see triangle_colors[] below.
 //
 // layout(location = 0) out vec3 fragColor;
 //
 // void main() {
-//     gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-//     fragColor = colors[gl_VertexIndex];
+//     gl_Position = vec4(inPosition, 1.0);
+//     fragColor = inColor;
 // }
 static int spirv_compile_triangle_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
 {
@@ -83,49 +74,46 @@ static int spirv_compile_triangle_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
 
     uint32_t void_ty = spirv_type_void(&vs);
     uint32_t f32     = spirv_type_float32(&vs);
-    uint32_t i32     = spirv_type_int32(&vs);
     uint32_t v3      = spirv_type_vec3_float32(&vs);
     uint32_t v4      = spirv_type_vec4_float32(&vs);
-    uint32_t bool_ty = spirv_type_bool(&vs);
     uint32_t fn_ty   = spirv_type_func_void(&vs);
+
     uint32_t pos_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
     uint32_t pos_var = spirv_global_var(&vs, pos_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
     spirv_decorate_1(&vs, pos_var, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
     uint32_t col_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v3);
     uint32_t col_var = spirv_global_var(&vs, col_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
     spirv_decorate_1(&vs, col_var, SPIRV_DECORATION_LOCATION, 0);
-    uint32_t vid_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_INPUT, i32);
-    uint32_t vid_var = spirv_global_var(&vs, vid_ptr, SPIRV_STORAGE_CLASS_INPUT);
-    spirv_decorate_1(&vs, vid_var, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_VERTEX_INDEX);
+
+    // Vertex attribute inputs. Locations/format here must match
+    // draw.vertex.attrib[] in main() below.
+    uint32_t in_pos_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_INPUT, v3);
+    uint32_t in_pos_var = spirv_global_var(&vs, in_pos_ptr, SPIRV_STORAGE_CLASS_INPUT);
+    spirv_decorate_1(&vs, in_pos_var, SPIRV_DECORATION_LOCATION, 0);
+    spirv_name(&vs, in_pos_var, "inPosition");
+    uint32_t in_col_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_INPUT, v3);
+    uint32_t in_col_var = spirv_global_var(&vs, in_col_ptr, SPIRV_STORAGE_CLASS_INPUT);
+    spirv_decorate_1(&vs, in_col_var, SPIRV_DECORATION_LOCATION, 1);
+    spirv_name(&vs, in_col_var, "inColor");
+
     uint32_t main = spirv_func_begin(&vs, void_ty, fn_ty);
-    uint32_t vid  = spirv_op_load(&vs, i32, vid_var);
-    uint32_t c0   = spirv_type_const_int32(&vs, 0);
-    uint32_t c1   = spirv_type_const_int32(&vs, 1);
-    uint32_t eq0  = spirv_cmp(&vs, SPIRV_OP_I_EQUAL, bool_ty, vid, c0);
-    uint32_t eq1  = spirv_cmp(&vs, SPIRV_OP_I_EQUAL, bool_ty, vid, c1);
-    uint32_t px0  = spirv_type_const_float32(&vs, 0.0f);
-    uint32_t py0  = spirv_type_const_float32(&vs, -0.5f);
-    uint32_t px1  = spirv_type_const_float32(&vs, 0.5f);
-    uint32_t py1  = spirv_type_const_float32(&vs, 0.5f);
-    uint32_t px2  = spirv_type_const_float32(&vs, -0.5f);
-    uint32_t py2  = spirv_type_const_float32(&vs, 0.5f);
-    uint32_t z0   = spirv_type_const_float32(&vs, 0.0f);
-    uint32_t w1   = spirv_type_const_float32(&vs, 1.0f);
-    uint32_t sx   = spirv_select(&vs, f32, eq0, px0, spirv_select(&vs, f32, eq1, px1, px2));
-    uint32_t sy   = spirv_select(&vs, f32, eq0, py0, spirv_select(&vs, f32, eq1, py1, py2));
-    uint32_t pos  = spirv_composite_construct4(&vs, v4, sx, sy, z0, w1);
-    spirv_op_store(&vs, pos_var, pos);
-    uint32_t one  = w1;
-    uint32_t zero = z0;
-    uint32_t cr   = spirv_select(&vs, f32, eq0, one, spirv_select(&vs, f32, eq1, zero, zero)); /* 1,0,0 */
-    uint32_t cg   = spirv_select(&vs, f32, eq0, zero, spirv_select(&vs, f32, eq1, one, zero)); /* 0,1,0 */
-    uint32_t cb   = spirv_select(&vs, f32, eq0, zero, spirv_select(&vs, f32, eq1, zero, one)); /* 0,0,1 */
-    uint32_t col  = spirv_op_3(&vs, SPIRV_OP_COMPOSITE_CONSTRUCT, v3, cr, cg, cb);
-    spirv_op_store(&vs, col_var, col);
+    spirv_name(&vs, main, "main");
+
+    // gl_Position = vec4(inPosition, 1.0)
+    uint32_t p  = spirv_op_load(&vs, v3, in_pos_var);
+    uint32_t x  = spirv_composite_extract1(&vs, f32, p, 0);
+    uint32_t y  = spirv_composite_extract1(&vs, f32, p, 1);
+    uint32_t z  = spirv_composite_extract1(&vs, f32, p, 2);
+    uint32_t w1 = spirv_type_const_float32(&vs, 1.0f);
+    spirv_op_store(&vs, pos_var, spirv_composite_construct4(&vs, v4, x, y, z, w1));
+
+    // fragColor = inColor
+    spirv_op_store(&vs, col_var, spirv_op_load(&vs, v3, in_col_var));
+
     spirv_func_end(&vs);
 
-    uint32_t vs_iface[] = {pos_var, col_var, vid_var};
-    spirv_entry_point(&vs, SPIRV_EXECUTION_MODEL_VERTEX, main, "main", vs_iface, 3);
+    uint32_t vs_iface[] = {pos_var, col_var, in_pos_var, in_col_var};
+    spirv_entry_point(&vs, SPIRV_EXECUTION_MODEL_VERTEX, main, "main", vs_iface, 4);
 
     if (spirv_module_finish(&vs, out_vs, out_vs_n) != 0) {
         spirv_module_free(&vs);
@@ -278,6 +266,25 @@ static int spirv_compile_shader(uint32_t** out_vs, uint32_t* out_vs_n, uint32_t*
 #define W 800
 #define H 600
 
+// Two separate bindings, one per attribute - deliberately not
+// interleaved into one struct, so this exercises the same
+// multiple-VkVertexInputBindingDescription path a real multi-buffer
+// guest draw does (see gpu_vulkan_vertex_attrib_t.binding in
+// gpu-vulkan.h). An interleaved single buffer works too; just give
+// every attribute the same binding index and vary .offset instead.
+static const float triangle_positions[][3] = {
+    { 0.0f, -0.5f, 0.0f},
+    { 0.5f,  0.5f, 0.0f},
+    {-0.5f,  0.5f, 0.0f},
+    {-0.1f,  0.2f, 0.3f},
+};
+static const float triangle_colors[][3] = {
+    {1.0f, 0.0f, 0.0f},
+    {0.0f, 1.0f, 0.0f},
+    {0.0f, 0.0f, 1.0f},
+    {0.0f, 0.0f, 1.0f},
+};
+
 typedef struct {
     SDL_Window*   win;
     SDL_Texture*  texture;
@@ -313,6 +320,67 @@ static void sdl_destroy_window(sdl_window_t* win)
     SDL_DestroyRenderer(win->renderer);
     SDL_DestroyWindow(win->win);
     SDL_Quit();
+}
+
+#define STAR_POINTS 30
+
+static float star_positions[STAR_POINTS][3];
+static float star_colors[STAR_POINTS][3];
+
+void build_star(void)
+{
+    const float R = 0.55f, r = 0.22f;
+    const float cx = 0.f, cy = 0.f;
+    int         v = 0;
+    for (int i = 0; i < 5; i++) {
+        float a0 = -1.5708f + i * 1.2566f;
+        float a1 = a0 + 0.6283f;
+        float a2 = a0 + 1.2566f;
+
+        star_positions[v][0] = cx + R * cosf(a0);
+        star_positions[v][1] = cy + R * sinf(a0);
+        star_positions[v][2] = 0;
+        star_colors[v][0]    = 1;
+        star_colors[v][1]    = 0.8f;
+        star_colors[v][2]    = 0.2f;
+        v++;
+        star_positions[v][0] = cx + r * cosf(a1);
+        star_positions[v][1] = cy + r * sinf(a1);
+        star_positions[v][2] = 0;
+        star_colors[v][0]    = 1;
+        star_colors[v][1]    = 0.4f;
+        star_colors[v][2]    = 0.1f;
+        v++;
+        star_positions[v][0] = cx;
+        star_positions[v][1] = cy;
+        star_positions[v][2] = 0;
+        star_colors[v][0]    = 1;
+        star_colors[v][1]    = 1;
+        star_colors[v][2]    = 0.6f;
+        v++;
+
+        star_positions[v][0] = cx + r * cosf(a1);
+        star_positions[v][1] = cy + r * sinf(a1);
+        star_positions[v][2] = 0;
+        star_colors[v][0]    = 1;
+        star_colors[v][1]    = 0.4f;
+        star_colors[v][2]    = 0.1f;
+        v++;
+        star_positions[v][0] = cx + R * cosf(a2);
+        star_positions[v][1] = cy + R * sinf(a2);
+        star_positions[v][2] = 0;
+        star_colors[v][0]    = 1;
+        star_colors[v][1]    = 0.8f;
+        star_colors[v][2]    = 0.2f;
+        v++;
+        star_positions[v][0] = cx;
+        star_positions[v][1] = cy;
+        star_positions[v][2] = 0;
+        star_colors[v][0]    = 1;
+        star_colors[v][1]    = 1;
+        star_colors[v][2]    = 0.6f;
+        v++;
+    }
 }
 
 int main(void)
@@ -353,11 +421,85 @@ int main(void)
     draw.stage[GPU_VULKAN_STAGE_FRAGMENT].constants    = &fragment_consts;
     draw.stage[GPU_VULKAN_STAGE_FRAGMENT].const_bytes  = sizeof(fragment_consts);
 
+#define STERN
+#ifdef STERN
+    build_star();
+
+    draw.vertex.binding[0] = (gpu_vulkan_vertex_binding_t) {
+        .data   = star_positions,
+        .size   = sizeof(star_positions),
+        .stride = 3 * sizeof(float),
+    };
+    draw.vertex.binding[1] = (gpu_vulkan_vertex_binding_t) {
+        .data   = star_colors,
+        .size   = sizeof(star_colors),
+        .stride = 3 * sizeof(float),
+    };
+    draw.vertex.binding_count = 2;
+
+    draw.vertex.attrib[0] = (gpu_vulkan_vertex_attrib_t) {
+        .location = 0,
+        .binding  = 0,
+        .format   = GPU_VULKAN_FORMAT_R32G32B32_SFLOAT,
+        .offset   = 0,
+    };
+    draw.vertex.attrib[1] = (gpu_vulkan_vertex_attrib_t) {
+        .location = 1,
+        .binding  = 1,
+        .format   = GPU_VULKAN_FORMAT_R32G32B32_SFLOAT,
+        .offset   = 0,
+    };
+    draw.vertex.attrib_count = 2;
+    static uint16_t star_indices[STAR_POINTS * 3];
+    for (int i = 0; i < STAR_POINTS; i++) {
+        star_indices[i * 3 + 0] = 0;
+        star_indices[i * 3 + 1] = 1 + i * 2;
+        star_indices[i * 3 + 2] = 1 + (i * 2 + 1) % (STAR_POINTS * 2);
+    }
     draw.topology       = GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST;
-    draw.vertex_count   = 3;
+    draw.vertex_count   = STAR_POINTS * 2 + 1;
+    draw.instance_count = 1;
+    draw.first_vertex   = 0;
+
+    draw.vertex.index_type = 0;               // UINT16 or whatever the header defines
+    draw.vertex_count      = STAR_POINTS * 3; // number of indices
+#else
+    draw.topology       = GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST;
+    draw.vertex_count   = STATIC_ARRAY_SIZE(triangle_positions);
     draw.instance_count = 1;
     draw.first_vertex   = 0;
     draw.first_instance = 0;
+
+    // Vertex input: two bindings (positions, colors), one attribute
+    // each. Everything here is copied by gpu_vulkan_submit_draw() below,
+    // so these arrays don't need to outlive the call - they're static
+    // only because that's the simplest way to define constant data.
+    draw.vertex.binding[0] = (gpu_vulkan_vertex_binding_t) {
+        .data   = triangle_positions,
+        .size   = sizeof(triangle_positions),
+        .stride = sizeof(triangle_positions[0]),
+    };
+    draw.vertex.binding[1] = (gpu_vulkan_vertex_binding_t) {
+        .data   = triangle_colors,
+        .size   = sizeof(triangle_colors),
+        .stride = sizeof(triangle_colors[0]),
+    };
+    draw.vertex.binding_count = 2;
+
+    draw.vertex.attrib[0] = (gpu_vulkan_vertex_attrib_t) {
+        .location = 0,
+        .binding  = 0,
+        .format   = GPU_VULKAN_FORMAT_R32G32B32_SFLOAT,
+        .offset   = 0,
+    };
+    draw.vertex.attrib[1] = (gpu_vulkan_vertex_attrib_t) {
+        .location = 1,
+        .binding  = 1,
+        .format   = GPU_VULKAN_FORMAT_R32G32B32_SFLOAT,
+        .offset   = 0,
+    };
+    draw.vertex.attrib_count = 2;
+#endif /* STERN */
 
     bool draw_submitted = gpu_vulkan_submit_draw(ctx, &draw);
     if (!draw_submitted) {

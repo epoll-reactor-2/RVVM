@@ -1281,10 +1281,8 @@ typedef struct {
     uint32_t            buffer_count;
     uint32_t            topology; // 3DSTATE_VF_TOPOLOGY -> VkPrimitiveTopology
 
-    // Not decoded by any command handler yet: element descriptions come
-    // from 3DSTATE_VERTEX_ELEMENTS and the index buffer from
-    // 3DSTATE_INDEX_BUFFER, neither of which has a consumer while
-    // attribute fetch is unimplemented.
+    // Elements come from 3DSTATE_VERTEX_ELEMENTS, the index buffer from
+    // 3DSTATE_INDEX_BUFFER. Consumed by xe2_3dprimitive_vertex_input().
     xe2_vertex_element_t element[XE2_SHADER_MAX_BINDINGS];
     uint32_t             element_count;
     xe2_dma_addr_t       index_addr;
@@ -1585,7 +1583,15 @@ typedef struct {
     uint32_t color_out;    // Location 0 (PS).
     bool     wrote_output;
 
-    uint32_t entry_iface[8];
+    // Vertex attribute inputs (VS only). Modelled as a "push" layout:
+    // one Input vec4 per element, read through the GRF range right
+    // after the constant window - see xe2_spirv_declare_attribs().
+    uint32_t attr_var[XE2_SHADER_MAX_BINDINGS];
+    uint32_t attr_elem_ptr; // Pointer to one float inside an attr_var.
+    uint32_t attr_count;
+    uint32_t attr_grf_base;
+
+    uint32_t entry_iface[XE2_SHADER_MAX_BINDINGS + 1];
     size_t   entry_iface_n;
 
     bool saw_eot;
@@ -1647,6 +1653,15 @@ typedef struct {
 
     gpu_vulkan_ctx_t* vulkan_ctx;
     xe2_spirv_ctx_t   spirv_ctx;
+
+    // DMA staging for xe2_3dprimitive()'s vertex/index reads. Reused
+    // and grown (never shrunk) across draws instead of malloc/free per
+    // draw - same reasoning as spirv_ctx above being a single reused
+    // instance rather than one per shader.
+    uint8_t* vertex_scratch[XE2_SHADER_MAX_BINDINGS];
+    uint32_t vertex_scratch_cap[XE2_SHADER_MAX_BINDINGS];
+    uint8_t* index_scratch;
+    uint32_t index_scratch_cap;
 
     bool     draw_submitted;
     uint64_t last_draw_tick;
@@ -3292,6 +3307,12 @@ static forceinline uint32_t xe2_brw_parse_dst(const xe2_qword_t* qw)
 // into a load from the uniform block. Registers the kernel wrote first
 // are its own temporaries and stay Function-local, so scratch use of
 // high registers keeps working.
+//
+// Vertex attribute binding (VS only) reuses the same trick one GRF
+// window further out: xe2_spirv_declare_attribs() reserves the range
+// right after the constant window, and an unwritten read there loads
+// from a per-element Input variable instead of a Function-local. See
+// xe2_spirv_grf_is_attr().
 
 
 // Descriptor set/binding the pushed constants of a stage are bound at.
@@ -3309,9 +3330,11 @@ static forceinline void xe2_spirv_add_iface(xe2_spirv_ctx_t* ctx, uint32_t var)
     }
 }
 
-// Declares the stage's outputs. Inputs are not wired yet: the kernel
-// reads its varyings out of the URB payload registers, which we do not
-// model, so those reads resolve to undefined Function-locals.
+// Declares the stage's outputs. Non-attribute inputs are still not
+// wired: a PS's interpolated varyings and a HS/DS/GS's inter-stage URB
+// reads have no consumer, so those resolve to undefined Function-locals.
+// A VS's vertex attributes are the one input this does model - see
+// xe2_spirv_declare_attribs(), called separately for that stage.
 static forceinline void xe2_spirv_declare_io(xe2_spirv_ctx_t* ctx)
 {
     uint32_t out_v4 = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_OUTPUT, ctx->v4ty);
@@ -3326,6 +3349,30 @@ static forceinline void xe2_spirv_declare_io(xe2_spirv_ctx_t* ctx)
         spirv_decorate_1(&ctx->mod, ctx->position_out, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
         spirv_name(&ctx->mod, ctx->position_out, "out_position");
         xe2_spirv_add_iface(ctx, ctx->position_out);
+    }
+}
+
+// Declares one Input vec4 per vertex element, so a VS kernel's payload
+// reads (see xe2_spirv_grf_is_attr below) resolve to real per-vertex
+// data instead of an undefined Function-local. Modelled as a push
+// layout: attributes occupy the GRF range right after the reserved
+// constant window, one GRF-worth of vec4 per element - the same "4
+// consecutive scalar GRFs = 1 vec4" convention xe2_spirv_load_grf_vec4
+// already uses for outputs, just for inputs.
+static forceinline void xe2_spirv_declare_attribs(xe2_spirv_ctx_t* ctx, const xe2_vertex_input_t* vi)
+{
+    ctx->attr_grf_base = ctx->push_grf_base + XE2_CONST_MAX_DWORDS / XE2_GRF_DWORDS;
+    ctx->attr_count    = vi ? EVAL_MIN(vi->element_count, XE2_SHADER_MAX_BINDINGS) : 0;
+    if (!ctx->attr_count) {
+        return;
+    }
+    uint32_t in_v4     = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->v4ty);
+    ctx->attr_elem_ptr = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->fty);
+    for (uint32_t i = 0; i < ctx->attr_count; ++i) {
+        ctx->attr_var[i] = spirv_global_var(&ctx->mod, in_v4, SPIRV_STORAGE_CLASS_INPUT);
+        spirv_decorate_1(&ctx->mod, ctx->attr_var[i], SPIRV_DECORATION_LOCATION, vi->element[i].location);
+        spirv_name(&ctx->mod, ctx->attr_var[i], "in_attr");
+        xe2_spirv_add_iface(ctx, ctx->attr_var[i]);
     }
 }
 
@@ -3377,8 +3424,10 @@ static inline const char* xe2_shader_kind_to_string(xe2_shader_kind_t kind)
 
 // Starts a module for one kernel. Everything the translation needs is
 // live once this returns: base types, the constant block, the stage
-// outputs and an open entry function.
-static forceinline void xe2_spirv_begin(xe2_spirv_ctx_t* ctx, xe2_shader_kind_t stage)
+// outputs and an open entry function. `vi` is the current vertex
+// layout; only read for stage == XE2_SHADER_VS, ignored (may be NULL)
+// otherwise.
+static forceinline void xe2_spirv_begin(xe2_spirv_ctx_t* ctx, xe2_shader_kind_t stage, const xe2_vertex_input_t* vi)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->stage         = stage;
@@ -3397,6 +3446,9 @@ static forceinline void xe2_spirv_begin(xe2_spirv_ctx_t* ctx, xe2_shader_kind_t 
     spirv_name(&ctx->mod, ctx->const_var, "xe2_constants");
 
     xe2_spirv_declare_io(ctx);
+    if (stage == XE2_SHADER_VS) {
+        xe2_spirv_declare_attribs(ctx, vi);
+    }
 
     ctx->func = spirv_func_begin(&ctx->mod, ctx->void_ty, ctx->fn_ty);
 }
@@ -3448,11 +3500,45 @@ static forceinline uint32_t xe2_spirv_load_const(xe2_spirv_ctx_t* ctx, uint32_t 
     return spirv_op_load(&ctx->mod, ctx->fty, ptr);
 }
 
+// True when a read of this register names fetched vertex-attribute data
+// (VS only) rather than a value the kernel produced. Same "kernel
+// hasn't overwritten it yet" rule as xe2_spirv_grf_is_const; the two
+// ranges are disjoint by construction (attr_grf_base sits right past
+// the constant window), so a register is never both.
+static forceinline bool xe2_spirv_grf_is_attr(const xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t* attr_idx,
+                                              uint32_t* component)
+{
+    if (!ctx->attr_count || grf < ctx->attr_grf_base || ctx->grf_written[grf]) {
+        return false;
+    }
+    uint32_t rel = grf - ctx->attr_grf_base;
+    if (rel / 4 >= ctx->attr_count) {
+        return false;
+    }
+    *attr_idx  = rel / 4;
+    *component = rel % 4;
+    return true;
+}
+
+// Loads one component (x/y/z/w) of a vertex attribute Input variable.
+static forceinline uint32_t xe2_spirv_load_attr(xe2_spirv_ctx_t* ctx, uint32_t idx, uint32_t component)
+{
+    uint32_t comp = spirv_type_const_uint32(&ctx->mod, component);
+    uint32_t ptr  = spirv_access_chain(&ctx->mod, ctx->attr_elem_ptr, ctx->attr_var[idx], &comp, 1);
+    return spirv_op_load(&ctx->mod, ctx->fty, ptr);
+}
+
 static forceinline uint32_t xe2_spirv_load_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg, bool neg, bool abs)
 {
-    uint32_t id = xe2_spirv_grf_is_const(ctx, grf, subreg)
-                    ? xe2_spirv_load_const(ctx, grf, subreg)
-                    : spirv_op_load(&ctx->mod, ctx->fty, xe2_spirv_grf(ctx, grf));
+    uint32_t attr_idx = 0, attr_comp = 0;
+    uint32_t id;
+    if (xe2_spirv_grf_is_const(ctx, grf, subreg)) {
+        id = xe2_spirv_load_const(ctx, grf, subreg);
+    } else if (xe2_spirv_grf_is_attr(ctx, grf, &attr_idx, &attr_comp)) {
+        id = xe2_spirv_load_attr(ctx, attr_idx, attr_comp);
+    } else {
+        id = spirv_op_load(&ctx->mod, ctx->fty, xe2_spirv_grf(ctx, grf));
+    }
     if (abs) {
         id = spirv_ext_inst1(&ctx->mod, ctx->fty, SPIRV_GLSL_STD450_FABS, id);
     }
@@ -3583,6 +3669,8 @@ static forceinline void xe2_brw_emit_spirv(xe2_spirv_ctx_t* spirv_ctx, const xe2
 {
     switch (op) {
         case XE2_BRW_OP_MOV:
+        case XE2_BRW_OP_MOVI: // Immediate is already resolved by xe2_spirv_load_operand.
+        case XE2_BRW_OP_SMOV: // Structured move, approximated as a plain move.
         case XE2_BRW_OP_SEL:
         case XE2_BRW_OP_FRC:
         case XE2_BRW_OP_RNDU:
@@ -3594,6 +3682,14 @@ static forceinline void xe2_brw_emit_spirv(xe2_spirv_ctx_t* spirv_ctx, const xe2
                 // frac(x) = x - floor(x); approximate with x for now.
             }
             xe2_spirv_store_grf(spirv_ctx, dst->reg, v);
+            break;
+        }
+        case XE2_BRW_OP_NOT: {
+            uint32_t u32      = spirv_type_uint32(&spirv_ctx->mod);
+            uint32_t ia       = spirv_op_bitcast(&spirv_ctx->mod, u32, xe2_spirv_load_operand(spirv_ctx, s0));
+            uint32_t all_ones = spirv_type_const_uint32(&spirv_ctx->mod, 0xFFFFFFFFu);
+            uint32_t r        = spirv_op_bit_xor(&spirv_ctx->mod, u32, ia, all_ones);
+            xe2_spirv_store_grf(spirv_ctx, dst->reg, spirv_op_bitcast(&spirv_ctx->mod, spirv_ctx->fty, r));
             break;
         }
         case XE2_BRW_OP_ADD:
@@ -3942,14 +4038,16 @@ static void xe2_write_spirv(const uint32_t* words, uint32_t n)
 // for the stage. The module scaffolding (register file, pushed constant
 // block, stage outputs, entry point) is built by gpu-xe2-shader.h; this
 // walks the kernel and feeds its instructions through the translator.
-static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_t dma, uint32_t** spirv,
-                           uint32_t* spirv_nwords)
+// `vi` is the current vertex layout, used to declare attribute Inputs
+// for a VS (NULL/ignored for every other stage).
+static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_t dma, const xe2_vertex_input_t* vi,
+                           uint32_t** spirv, uint32_t* spirv_nwords)
 {
     if (dma.addr == 0U) {
         return;
     }
 
-    xe2_spirv_begin(&xe2->spirv_ctx, kind);
+    xe2_spirv_begin(&xe2->spirv_ctx, kind, vi);
 
     static const uint32_t limit = 4096;
     uint32_t              len   = 0U;
@@ -4252,7 +4350,10 @@ static void xe2_decode_shader(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_shader_
     // changed; recompiling the same kernel each time would be wasted
     // work. This takes the kernel address as the kernel's identity,
     // which holds as long as the driver allocates a new buffer for a new
-    // kernel rather than overwriting one in place.
+    // kernel rather than overwriting one in place. Known gap: this does
+    // not notice a VS kernel whose *vertex layout* changed (different
+    // 3DSTATE_VERTEX_ELEMENTS) while its address stayed the same - the
+    // cached SPIR-V would still declare the old attribute set.
     if (stage->spirv && stage->kernel_va == va) {
         stage->enabled = true;
         return;
@@ -4262,9 +4363,10 @@ static void xe2_decode_shader(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_shader_
     xe2_dma_addr_t kernel_dma = xe2_ppgtt_translate(xe2, pdp4, va);
     xe2_print_decompiled_shader(xe2, kernel_dma);
 
-    uint32_t* spirv        = NULL;
-    uint32_t  spirv_nwords = 0;
-    xe2_brw_decode(xe2, kind, kernel_dma, &spirv, &spirv_nwords);
+    uint32_t*                 spirv        = NULL;
+    uint32_t                  spirv_nwords = 0;
+    const xe2_vertex_input_t* vi           = (kind == XE2_SHADER_VS) ? &ctx->d3d.vertex_input : NULL;
+    xe2_brw_decode(xe2, kind, kernel_dma, vi, &spirv, &spirv_nwords);
     if (!spirv || !spirv_nwords) {
         return;
     }
@@ -4407,6 +4509,31 @@ static uint32_t xe2_topology_to_vulkan(uint32_t topology)
         case 0x04:
         default:
             return GPU_VULKAN_TOPOLOGY_TRIANGLE_LIST;
+    }
+}
+
+// VERTEX_ELEMENT_STATE.Source Element Format uses the same shared 9-bit
+// SURFACE_FORMAT enumeration as RENDER_SURFACE_STATE. Only the float
+// formats most vertex-attribute traffic actually uses are mapped here;
+// verify against Mesa's isl_format_layout.c (or the PRM) before trusting
+// this for anything beyond those. An unmapped format falls back to
+// R32G32B32A32_FLOAT and logs, rather than silently misreading the
+// buffer - wrong component count is a visibly wrong triangle, not a
+// crash.
+static uint32_t xe2_isl_vertex_format_to_vulkan(uint32_t isl_format)
+{
+    switch (isl_format) {
+        case 0x00: // R32G32B32A32_FLOAT
+            return GPU_VULKAN_FORMAT_R32G32B32A32_SFLOAT;
+        case 0x40: // R32G32B32_FLOAT
+            return GPU_VULKAN_FORMAT_R32G32B32_SFLOAT;
+        case 0x85: // R32G32_FLOAT
+            return GPU_VULKAN_FORMAT_R32G32_SFLOAT;
+        case 0xC7: // R8G8B8A8_UNORM
+            return GPU_VULKAN_FORMAT_R8G8B8A8_UNORM;
+        default:
+            rvvm_warn("%s: unmapped ISL format 0x%x, defaulting to R32G32B32A32_FLOAT", __FUNCTION__, isl_format);
+            return GPU_VULKAN_FORMAT_R32G32B32A32_SFLOAT;
     }
 }
 
@@ -4711,19 +4838,13 @@ static inline void xe2_3dprimitive_print_readiness(const xe2_3dstate_t* d3d)
 //   been root-caused. xe2_3dprimitive_print_readiness() below reports
 //   whether PS is actually usable on any given draw rather than
 //   assuming so.
-// - Vertex attribute data is decoded (xe2_vertex_input_t.element[]) but
-//   not yet threaded through to the Vulkan backend: gpu_vulkan_draw_t
-//   still only carries per-stage SPIR-V + push constants, so a VS with
-//   real attribute inputs runs with no per-vertex data behind them.
-//   Wiring this needs gpu_vulkan_draw_t to grow a vertex-binding
-//   description (binding/stride/format/offset per element, matching
-//   VkPipelineVertexInputStateCreateInfo) plus the raw vertex buffer
-//   bytes/address, and an index buffer field for indexed draws. Same
-//   story for the depth buffer, viewport, scissor and raster/blend
-//   state decoded above: they're tracked correctly here now, but
-//   xe2_3dprimitive() below does not yet pass them to
-//   gpu_vulkan_submit_draw() because that requires extending
-//   gpu-vulkan.h, which is out of reach from this file alone.
+// - Vertex buffers/elements/index buffer are now read and handed to the
+//   Vulkan backend (xe2_3dprimitive_vertex_input()); the VS SPIR-V reads
+//   them through xe2_spirv_ctx_t's attribute GRF window (see
+//   xe2_spirv_begin()). Depth buffer, viewport, scissor and raster/blend
+//   state are still tracked here but not yet passed to
+//   gpu_vulkan_submit_draw() - same "needs gpu-vulkan.h to grow a field"
+//   story, just not done yet for those.
 
 // Smokin' weed with you 'cause you've taught me to
 static inline void xe2_3dprimitive_print(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, const uint32_t* cmd)
@@ -4745,30 +4866,99 @@ static inline void xe2_3dprimitive_print(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, 
     rvvm_info("================================================");
 }
 
+// Grows *buf to at least `need` bytes and zeroes it, so a short DMA read
+// (guest buffer runs past mapped memory) leaves zeros instead of another
+// draw's leftover bytes. *buf is one of xe2->vertex_scratch[i]/index_scratch,
+// reused across draws instead of malloc/free per draw.
+static uint8_t* xe2_scratch_grow(uint8_t** buf, uint32_t* cap, uint32_t need)
+{
+    if (need > *cap) {
+        uint8_t* grown = realloc(*buf, need);
+        if (!grown) {
+            rvvm_warn("%s: OOM growing scratch to %u bytes", __FUNCTION__, need);
+            return *buf;
+        }
+        *buf = grown;
+        *cap = need;
+    }
+    memset(*buf, 0, need);
+    return *buf;
+}
+
+// Reads this draw's vertex/index bytes out of guest memory into `xe2`'s
+// reused scratch buffers and fills in the Vulkan-facing description.
+// gpu_vulkan_submit_draw() copies everything out of `out` synchronously,
+// so the scratch buffers are free to be overwritten by the next draw.
+static void xe2_3dprimitive_vertex_input(xe2_dev_t* xe2, const xe2_vertex_input_t* vi, bool indexed,
+                                         uint32_t index_count, gpu_vulkan_vertex_input_t* out)
+{
+    out->binding_count = EVAL_MIN(vi->buffer_count, GPU_VULKAN_MAX_VERTEX_BINDINGS);
+    for (uint32_t i = 0; i < out->binding_count; ++i) {
+        const xe2_vertex_buffer_t* vb = &vi->buffer[i];
+        if (!vb->size) {
+            continue;
+        }
+        uint8_t* bytes = xe2_scratch_grow(&xe2->vertex_scratch[i], &xe2->vertex_scratch_cap[i], vb->size);
+        xe2_dma_read_bytes(xe2, vb->addr, bytes, vb->size);
+        out->binding[i] = (gpu_vulkan_vertex_binding_t) {.data = bytes, .size = vb->size, .stride = vb->stride};
+    }
+
+    out->attrib_count = EVAL_MIN(vi->element_count, GPU_VULKAN_MAX_VERTEX_ATTRIBS);
+    for (uint32_t i = 0; i < out->attrib_count; ++i) {
+        const xe2_vertex_element_t* el = &vi->element[i];
+
+        out->attrib[i] = (gpu_vulkan_vertex_attrib_t) {
+            .location = el->location,
+            .binding  = el->binding,
+            .format   = xe2_isl_vertex_format_to_vulkan(el->format),
+            .offset   = el->offset,
+        };
+    }
+
+    if (!indexed || !vi->index_valid || !index_count) {
+        return;
+    }
+    // index_format: 0=BYTE, 1=WORD, 2=DWORD. Core Vulkan has no 8-bit
+    // index type, so BYTE indices are widened to 16-bit in place rather
+    // than pulling in VK_EXT_index_type_uint8: DMA the raw bytes into
+    // the front half of a 2x buffer, then expand back-to-front (each
+    // write only ever clobbers a byte already consumed by an earlier,
+    // higher-index step).
+    if (vi->index_format == 0) {
+        uint8_t* raw = xe2_scratch_grow(&xe2->index_scratch, &xe2->index_scratch_cap, index_count * 2);
+        xe2_dma_read_bytes(xe2, vi->index_addr, raw, index_count);
+        uint16_t* widened = (uint16_t*)raw;
+        for (uint32_t i = index_count; i-- > 0;) {
+            widened[i] = raw[i];
+        }
+        out->index_data = raw;
+        out->index_size = index_count * 2;
+        out->index_type = 0; // VK_INDEX_TYPE_UINT16
+    } else {
+        uint32_t elem_size = (vi->index_format == 2) ? 4 : 2;
+        uint32_t nbytes    = index_count * elem_size;
+        uint8_t* raw       = xe2_scratch_grow(&xe2->index_scratch, &xe2->index_scratch_cap, nbytes);
+        xe2_dma_read_bytes(xe2, vi->index_addr, raw, nbytes);
+        out->index_data = raw;
+        out->index_size = nbytes;
+        out->index_type = (vi->index_format == 2) ? 1 : 0; // VK_INDEX_TYPE_UINT32 : UINT16
+    }
+}
+
 // Turn the accumulated 3D state into a draw for the Vulkan backend.
-//
-// Vertex attributes are not wired yet: a cross-compiled kernel reads its
-// varyings out of the URB payload registers, which the register model
-// does not reproduce, so vertex buffers and vertex element descriptions
-// have no consumer. Constants do have one - that is the path this
-// submits, and what a kernel computes from them is what ends up on
-// screen.
 static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd)
 {
     xe2_3dprimitive_print(xe2, ctx, cmd);
 
     bool     indexed        = (cmd[1] >> 8) & 1; // VertexAccessType
-    uint32_t vertex_count   = cmd[2];
-    uint32_t start_vertex   = cmd[3];
+    uint32_t vertex_count   = cmd[2];            // Index count, for an indexed draw.
+    uint32_t start_vertex   = cmd[3];            // Start index, for an indexed draw.
     uint32_t instance_count = cmd[4];
     uint32_t start_instance = cmd[5];
     int32_t  base_vertex    = (int32_t)cmd[6];
 
     rvvm_info("%s: vertex_count: %u, start_vertex: %u, instances: %u, start_instance: %u, base_vertex: %u",
               __FUNCTION__, vertex_count, start_vertex, instance_count, start_instance, base_vertex);
-    if (indexed) {
-        rvvm_info("%s: indexed draws are not translated yet", __FUNCTION__);
-    }
 
     xe2_3dstate_t* d3d = &ctx->d3d;
 
@@ -4781,9 +4971,13 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
     };
 
     // A batch that re-emits the same state and repeats the same draw
-    // gets the same picture; handing it over again would only re-copy
-    // every shader module for nothing.
-    if (!xe2_3dstate_dirty(d3d, &params)) {
+    // gets the same picture and skipping it is free - except when vertex
+    // buffers are bound: their bytes can change under an identical
+    // 3DPRIMITIVE (e.g. CPU-animated geometry), and there is no cheap
+    // way to tell without re-reading them, so those draws always go
+    // through.
+    bool has_vertex_buffers = d3d->vertex_input.buffer_count > 0;
+    if (!has_vertex_buffers && !xe2_3dstate_dirty(d3d, &params)) {
         rvvm_warn("%s: !xe2_3dstate_dirty()", __FUNCTION__);
         return;
     }
@@ -4795,6 +4989,10 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
         .first_vertex   = params.first_vertex,
         .first_instance = params.first_instance,
     };
+    xe2_3dprimitive_vertex_input(xe2, &d3d->vertex_input, indexed, vertex_count, &draw.vertex);
+    if (indexed && draw.vertex.index_data) {
+        draw.vertex.vertex_offset = base_vertex;
+    }
 
     for (size_t i = 0; i < STATIC_ARRAY_SIZE(xe2_draw_stages); ++i) {
         xe2_shader_kind_t         kind   = xe2_draw_stages[i].xe2;
@@ -4959,7 +5157,12 @@ static inline void xe2_3dstate_vertex_buffers_cmd(xe2_dev_t* xe2, xe2_submit_ctx
                                                   rvvm_addr_t pdp4, uint32_t op)
 {
     xe2_vertex_input_t* vertex = &ctx->d3d.vertex_input;
-    size_t              total  = EVAL_MIN(((op & 0xFF) - 3) / 4, XE2_SHADER_MAX_BINDINGS);
+    // DWordLength -> payload dwords is +1 (TotalDwords = DWordLength+2,
+    // minus the 1 header dword), same as xe2_3dstate_vertex_elements_cmd
+    // just below and the generic MI length fallback above. This used to
+    // read "- 3", silently dropping the last VERTEX_BUFFER_STATE entry
+    // any time a command declared more than one buffer.
+    size_t total = EVAL_MIN(((op & 0xFF) + 1) / 4, XE2_SHADER_MAX_BINDINGS);
 
     rvvm_info("3DSTATE_VERTEX_BUFFERS cmd received (size: %zu)", total);
 

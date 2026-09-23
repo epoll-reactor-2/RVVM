@@ -110,8 +110,61 @@ typedef struct {
     uint32_t    const_bytes;
 } gpu_vulkan_stage_desc_t;
 
+// -----------------------------------------------------------
+// Vertex input
+// -----------------------------------------------------------
+//
+// Optional: a draw with vertex.binding_count == 0 has no bound vertex
+// buffers, matching the previous behaviour (a VS that generates its own
+// geometry from gl_VertexIndex). When present, everything here is
+// copied by gpu_vulkan_submit_draw(), same as .spirv above.
+#define GPU_VULKAN_MAX_VERTEX_BINDINGS 16
+#define GPU_VULKAN_MAX_VERTEX_ATTRIBS  16
+
 typedef struct {
-    gpu_vulkan_stage_desc_t stage[GPU_VULKAN_STAGE_COUNT];
+    const void* data; // Raw bytes for this binding.
+    uint32_t    size;
+    uint32_t    stride;
+} gpu_vulkan_vertex_binding_t;
+
+// A few VkFormat values callers commonly need for vertex attributes,
+// named so gpu_vulkan_vertex_attrib_t.format below can be filled in
+// without pulling vulkan.h into every caller. Values match VkFormat
+// exactly (Khronos guarantees these never change) - any other VkFormat
+// works too, this is just the backend's own name for the common ones.
+#define GPU_VULKAN_FORMAT_R32_SFLOAT          100
+#define GPU_VULKAN_FORMAT_R32G32_SFLOAT       103
+#define GPU_VULKAN_FORMAT_R32G32B32_SFLOAT    106
+#define GPU_VULKAN_FORMAT_R32G32B32A32_SFLOAT 109
+#define GPU_VULKAN_FORMAT_R8G8B8A8_UNORM      37
+#define GPU_VULKAN_FORMAT_R8G8B8A8_UINT       41
+#define GPU_VULKAN_FORMAT_R8G8B8A8_SINT       42
+
+typedef struct {
+    uint32_t location; // Shader input location (matches the SPIR-V Location decoration).
+    uint32_t binding;  // Index into vertex.binding[].
+    uint32_t format;   // VkFormat value, e.g. one of GPU_VULKAN_FORMAT_* above.
+    uint32_t offset;   // Byte offset within one binding's stride.
+} gpu_vulkan_vertex_attrib_t;
+
+typedef struct {
+    gpu_vulkan_vertex_binding_t binding[GPU_VULKAN_MAX_VERTEX_BINDINGS];
+    uint32_t                    binding_count;
+    gpu_vulkan_vertex_attrib_t  attrib[GPU_VULKAN_MAX_VERTEX_ATTRIBS];
+    uint32_t                    attrib_count;
+
+    // Indexed draw, e.g. vkCmdDrawIndexed(). index_data == NULL means a
+    // plain vkCmdDraw(); when set, .vertex_count/.first_vertex above are
+    // read as index count/first index instead of vertex count/first vertex.
+    const void* index_data;
+    uint32_t    index_size;
+    uint32_t    index_type;    // VkIndexType value.
+    int32_t     vertex_offset; // Added to each fetched index.
+} gpu_vulkan_vertex_input_t;
+
+typedef struct {
+    gpu_vulkan_stage_desc_t   stage[GPU_VULKAN_STAGE_COUNT];
+    gpu_vulkan_vertex_input_t vertex;
 
     uint32_t topology; // gpu_vulkan_topology_t
     uint32_t vertex_count;
@@ -130,6 +183,10 @@ typedef struct {
 // Returns false when the draw carries no vertex shader - a graphics
 // pipeline cannot be built without one - in which case the backend keeps
 // rendering whatever it had.
+//
+// draw->vertex is optional; when set it is copied like the SPIR-V above,
+// bound as vertex/index buffers, and folded into the pipeline's vertex
+// input state (a layout change rebuilds the pipeline, same as new SPIR-V).
 bool gpu_vulkan_submit_draw(gpu_vulkan_ctx_t* ctx, const gpu_vulkan_draw_t* draw);
 
 // Overwrite sized memory region treated as uniform buffer. Shader's uniform buffer's
