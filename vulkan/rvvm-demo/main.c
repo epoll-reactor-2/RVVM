@@ -411,22 +411,15 @@ int main(void)
         uint32_t   out_height = 0;
         uint32_t   out_stride = 0;
         rvvm_rgb_t out_format = 0;
-        bool       have_frame = false;
 
         if (draw_submitted) {
-            have_frame = gpu_vulkan_render_frame(ctx, W, H, vram, bufsz, stride, RVVM_RGB_XRGB8888, &out_width,
-                                                 &out_height, &out_stride, &out_format);
-        }
-
-        if (have_frame && out_width && out_height && out_stride) {
             void* pixels;
             int   pitch;
             if (SDL_LockTexture(win.texture, NULL, &pixels, &pitch) == 0) {
-                const uint32_t copy_w    = out_width < W ? out_width : W;
-                const uint32_t copy_h    = out_height < H ? out_height : H;
-                const size_t   row_bytes = (size_t)copy_w * 4;
-                for (uint32_t y = 0; y < copy_h; y++) {
-                    memcpy((uint8_t*)pixels + (size_t)y * (size_t)pitch, vram + (size_t)y * out_stride, row_bytes);
+                if (gpu_vulkan_render_frame(ctx, W, H, pixels, bufsz, pitch, RVVM_RGB_XRGB8888, &out_width, &out_height,
+                                            &out_stride, &out_format)
+                    == 0) {
+                    rvvm_warn("Failed to draw frame");
                 }
                 SDL_UnlockTexture(win.texture);
             }
