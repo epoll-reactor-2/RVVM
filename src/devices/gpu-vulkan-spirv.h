@@ -716,6 +716,33 @@ static forceinline void spirv_func_end(spirv_module_t* module)
     spirv_push(module->func_body, SPIRV_OP_FUNCTION_END | (1 << 16));
 }
 
+// High-level auxiliary functions.
+
+// layout(location = %0) in/out %1 %2
+static forceinline uint32_t spirv_declare_location(spirv_module_t* module, uint32_t storage, uint32_t location,
+                                                   uint32_t ty, const char* name)
+{
+    uint32_t ptr = spirv_type_ptr(module, storage, ty);
+    uint32_t var = spirv_global_var(module, ptr, storage);
+    spirv_decorate_1(module, var, SPIRV_DECORATION_LOCATION, location);
+    spirv_name(module, var, name);
+    return var;
+}
+
+// layout(location = %0) in %1 %2
+static forceinline uint32_t spirv_declare_location_in(spirv_module_t* module, uint32_t location, uint32_t ty,
+                                                      const char* name)
+{
+    return spirv_declare_location(module, SPIRV_STORAGE_CLASS_INPUT, location, ty, name);
+}
+
+// layout(location = %0) out %1 %2
+static forceinline uint32_t spirv_declare_location_out(spirv_module_t* module, uint32_t location, uint32_t ty,
+                                                       const char* name)
+{
+    return spirv_declare_location(module, SPIRV_STORAGE_CLASS_OUTPUT, location, ty, name);
+}
+
 static forceinline void spirv_merge(spirv_words_t* dst, const spirv_words_t* src)
 {
     vector_foreach (*src, i) {

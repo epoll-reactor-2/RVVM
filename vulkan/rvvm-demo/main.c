@@ -87,14 +87,8 @@ static int spirv_compile_triangle_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
 
     // Vertex attribute inputs. Locations/format here must match
     // draw.vertex.attrib[] in main() below.
-    uint32_t in_pos_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_INPUT, v3);
-    uint32_t in_pos_var = spirv_global_var(&vs, in_pos_ptr, SPIRV_STORAGE_CLASS_INPUT);
-    spirv_decorate_1(&vs, in_pos_var, SPIRV_DECORATION_LOCATION, 0);
-    spirv_name(&vs, in_pos_var, "inPosition");
-    uint32_t in_col_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_INPUT, v3);
-    uint32_t in_col_var = spirv_global_var(&vs, in_col_ptr, SPIRV_STORAGE_CLASS_INPUT);
-    spirv_decorate_1(&vs, in_col_var, SPIRV_DECORATION_LOCATION, 1);
-    spirv_name(&vs, in_col_var, "inColor");
+    uint32_t in_pos_var = spirv_declare_location_in(&vs, 0, v3, "inPosition");
+    uint32_t in_col_var = spirv_declare_location_in(&vs, 1, v3, "inColor");
 
     uint32_t main = spirv_func_begin(&vs, void_ty, fn_ty);
     spirv_name(&vs, main, "main");
@@ -180,15 +174,10 @@ static int spirv_compile_triangle_fragment(uint32_t** out_fs, uint32_t* out_fs_n
     uint32_t fn_ty   = spirv_type_func_void(&fs);
     uint32_t f32     = spirv_type_float32(&fs);
     uint32_t v4      = spirv_type_vec4_float32(&fs);
-    uint32_t out_ptr = spirv_type_ptr(&fs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
-    uint32_t out_col = spirv_global_var(&fs, out_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
-    spirv_decorate_1(&fs, out_col, SPIRV_DECORATION_LOCATION, 0);
-    spirv_name(&fs, out_col, "outColor");
-    uint32_t v3     = spirv_type_vec3_float32(&fs);
-    uint32_t in_ptr = spirv_type_ptr(&fs, SPIRV_STORAGE_CLASS_INPUT, v3);
-    uint32_t in_col = spirv_global_var(&fs, in_ptr, SPIRV_STORAGE_CLASS_INPUT);
-    spirv_decorate_1(&fs, in_col, SPIRV_DECORATION_LOCATION, 0);
-    spirv_name(&fs, in_col, "fragColor");
+    uint32_t v3      = spirv_type_vec3_float32(&fs);
+
+    uint32_t out_col = spirv_declare_location_out(&fs, 0, v4, "outColor");
+    uint32_t in_col  = spirv_declare_location_in(&fs, 0, v3, "fragColor");
 
     // The stage's constant block: "vec4 c[GPU_VULKAN_CONST_BYTES / 16]" at
     // the set/binding the backend binds it to. Not part of the entry point
