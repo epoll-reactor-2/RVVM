@@ -1291,6 +1291,186 @@ typedef struct {
 } xe2_vertex_input_t;
 
 // -----------------------------------------------------------
+// Generic placeholder shaders (position + color passthrough)
+// -----------------------------------------------------------
+
+typedef struct {
+    float hue; // Hue rotation angle, radians; 0 = pass color through unchanged.
+} xe2_generic_frag_consts_t;
+
+BUILD_ASSERT(sizeof(xe2_generic_frag_consts_t) <= GPU_VULKAN_CONST_BYTES);
+
+// Dot product of a constant 3-vector row with (r, g, b): 3 fmul + 2 fadd.
+static uint32_t xe2_spirv_row3(spirv_module_t* m, uint32_t f32, uint32_t k0, uint32_t k1, uint32_t k2, uint32_t r,
+                               uint32_t g, uint32_t b)
+{
+    uint32_t t0 = spirv_op_fmul(m, f32, k0, r);
+    uint32_t t1 = spirv_op_fmul(m, f32, k1, g);
+    uint32_t t2 = spirv_op_fmul(m, f32, k2, b);
+    return spirv_op_fadd(m, f32, spirv_op_fadd(m, f32, t0, t1), t2);
+}
+
+// #version 450
+//
+// layout(location = 0) in vec3 inPosition; // binding 0
+// layout(location = 1) in vec3 inColor;    // binding 1
+//
+// layout(location = 0) out vec3 fragColor;
+//
+// void main() {
+//     gl_Position = vec4(inPosition, 1.0);
+//     fragColor = inColor;
+// }
+static int xe2_spirv_compile_generic_vertex(uint32_t** out_vs, uint32_t* out_vs_n)
+{
+    spirv_module_t vs = {0};
+    spirv_module_init(&vs);
+    spirv_module_begin(&vs);
+
+    uint32_t void_ty = spirv_type_void(&vs);
+    uint32_t f32     = spirv_type_float32(&vs);
+    uint32_t v3      = spirv_type_vec3_float32(&vs);
+    uint32_t v4      = spirv_type_vec4_float32(&vs);
+    uint32_t fn_ty   = spirv_type_func_void(&vs);
+
+    uint32_t pos_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
+    uint32_t pos_var = spirv_global_var(&vs, pos_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
+    spirv_decorate_1(&vs, pos_var, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
+    uint32_t col_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v3);
+    uint32_t col_var = spirv_global_var(&vs, col_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
+    spirv_decorate_1(&vs, col_var, SPIRV_DECORATION_LOCATION, 0);
+
+    // Vertex attribute inputs. Locations/format here must match
+    // out->attrib[] built by xe2_3dprimitive_bind_vertex_buffers() below:
+    // bound buffer 0 -> location 0 (position), bound buffer 1 -> location
+    // 1 (color).
+    uint32_t in_pos_var = spirv_declare_location_in(&vs, 0, v3, "inPosition");
+    uint32_t in_col_var = spirv_declare_location_in(&vs, 1, v3, "inColor");
+
+    uint32_t main = spirv_func_begin(&vs, void_ty, fn_ty);
+    spirv_name(&vs, main, "main");
+
+    // gl_Position = vec4(inPosition, 1.0)
+    uint32_t p  = spirv_op_load(&vs, v3, in_pos_var);
+    uint32_t x  = spirv_composite_extract1(&vs, f32, p, 0);
+    uint32_t y  = spirv_composite_extract1(&vs, f32, p, 1);
+    uint32_t z  = spirv_composite_extract1(&vs, f32, p, 2);
+    uint32_t w1 = spirv_type_const_float32(&vs, 1.0f);
+    spirv_op_store(&vs, pos_var, spirv_composite_construct4(&vs, v4, x, y, z, w1));
+
+    // fragColor = inColor
+    spirv_op_store(&vs, col_var, spirv_op_load(&vs, v3, in_col_var));
+
+    spirv_func_end(&vs);
+
+    uint32_t vs_iface[] = {pos_var, col_var, in_pos_var, in_col_var};
+    spirv_entry_point(&vs, SPIRV_EXECUTION_MODEL_VERTEX, main, "main", vs_iface, 4);
+
+    if (spirv_module_finish(&vs, out_vs, out_vs_n) != 0) {
+        spirv_module_free(&vs);
+        return -1;
+    }
+
+    spirv_module_free(&vs);
+    return 0;
+}
+
+// #version 450
+//
+// layout(location = 0)  in vec3 fragColor;
+// layout(location = 0) out vec4 outColor;
+//
+// // Descriptor set GPU_VULKAN_CONST_SET, binding
+// // GPU_VULKAN_CONST_BINDING(GPU_VULKAN_STAGE_FRAGMENT).
+// layout(set = 0, binding = 4, std140) uniform FragConsts {
+//     vec4 c[GPU_VULKAN_CONST_BYTES / 16];
+// };
+//
+// void main() {
+//     float a = c[0].x;         // xe2_generic_frag_consts_t.hue
+//     float k = cos(a);
+//     float s = sin(a);
+//     float d = (1.0 + 2.0 * k) / 3.0;
+//     float e = (1.0 - k) / 3.0;
+//     float f = s * 0.57735027; // s / sqrt(3)
+//     vec3  p = fragColor;
+//
+//     // Rotation of the color around the gray axis (1, 1, 1). With hue ==
+//     // 0 this reduces to the identity (d=1, e=f=0) and outColor == p.
+//     outColor = vec4(d       * p.r + (e - f) * p.g + (e + f) * p.b,
+//                     (e + f) * p.r + d       * p.g + (e - f) * p.b,
+//                     (e - f) * p.r + (e + f) * p.g + d       * p.b,
+//                     1.0);
+// }
+static int xe2_spirv_compile_generic_fragment(uint32_t** out_fs, uint32_t* out_fs_n)
+{
+    spirv_module_t fs = {0};
+    spirv_module_init(&fs);
+    spirv_module_begin(&fs);
+
+    uint32_t void_ty = spirv_type_void(&fs);
+    uint32_t fn_ty   = spirv_type_func_void(&fs);
+    uint32_t f32     = spirv_type_float32(&fs);
+    uint32_t v4      = spirv_type_vec4_float32(&fs);
+    uint32_t v3      = spirv_type_vec3_float32(&fs);
+
+    uint32_t out_col = spirv_declare_location_out(&fs, 0, v4, "outColor");
+    uint32_t in_col  = spirv_declare_location_in(&fs, 0, v3, "fragColor");
+
+    // The stage's constant block: not part of the entry point interface
+    // (SPIR-V 1.3 lists only Input/Output variables).
+    uint32_t c_elem_ptr = 0;
+    uint32_t c_var      = spirv_uniform_vec4_array_block(&fs, GPU_VULKAN_CONST_BYTES / 16, GPU_VULKAN_CONST_SET,
+                                                         GPU_VULKAN_CONST_BINDING(GPU_VULKAN_STAGE_FRAGMENT), &c_elem_ptr);
+    spirv_name(&fs, c_var, "consts");
+
+    uint32_t main = spirv_func_begin(&fs, void_ty, fn_ty);
+    spirv_name(&fs, main, "main");
+
+    // a = c[0].x  (block member 0, array element 0, vector component 0)
+    uint32_t zero   = spirv_type_const_uint32(&fs, 0);
+    uint32_t idx[3] = {zero, zero, zero};
+    uint32_t a_ptr  = spirv_access_chain(&fs, c_elem_ptr, c_var, idx, 3);
+    uint32_t a      = spirv_op_load(&fs, f32, a_ptr);
+
+    uint32_t one     = spirv_type_const_float32(&fs, 1.0f);
+    uint32_t two     = spirv_type_const_float32(&fs, 2.0f);
+    uint32_t third   = spirv_type_const_float32(&fs, 1.0f / 3.0f);
+    uint32_t inv_sq3 = spirv_type_const_float32(&fs, 0.57735027f);
+
+    uint32_t k   = spirv_ext_inst1(&fs, f32, SPIRV_GLSL_STD450_COS, a);
+    uint32_t s   = spirv_ext_inst1(&fs, f32, SPIRV_GLSL_STD450_SIN, a);
+    uint32_t d   = spirv_op_fmul(&fs, f32, spirv_op_fadd(&fs, f32, one, spirv_op_fmul(&fs, f32, two, k)), third);
+    uint32_t e   = spirv_op_fmul(&fs, f32, spirv_op_fsub(&fs, f32, one, k), third);
+    uint32_t f   = spirv_op_fmul(&fs, f32, s, inv_sq3);
+    uint32_t emf = spirv_op_fsub(&fs, f32, e, f);
+    uint32_t epf = spirv_op_fadd(&fs, f32, e, f);
+
+    uint32_t rgb  = spirv_op_load(&fs, v3, in_col);
+    uint32_t r    = spirv_composite_extract1(&fs, f32, rgb, 0);
+    uint32_t g    = spirv_composite_extract1(&fs, f32, rgb, 1);
+    uint32_t b    = spirv_composite_extract1(&fs, f32, rgb, 2);
+    uint32_t ro   = xe2_spirv_row3(&fs, f32, d, emf, epf, r, g, b);
+    uint32_t go   = xe2_spirv_row3(&fs, f32, epf, d, emf, r, g, b);
+    uint32_t bo   = xe2_spirv_row3(&fs, f32, emf, epf, d, r, g, b);
+    uint32_t rgba = spirv_composite_construct4(&fs, v4, ro, go, bo, one);
+    spirv_op_store(&fs, out_col, rgba);
+    spirv_func_end(&fs);
+
+    uint32_t fs_iface[] = {in_col, out_col};
+    spirv_entry_point(&fs, SPIRV_EXECUTION_MODEL_FRAGMENT, main, "main", fs_iface, 2);
+    spirv_exec_mode0(&fs, main, SPIRV_EXECUTION_MODE_ORIGIN_UPPER_LEFT);
+
+    if (spirv_module_finish(&fs, out_fs, out_fs_n) != 0) {
+        spirv_module_free(&fs);
+        return -1;
+    }
+
+    spirv_module_free(&fs);
+    return 0;
+}
+
+// -----------------------------------------------------------
 // Fixed function
 // -----------------------------------------------------------
 
@@ -1663,6 +1843,16 @@ typedef struct {
     uint8_t* index_scratch;
     uint32_t index_scratch_cap;
 
+    // Generic placeholder shaders (see xe2_spirv_compile_generic_vertex()/
+    // xe2_spirv_compile_generic_fragment() above), compiled once on first
+    // use by xe2_3dprimitive_bind_vertex_buffers() and reused after that -
+    // same one-instance-reused-across-draws reasoning as spirv_ctx above.
+    uint32_t*                 generic_vs_spirv;
+    uint32_t                  generic_vs_nwords;
+    uint32_t*                 generic_fs_spirv;
+    uint32_t                  generic_fs_nwords;
+    xe2_generic_frag_consts_t generic_frag_consts;
+
     bool     draw_submitted;
     uint64_t last_draw_tick;
     uint64_t scanout_tick;
@@ -1770,6 +1960,12 @@ static void xe2_remove(rvvm_reg_dev_t* dev)
             free(xe2->ctx[i].d3d.shader[s].spirv);
         }
     }
+    free(xe2->generic_vs_spirv);
+    free(xe2->generic_fs_spirv);
+    for (size_t i = 0; i < XE2_SHADER_MAX_BINDINGS; ++i) {
+        free(xe2->vertex_scratch[i]);
+    }
+    free(xe2->index_scratch);
 
     if (xe2->fbdev) {
         rvvm_fbdev_dec_ref(xe2->fbdev);
@@ -4873,16 +5069,168 @@ static inline void xe2_3dprimitive_print(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, 
 static uint8_t* xe2_scratch_grow(uint8_t** buf, uint32_t* cap, uint32_t need)
 {
     if (need > *cap) {
-        uint8_t* grown = realloc(*buf, need);
-        if (!grown) {
-            rvvm_warn("%s: OOM growing scratch to %u bytes", __FUNCTION__, need);
-            return *buf;
-        }
-        *buf = grown;
-        *cap = need;
+        uint8_t* grown = safe_realloc(*buf, need);
+        *buf           = grown;
+        *cap           = need;
     }
     memset(*buf, 0, need);
     return *buf;
+}
+
+// Compiles xe2_spirv_compile_generic_vertex()/_fragment() once and caches
+// the result on `xe2`; every draw through
+// xe2_3dprimitive_bind_vertex_buffers() reuses the same SPIR-V module
+// instead of recompiling per draw.
+static bool xe2_generic_shaders_ensure(xe2_dev_t* xe2)
+{
+    if (xe2->generic_vs_spirv && xe2->generic_fs_spirv) {
+        return true;
+    }
+
+    uint32_t* vs   = NULL;
+    uint32_t* fs   = NULL;
+    uint32_t  vs_n = 0;
+    uint32_t  fs_n = 0;
+    if (xe2_spirv_compile_generic_vertex(&vs, &vs_n) < 0 || xe2_spirv_compile_generic_fragment(&fs, &fs_n) < 0) {
+        rvvm_warn("%s: failed to compile generic placeholder shaders", __FUNCTION__);
+        free(vs);
+        free(fs);
+        return false;
+    }
+
+    free(xe2->generic_vs_spirv);
+    free(xe2->generic_fs_spirv);
+    xe2->generic_vs_spirv  = vs;
+    xe2->generic_vs_nwords = vs_n;
+    xe2->generic_fs_spirv  = fs;
+    xe2->generic_fs_nwords = fs_n;
+    return true;
+}
+
+// Binds the guest's raw vertex buffers to a gpu_vulkan_draw_t and submits
+// a real draw through the generic placeholder shaders declared above,
+// instead of the real per-kernel cross-compiled VS/PS - useful whenever
+// those aren't ready (xe2_3dprimitive_print_readiness() reports which),
+// or just to sanity-check that 3DSTATE_VERTEX_BUFFERS is being decoded
+// correctly.
+//
+// Buffer traversal is the same as xe2_3dprimitive_print_vertex_buffers()
+// above (same addr.addr < 0x1000 sanity check, same per-buffer DMA read
+// into xe2->vertex_scratch[i]), just binding instead of dumping. Vertex
+// count is derived from the buffer itself (size / stride) rather than
+// taken from the 3DPRIMITIVE command, so this works for any vertex_count/
+// buffer layout the guest sets up, independent of 3DSTATE_VERTEX_ELEMENTS
+// - the generic vertex shader only ever declares two inputs (inPosition
+// at location 0, inColor at location 1), so at most the first two valid
+// buffers are bound, buffer 0 -> position, buffer 1 -> color.
+static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex_input_t* vi)
+{
+    if (!xe2->vulkan_ctx || !vi->buffer_count) {
+        return false;
+    }
+    if (!xe2_generic_shaders_ensure(xe2)) {
+        return false;
+    }
+
+    gpu_vulkan_draw_t draw = {0};
+
+    uint32_t bound        = 0;
+    uint32_t vertex_count = 0;
+    uint32_t n            = EVAL_MIN(vi->buffer_count, GPU_VULKAN_MAX_VERTEX_BINDINGS);
+
+    for (uint32_t i = 0; i < n && bound < 2; ++i) {
+        const xe2_vertex_buffer_t* vb = &vi->buffer[i];
+
+        // Same sanity check as xe2_3dprimitive_print_vertex_buffers(): low
+        // addresses show up on some (mis?)decoded VERTEX_BUFFER_STATE reads.
+        if (vb->addr.addr < 0x1000 || !vb->size) {
+            rvvm_info("%s: [%u]  <invalid, skipped>", __FUNCTION__, i);
+            continue;
+        }
+
+        uint32_t stride = vb->stride ? vb->stride : (uint32_t)(3 * sizeof(float));
+
+        uint8_t* bytes = xe2_scratch_grow(&xe2->vertex_scratch[i], &xe2->vertex_scratch_cap[i], vb->size);
+        xe2_dma_read_bytes(xe2, vb->addr, bytes, vb->size);
+
+        draw.vertex.binding[bound] = (gpu_vulkan_vertex_binding_t) {
+            .data   = bytes,
+            .size   = vb->size,
+            .stride = stride,
+        };
+        // bound 0 -> inPosition (location 0), bound 1 -> inColor (location
+        // 1): the two inputs xe2_spirv_compile_generic_vertex() declares.
+        draw.vertex.attrib[bound] = (gpu_vulkan_vertex_attrib_t) {
+            .location = bound,
+            .binding  = bound,
+            .format   = GPU_VULKAN_FORMAT_R32G32B32_SFLOAT,
+            .offset   = 0,
+        };
+
+        uint32_t this_count = vb->size / stride;
+        vertex_count        = (bound == 0) ? this_count : EVAL_MIN(vertex_count, this_count);
+        bound++;
+    }
+
+    if (!bound || !vertex_count) {
+        rvvm_warn("%s: no usable vertex buffer, skipped", __FUNCTION__);
+        return false;
+    }
+
+    // Only a position buffer was bound - synthesize a flat white color
+    // buffer so binding 1 / location 1, which the generic shader always
+    // reads, still holds defined data instead of whatever vertex_scratch[1]
+    // last held.
+    if (bound == 1) {
+        uint32_t nbytes = vertex_count * 3 * sizeof(float);
+        uint8_t* white  = xe2_scratch_grow(&xe2->vertex_scratch[1], &xe2->vertex_scratch_cap[1], nbytes);
+        float*   f      = (float*)white;
+        for (uint32_t v = 0; v < vertex_count; ++v) {
+            f[v * 3 + 0] = 1.0f;
+            f[v * 3 + 1] = 1.0f;
+            f[v * 3 + 2] = 1.0f;
+        }
+        draw.vertex.binding[1] = (gpu_vulkan_vertex_binding_t) {
+            .data   = white,
+            .size   = nbytes,
+            .stride = 3 * sizeof(float),
+        };
+        draw.vertex.attrib[1] = (gpu_vulkan_vertex_attrib_t) {
+            .location = 1,
+            .binding  = 1,
+            .format   = GPU_VULKAN_FORMAT_R32G32B32_SFLOAT,
+            .offset   = 0,
+        };
+        bound = 2;
+    }
+
+    draw.vertex.binding_count = bound;
+    draw.vertex.attrib_count  = bound;
+
+    draw.topology       = xe2_topology_to_vulkan(vi->topology);
+    draw.vertex_count   = vertex_count;
+    draw.instance_count = 1;
+    draw.first_vertex   = 0;
+    draw.first_instance = 0;
+
+    xe2->generic_frag_consts.hue = 0.0f; // identity - pass fragColor through unchanged
+
+    draw.stage[GPU_VULKAN_STAGE_VERTEX] = (gpu_vulkan_stage_desc_t) {
+        .spirv        = xe2->generic_vs_spirv,
+        .spirv_nwords = xe2->generic_vs_nwords,
+    };
+    draw.stage[GPU_VULKAN_STAGE_FRAGMENT] = (gpu_vulkan_stage_desc_t) {
+        .spirv        = xe2->generic_fs_spirv,
+        .spirv_nwords = xe2->generic_fs_nwords,
+        .constants    = &xe2->generic_frag_consts,
+        .const_bytes  = sizeof(xe2->generic_frag_consts),
+    };
+
+    bool submitted = gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
+    if (!submitted) {
+        rvvm_warn("%s: submit_draw failed", __FUNCTION__);
+    }
+    return submitted;
 }
 
 // Reads this draw's vertex/index bytes out of guest memory into `xe2`'s
@@ -5037,9 +5385,27 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
         // for filter/wrap modes and belongs in the same struct.
     }
 
-    bool submitted = xe2->vulkan_ctx && gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
-    if (!submitted) {
-        rvvm_warn("%s: draw carries no usable shaders, skipped", __FUNCTION__);
+    // The real per-guest-kernel cross-compile path needs both VS and PS
+    // usable to put anything correct on screen (see
+    // xe2_3dprimitive_print_readiness() above). When either is missing -
+    // PS cross-compile is the one that's still unreliable, per the note
+    // above xe2_3dprimitive_print() - fall back to the generic
+    // placeholder pipeline so the guest's geometry still reaches the
+    // screen instead of freezing on the last good frame (or nothing at
+    // all) until PS decoding is fixed.
+    bool vs_ready = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv && draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords;
+    bool ps_ready = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv && draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords;
+
+    bool submitted;
+    if (vs_ready && ps_ready) {
+        submitted = xe2->vulkan_ctx && gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
+        if (!submitted) {
+            rvvm_warn("%s: draw carries no usable shaders, skipped", __FUNCTION__);
+        }
+    } else {
+        rvvm_warn("%s: VS/PS not both ready (vs=%d ps=%d), falling back to generic placeholder shaders", __FUNCTION__,
+                  vs_ready, ps_ready);
+        submitted = xe2_3dprimitive_bind_vertex_buffers(xe2, &d3d->vertex_input);
     }
 
     for (uint32_t s = 0; s < XE2_SHADER_STAGE_COUNT; ++s) {
