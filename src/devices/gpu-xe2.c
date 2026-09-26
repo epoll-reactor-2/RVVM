@@ -7,6 +7,7 @@ License, v. 2.0. If a copy of the MPL was not distributed with this
 file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
+#include "rvtimer.h"
 #include <devices/gpu-vulkan-spirv.h>
 #include <devices/gpu-vulkan.h>
 #include <errno.h>
@@ -4404,7 +4405,8 @@ static inline uint32_t xe2_process_batch_buffer(xe2_dev_t* xe2, xe2_submit_ctx_t
     }
 
     if (unlikely(ring.addr == 0ULL)) {
-        rvvm_warn("Failed to translate batch buffer address! bo: 0x%" PRIx64, bo);
+        rvvm_warn("Failed to translate batch buffer start address (%s)! bo: 0x%" PRIx64,
+                  op & XE2_MI_OP_BATCH_BUFFER_START_PPGTT ? "PPGTT" : "GGTT", bo);
         return 3;
     }
 
@@ -4461,6 +4463,7 @@ static inline uint32_t xe2_mi_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma
             uint32_t    lo = xe2_dma_read_32(xe2, ring, 1 * 4);
             uint32_t    hi = xe2_dma_read_32(xe2, ring, 2 * 4);
             rvvm_addr_t bo = xe2_concat_lohi(lo, hi);
+            rvvm_info("XE2_MI_OP_BATCH_BUFFER_START: BO = 0x%lx", bo);
             return xe2_process_batch_buffer(xe2, ctx, pdp4, op, bo, user_int);
         }
         default:
@@ -4842,7 +4845,7 @@ static inline void xe2_3dprimitive_print_vertex_buffers(xe2_dev_t* xe2, const xe
         // vertex buffer 0, size 36
         //   buffer contents unavailable
         if (vb->addr.addr < 0x1000) {
-            rvvm_info(" | [%u]  <invalid>", i);
+            rvvm_info(" | [%u]  <invalid> (addr: 0x%lx)", i, vb->addr.addr);
             continue;
         }
         rvvm_info(" | [%u]  addr=0x%" PRIx64 "  stride=%u  size=%u", i, vb->addr.addr, vb->stride, vb->size);
@@ -4851,6 +4854,7 @@ static inline void xe2_3dprimitive_print_vertex_buffers(xe2_dev_t* xe2, const xe
             uint32_t buffers[30] = {0};
             uint32_t size        = EVAL_MIN(STATIC_ARRAY_SIZE(buffers), vb->size / 4);
             if (!xe2_dma_read_many(xe2, vb->addr, buffers, STATIC_ARRAY_SIZE(buffers))) {
+                rvvm_warn(" | ERROR: Failed to read vertex buffers, addr=0x%lx", vb->addr.addr);
                 continue;
             }
 
@@ -5003,10 +5007,12 @@ static inline void xe2_3dprimitive_print_readiness(const xe2_3dstate_t* d3d)
     rvvm_info(" Readiness:");
     bool vs_ok = vs->enabled && vs->spirv && vs->spirv_nwords;
     bool ps_ok = ps->enabled && ps->spirv && ps->spirv_nwords;
-    rvvm_info(" | VS bound & compiled : %s", vs_ok ? "yes" : "NO");
-    rvvm_info(" | PS bound & compiled : %s", ps_ok ? "yes" : "NO (no fragment shading -> nothing written to color)");
-    rvvm_info(" | Vertex attributes   : %s",
-              d3d->vertex_input.element_count ? "wired" : "NOT wired (VS sees only push constants/built-ins)");
+    rvvm_info(" | VS bound & compiled = %s (enabled? = %d, SPIR-V = %p, SPIR-V size = %u)", vs_ok ? "yes" : "no",
+              vs->enabled, vs->spirv, vs->spirv_nwords);
+    rvvm_info(" | PS bound & compiled = %s (enabled? = %d, SPIR-V = %p, SPIR-V size = %u)", ps_ok ? "yes" : "no",
+              ps->enabled, ps->spirv, ps->spirv_nwords);
+    rvvm_info(" | Vertex attributes   = %s",
+              d3d->vertex_input.element_count ? "wired" : "not wired (VS sees only push constants/built-ins)");
 
     bool rt_ok = false;
     for (uint32_t t = 0; t < d3d->binding_table_entry_count[XE2_SHADER_PS] && t < XE2_MAX_BOUND_SURFACES; ++t) {
@@ -5016,9 +5022,9 @@ static inline void xe2_3dprimitive_print_readiness(const xe2_3dstate_t* d3d)
             break;
         }
     }
-    rvvm_info(" | Real render target  : %s", rt_ok ? "yes" : "NO (PS binding table has no non-degenerate surface)");
-    rvvm_info(" | Depth buffer        : %s", d3d->depth.depth_valid ? "bound" : "none (fine if depth test is off)");
-    rvvm_info(" | Viewport            : %s", d3d->viewport.valid ? "decoded" : "NOT decoded (defaulting elsewhere)");
+    rvvm_info(" | Real render target  = %s", rt_ok ? "yes" : "no (PS binding table has no non-degenerate surface)");
+    rvvm_info(" | Depth buffer        = %s", d3d->depth.depth_valid ? "bound" : "none (fine if depth test is off)");
+    rvvm_info(" | Viewport            = %s", d3d->viewport.valid ? "decoded" : "not decoded (defaulting elsewhere)");
 }
 
 // Fixed since this comment was first written:
@@ -5226,6 +5232,7 @@ static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex
         .const_bytes  = sizeof(xe2->generic_frag_consts),
     };
 
+    rvvm_info("%s: Submit Vulkan draw", __FUNCTION__);
     bool submitted = gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
     if (!submitted) {
         rvvm_warn("%s: submit_draw failed", __FUNCTION__);
@@ -5396,8 +5403,9 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
     bool vs_ready = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv && draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords;
     bool ps_ready = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv && draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords;
 
-    bool submitted;
+    bool submitted = 0;
     if (vs_ready && ps_ready) {
+        rvvm_info("%s: Submit Vulkan draw", __FUNCTION__);
         submitted = xe2->vulkan_ctx && gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
         if (!submitted) {
             rvvm_warn("%s: draw carries no usable shaders, skipped", __FUNCTION__);
@@ -5551,6 +5559,9 @@ static inline void xe2_3dstate_vertex_buffers_cmd(xe2_dev_t* xe2, xe2_submit_ctx
         if (binding + 1 > vertex->buffer_count) {
             vertex->buffer_count = binding + 1;
         }
+
+        rvvm_info("3DSTATE_VERTEX_BUFFERS cmd translated: phys=0x%lx -> ppgtt=0x%lx", phys,
+                  vertex->buffer[binding].addr.addr);
     }
 
     ctx->d3d.ff_dirty = 1;
@@ -6064,8 +6075,8 @@ static inline uint32_t xe2_ring_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_d
             // This instruction always has size equals 3 bytes per Mesa.
             return 3;
         default:
-            rvvm_fatal("Unknown instruction type: %u", XE2_INSTR_TYPE(op));
-            return 0;
+            rvvm_warn("Unknown instruction type: %u", XE2_INSTR_TYPE(op));
+            return 1;
     }
 }
 
@@ -6326,7 +6337,7 @@ static inline void xe2_guc_action_tlb_invalidate(xe2_dev_t* xe2, const uint32_t*
     // [   80.273245] xe 0000:00:01.0: [drm] *ERROR* TLB invalidation fence timeout, seqno=235 recv=230
     // ...
     uint32_t seqno = msg[1];
-    // rvvm_info("XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: %u", seqno);
+    rvvm_info("XE2_GUC_ACTION_TLB_INVALIDATION_(ALL?), seqno: %u", seqno);
     xe2_guc_g2h_event(xe2, XE2_GUC_ACTION_TLB_INVALIDATION_DONE, &seqno, 1);
 }
 
