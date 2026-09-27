@@ -2398,7 +2398,7 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PML4e not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
-    rvvm_info("PPGTT translation (1): pml4e: 0x%lx", pml4e);
+    rvvm_debug("PPGTT translation (1): pml4e: 0x%lx", pml4e);
 
     rvvm_addr_t pdpt_addr = (pml4e & ~0xFFFULL) + pdpt_idx * 8;
     rvvm_addr_t pdpte     = xe2_read_pte_lmem(xe2, pdpt_addr);
@@ -2406,7 +2406,7 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PDPTe not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
-    rvvm_info("PPGTT translation (2): pdpte: 0x%lx", pdpte);
+    rvvm_debug("PPGTT translation (2): pdpte: 0x%lx", pdpte);
 
     // 1 GiB huge page
     if (pdpte & (1 << 7)) {
@@ -2423,7 +2423,7 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PDE not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
-    rvvm_info("PPGTT translation (3): pde: 0x%lx", pde);
+    rvvm_debug("PPGTT translation (3): pde: 0x%lx", pde);
 
     // 2 MiB huge page
     if (likely(pde & (1 << 7))) {
@@ -2440,9 +2440,9 @@ static inline xe2_dma_addr_t xe2_ppgtt_translate(xe2_dev_t* xe2, rvvm_addr_t pdp
         rvvm_warn("PPGTT: PTE not present (VA=0x%lx)", va);
         return (xe2_dma_addr_t) {0};
     }
-    rvvm_info("PPGTT translation (4): pte: 0x%lx", pte);
-    rvvm_info("PPGTT translation (5): result: 0x%llx, type: %s", (pte & ~0xFFFULL) + offset,
-              (pte & (1 << 11)) ? "LMEM" : "SMEM");
+    rvvm_debug("PPGTT translation (4): pte: 0x%lx", pte);
+    rvvm_debug("PPGTT translation (5): result: 0x%llx, type: %s", (pte & ~0xFFFULL) + offset,
+               (pte & (1 << 11)) ? "LMEM" : "SMEM");
 
     return (xe2_dma_addr_t) {
         .addr = (pte & ~0xFFFULL) + offset,
@@ -2500,7 +2500,7 @@ static inline void xe2_dpcd_aux_config(uint32_t cmd, uint32_t request, uint32_t 
     //
     // 16 bytes total.
 
-    rvvm_info("AUX cmd: 0x%x", cmd);
+    rvvm_debug("AUX cmd: 0x%x", cmd);
 
     switch (cmd) {
         case DPCD_REG_REV: {
@@ -4463,7 +4463,7 @@ static inline uint32_t xe2_mi_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_dma
             uint32_t    lo = xe2_dma_read_32(xe2, ring, 1 * 4);
             uint32_t    hi = xe2_dma_read_32(xe2, ring, 2 * 4);
             rvvm_addr_t bo = xe2_concat_lohi(lo, hi);
-            rvvm_info("XE2_MI_OP_BATCH_BUFFER_START: BO = 0x%lx", bo);
+            rvvm_debug("XE2_MI_OP_BATCH_BUFFER_START: BO = 0x%lx", bo);
             return xe2_process_batch_buffer(xe2, ctx, pdp4, op, bo, user_int);
         }
         default:
@@ -5232,10 +5232,12 @@ static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex
         .const_bytes  = sizeof(xe2->generic_frag_consts),
     };
 
-    rvvm_info("%s: Submit Vulkan draw", __FUNCTION__);
+    // My whole life has been about pain. I was born into pain,
+    // I was born to bring pain. Pain has always been my best
+    // friend, my only friend. But now, it's my worst enemy.
     bool submitted = gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
     if (!submitted) {
-        rvvm_warn("%s: submit_draw failed", __FUNCTION__);
+        rvvm_warn("%s: gpu_vulkan_submit_draw failed", __FUNCTION__);
     }
     return submitted;
 }
@@ -5312,8 +5314,8 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
     uint32_t start_instance = cmd[5];
     int32_t  base_vertex    = (int32_t)cmd[6];
 
-    rvvm_info("%s: vertex_count: %u, start_vertex: %u, instances: %u, start_instance: %u, base_vertex: %u",
-              __FUNCTION__, vertex_count, start_vertex, instance_count, start_instance, base_vertex);
+    rvvm_debug("%s: vertex_count: %u, start_vertex: %u, instances: %u, start_instance: %u, base_vertex: %u",
+               __FUNCTION__, vertex_count, start_vertex, instance_count, start_instance, base_vertex);
 
     xe2_3dstate_t* d3d = &ctx->d3d;
 
@@ -5370,7 +5372,7 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
             .const_bytes  = consts->nbytes,
         };
 
-        rvvm_info("%s: Count %u ", __FUNCTION__, d3d->binding_table_entry_count[kind]);
+        rvvm_debug("%s: Count %u ", __FUNCTION__, d3d->binding_table_entry_count[kind]);
         for (uint32_t t = 0; t < d3d->binding_table_entry_count[kind]; ++t) {
             const xe2_surface_state_t* surf = &d3d->surface[kind][t];
             rvvm_info(
@@ -6352,6 +6354,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
 
     uint32_t dwords = xe2->guc.ctb_h2g_size / 4;
     if (dwords == 0) {
+        rvvm_warn("%s: No dwords to process. Return", __FUNCTION__);
         return;
     }
 
@@ -6364,6 +6367,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
         uint32_t fence      = xe2_reg_field_get(XE2_GUC_CTB_MSG_0_FENCE, header);
 
         if (num_dwords == 0) {
+            rvvm_warn("%s: Empty command. Continue", __FUNCTION__);
             break;
         }
 
@@ -6375,7 +6379,7 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
         uint32_t type   = xe2_reg_field_get(XE2_GUC_HXG_MSG_0_TYPE, msg[0]);
         uint32_t action = xe2_reg_field_get(XE2_GUC_HXG_MSG_0_ACTION, msg[0]);
 
-        // rvvm_info("GuC CT: action=0x%x type=%u fence=0x%x (%u) dwords=%u", action, type, fence, fence, num_dwords);
+        rvvm_info("GuC CT: action=0x%x type=%u fence=0x%x (%u) dwords=%u", action, type, fence, fence, num_dwords);
 
         switch (action) {
             // Note that context ID = GuC ID.
@@ -7446,10 +7450,8 @@ static void xe2_mmio_write(rvvm_reg_dev_t* dev, const void* data, size_t size, s
         }
 
         case XE2_REG_GUC_TLB_INV_DESC0:
-            rvvm_info("GuC requested to invalidate TLB[0]");
             break;
         case XE2_REG_GUC_TLB_INV_DESC1:
-            rvvm_info("GuC requested to invalidate TLB[1]");
             break;
 
         case XE2_REG_GUC_DMA_ADDR_1_LO:

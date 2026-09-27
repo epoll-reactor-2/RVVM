@@ -1433,7 +1433,7 @@ static void* gpu_vulkan_render_task(void* arg)
     uint8_t*          dst      = ctx->requested_dst;
     size_t            dst_size = ctx->requested_dst_size;
 
-    rvvm_info("Vulkan render task");
+    rvvm_debug("Vulkan render task");
 
     if (atomic_load_uint8_relax(&ctx->shutting_down) || width == 0 || height == 0) {
         goto done;
@@ -1442,7 +1442,7 @@ static void* gpu_vulkan_render_task(void* arg)
     if (!gpu_vulkan_reconfigure(ctx, width, height, stride, format)) {
         goto done;
     }
-    rvvm_info("Vulkan reconfigure done");
+    rvvm_debug("Vulkan reconfigure done");
 
     // Pick up whatever the guest submitted last. A scene whose pipeline
     // fails to build (a kernel we cross-compiled into something the
@@ -1595,7 +1595,6 @@ static void* gpu_vulkan_render_task(void* arg)
 
 done:
     atomic_store_uint8_relax(&ctx->render_in_progress, 0);
-    rvvm_info("%s: render_in_progress: %u", __FUNCTION__, atomic_load_uint8_relax(&ctx->render_in_progress));
     return NULL;
 }
 
@@ -1626,7 +1625,6 @@ bool gpu_vulkan_render_frame(gpu_vulkan_ctx_t* ctx, uint32_t width, uint32_t hei
     // This keeps at most one in-flight task, and guarantees the GUI
     // thread is never the one doing the work, no matter how slow the
     // blit is.
-    rvvm_info("%s: render_in_progress: %u", __FUNCTION__, atomic_load_uint8_relax(&ctx->render_in_progress));
     if (atomic_cas_uint8(&ctx->render_in_progress, 0, 1)) {
         thread_create_task(gpu_vulkan_render_task, ctx);
     }
