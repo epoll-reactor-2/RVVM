@@ -6367,8 +6367,10 @@ static void xe2_guc_host_interrupt(xe2_dev_t* xe2)
         uint32_t fence      = xe2_reg_field_get(XE2_GUC_CTB_MSG_0_FENCE, header);
 
         if (num_dwords == 0) {
-            rvvm_warn("%s: Empty command. Continue", __FUNCTION__);
-            break;
+            // If we are out of dwords, this means we reached end of circular
+            // buffer and we need to wrap out.
+            head = (head + XE2_GUC_CTB_HDR_LEN + num_dwords) % dwords;
+            continue;
         }
 
         uint32_t msg[64] = {0};
