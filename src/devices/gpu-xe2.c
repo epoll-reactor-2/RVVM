@@ -3861,6 +3861,10 @@ static forceinline void xe2_brw_emit_send(xe2_spirv_ctx_t* spirv_ctx, uint32_t s
     xe2_spirv_emit_output(spirv_ctx, s0->reg ? s0->reg : s1->reg);
 }
 
+// BRW -> SPIR-V tie problem.
+//
+// The main blocker is understanding which SPIR-V in/out variable should
+// be attached to which compiled SPIR-V variable that comes from BRW.
 static forceinline void xe2_brw_emit_spirv(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t* qw, uint32_t op,
                                            const xe2_brw_operand_t* dst, const xe2_brw_operand_t* s0,
                                            const xe2_brw_operand_t* s1, const xe2_brw_operand_t* s2)
@@ -4502,7 +4506,7 @@ static void xe2_print_decompiled_shader(xe2_dev_t* xe2, xe2_dma_addr_t dma)
     }
 
     static const uint32_t limit      = 4096;
-    uint32_t              code[4096] = {0};
+    uint32_t              code[8192] = {0};
     uint32_t              len        = 0U;
     uint32_t              zeros      = 0U;
 
@@ -5450,6 +5454,7 @@ static inline void xe2_3dstate_ps_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
 {
     uint32_t cmd[12] = {0};
     if (!xe2_dma_read_many(xe2, ring, cmd, STATIC_ARRAY_SIZE(cmd))) {
+        rvvm_warn("%s: Failed to read command", __FUNCTION__);
         return;
     }
 
@@ -5457,8 +5462,11 @@ static inline void xe2_3dstate_ps_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
         xe2_addr_63_6_mask(cmd[1], cmd[2]),
         xe2_addr_63_6_mask(cmd[8], cmd[9]),
     };
-    bool addr_kernel_enable[] = {cmd[0] & 1, cmd[8] & 1};
-    bool any                  = false;
+    bool addr_kernel_enable[] = {
+        cmd[1] & 1,
+        cmd[8] & 1,
+    };
+    bool any = false;
     for (size_t i = 0; i < STATIC_ARRAY_SIZE(addr_kernel); ++i) {
         if (addr_kernel_enable[i]) {
             rvvm_info("(PS) kernel %zu: lx%0lx", i, addr_kernel[i]);
