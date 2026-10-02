@@ -743,6 +743,24 @@ static forceinline uint32_t spirv_declare_location_out(spirv_module_t* module, u
     return spirv_declare_location(module, SPIRV_STORAGE_CLASS_OUTPUT, location, ty, name);
 }
 
+static forceinline uint32_t spirv_declare_builtin(spirv_module_t* module, uint32_t ty, uint32_t kind, uint32_t storage)
+{
+    uint32_t ptr = spirv_type_ptr(module, SPIRV_STORAGE_CLASS_OUTPUT, ty);
+    uint32_t var = spirv_global_var(module, ptr, storage);
+    spirv_decorate_1(module, var, SPIRV_DECORATION_BUILTIN, kind);
+    return var;
+}
+
+static forceinline uint32_t spirv_declare_builtin_in(spirv_module_t* module, uint32_t ty, uint32_t kind)
+{
+    return spirv_declare_builtin(module, ty, kind, SPIRV_STORAGE_CLASS_INPUT);
+}
+
+static forceinline uint32_t spirv_declare_builtin_out(spirv_module_t* module, uint32_t ty, uint32_t kind)
+{
+    return spirv_declare_builtin(module, ty, kind, SPIRV_STORAGE_CLASS_OUTPUT);
+}
+
 static forceinline void spirv_merge(spirv_words_t* dst, const spirv_words_t* src)
 {
     vector_foreach (*src, i) {

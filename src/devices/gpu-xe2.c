@@ -1334,11 +1334,10 @@ static int xe2_spirv_compile_generic_vertex(uint32_t** out_vs, uint32_t* out_vs_
     uint32_t v4      = spirv_type_vec4_float32(&vs);
     uint32_t fn_ty   = spirv_type_func_void(&vs);
 
-    uint32_t pos_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v4);
-    uint32_t pos_var = spirv_global_var(&vs, pos_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
-    spirv_decorate_1(&vs, pos_var, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
-    uint32_t col_ptr = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v3);
-    uint32_t col_var = spirv_global_var(&vs, col_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
+    // gl_Position is builtin variable. Declare it.
+    uint32_t gl_position = spirv_declare_builtin_out(&vs, v4, SPIRV_BUILTIN_POSITION);
+    uint32_t col_ptr     = spirv_type_ptr(&vs, SPIRV_STORAGE_CLASS_OUTPUT, v3);
+    uint32_t col_var     = spirv_global_var(&vs, col_ptr, SPIRV_STORAGE_CLASS_OUTPUT);
     spirv_decorate_1(&vs, col_var, SPIRV_DECORATION_LOCATION, 0);
 
     // Vertex attribute inputs. Locations/format here must match
@@ -1357,14 +1356,14 @@ static int xe2_spirv_compile_generic_vertex(uint32_t** out_vs, uint32_t* out_vs_
     uint32_t y  = spirv_composite_extract1(&vs, f32, p, 1);
     uint32_t z  = spirv_composite_extract1(&vs, f32, p, 2);
     uint32_t w1 = spirv_type_const_float32(&vs, 1.0f);
-    spirv_op_store(&vs, pos_var, spirv_composite_construct4(&vs, v4, x, y, z, w1));
+    spirv_op_store(&vs, gl_position, spirv_composite_construct4(&vs, v4, x, y, z, w1));
 
     // fragColor = inColor
     spirv_op_store(&vs, col_var, spirv_op_load(&vs, v3, in_col_var));
 
     spirv_func_end(&vs);
 
-    uint32_t vs_iface[] = {pos_var, col_var, in_pos_var, in_col_var};
+    uint32_t vs_iface[] = {gl_position, col_var, in_pos_var, in_col_var};
     spirv_entry_point(&vs, SPIRV_EXECUTION_MODEL_VERTEX, main, "main", vs_iface, 4);
 
     if (spirv_module_finish(&vs, out_vs, out_vs_n) != 0) {
@@ -3727,8 +3726,10 @@ static forceinline uint32_t xe2_spirv_load_attr(xe2_spirv_ctx_t* ctx, uint32_t i
 
 static forceinline uint32_t xe2_spirv_load_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg, bool neg, bool abs)
 {
-    uint32_t attr_idx = 0, attr_comp = 0;
-    uint32_t id;
+    uint32_t attr_idx  = 0;
+    uint32_t attr_comp = 0;
+    uint32_t id        = 0;
+
     if (xe2_spirv_grf_is_const(ctx, grf, subreg)) {
         id = xe2_spirv_load_const(ctx, grf, subreg);
     } else if (xe2_spirv_grf_is_attr(ctx, grf, &attr_idx, &attr_comp)) {
