@@ -5134,7 +5134,7 @@ static bool xe2_generic_shaders_ensure(xe2_dev_t* xe2)
 // - the generic vertex shader only ever declares two inputs (inPosition
 // at location 0, inColor at location 1), so at most the first two valid
 // buffers are bound, buffer 0 -> position, buffer 1 -> color.
-static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex_input_t* vi)
+static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex_input_t* vi, gpu_vulkan_draw_t* draw)
 {
     if (!xe2->vulkan_ctx || !vi->buffer_count) {
         return false;
@@ -5142,8 +5142,6 @@ static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex
     if (!xe2_generic_shaders_ensure(xe2)) {
         return false;
     }
-
-    gpu_vulkan_draw_t draw = {0};
 
     uint32_t bound        = 0;
     uint32_t vertex_count = 0;
@@ -5164,14 +5162,14 @@ static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex
         uint8_t* bytes = xe2_scratch_grow(&xe2->vertex_scratch[i], &xe2->vertex_scratch_cap[i], vb->size);
         xe2_dma_read_bytes(xe2, vb->addr, bytes, vb->size);
 
-        draw.vertex.binding[bound] = (gpu_vulkan_vertex_binding_t) {
+        draw->vertex.binding[bound] = (gpu_vulkan_vertex_binding_t) {
             .data   = bytes,
             .size   = vb->size,
             .stride = stride,
         };
         // bound 0 -> inPosition (location 0), bound 1 -> inColor (location
         // 1): the two inputs xe2_spirv_compile_generic_vertex() declares.
-        draw.vertex.attrib[bound] = (gpu_vulkan_vertex_attrib_t) {
+        draw->vertex.attrib[bound] = (gpu_vulkan_vertex_attrib_t) {
             .location = bound,
             .binding  = bound,
             .format   = GPU_VULKAN_FORMAT_R32G32B32_SFLOAT,
@@ -5201,12 +5199,12 @@ static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex
             f[v * 3 + 1] = 1.0f;
             f[v * 3 + 2] = 1.0f;
         }
-        draw.vertex.binding[1] = (gpu_vulkan_vertex_binding_t) {
+        draw->vertex.binding[1] = (gpu_vulkan_vertex_binding_t) {
             .data   = white,
             .size   = nbytes,
             .stride = 3 * sizeof(float),
         };
-        draw.vertex.attrib[1] = (gpu_vulkan_vertex_attrib_t) {
+        draw->vertex.attrib[1] = (gpu_vulkan_vertex_attrib_t) {
             .location = 1,
             .binding  = 1,
             .format   = GPU_VULKAN_FORMAT_R32G32B32_SFLOAT,
@@ -5215,36 +5213,18 @@ static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex
         bound = 2;
     }
 
-    draw.vertex.binding_count = bound;
-    draw.vertex.attrib_count  = bound;
+    draw->vertex.binding_count = bound;
+    draw->vertex.attrib_count  = bound;
 
-    draw.topology       = xe2_topology_to_vulkan(vi->topology);
-    draw.vertex_count   = vertex_count;
-    draw.instance_count = 1;
-    draw.first_vertex   = 0;
-    draw.first_instance = 0;
+    draw->topology       = xe2_topology_to_vulkan(vi->topology);
+    draw->vertex_count   = vertex_count;
+    draw->instance_count = 1;
+    draw->first_vertex   = 0;
+    draw->first_instance = 0;
 
     xe2->generic_frag_consts.hue = 0.0f; // identity - pass fragColor through unchanged
 
-    draw.stage[GPU_VULKAN_STAGE_VERTEX] = (gpu_vulkan_stage_desc_t) {
-        .spirv        = xe2->generic_vs_spirv,
-        .spirv_nwords = xe2->generic_vs_nwords,
-    };
-    draw.stage[GPU_VULKAN_STAGE_FRAGMENT] = (gpu_vulkan_stage_desc_t) {
-        .spirv        = xe2->generic_fs_spirv,
-        .spirv_nwords = xe2->generic_fs_nwords,
-        .constants    = &xe2->generic_frag_consts,
-        .const_bytes  = sizeof(xe2->generic_frag_consts),
-    };
-
-    // My whole life has been about pain. I was born into pain,
-    // I was born to bring pain. Pain has always been my best
-    // friend, my only friend. But now, it's my worst enemy.
-    bool submitted = gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
-    if (!submitted) {
-        rvvm_warn("%s: gpu_vulkan_submit_draw failed", __FUNCTION__);
-    }
-    return submitted;
+    return true;
 }
 
 // Reads this draw's vertex/index bytes out of guest memory into `xe2`'s
@@ -5410,17 +5390,43 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
     bool vs_ready = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv && draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords;
     bool ps_ready = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv && draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords;
 
+    if (!xe2_3dprimitive_bind_vertex_buffers(xe2, &d3d->vertex_input, &draw)) {
+        rvvm_warn("Failed to submit vertex buffers");
+    }
+    // When this set, image is displayed.
+    vs_ready = 0;
+    ps_ready = 0;
+
     bool submitted = 0;
     if (vs_ready && ps_ready) {
-        rvvm_info("%s: Submit Vulkan draw", __FUNCTION__);
-        submitted = xe2->vulkan_ctx && gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
-        if (!submitted) {
-            rvvm_warn("%s: draw carries no usable shaders, skipped", __FUNCTION__);
-        }
+        draw.stage[GPU_VULKAN_STAGE_VERTEX] = (gpu_vulkan_stage_desc_t) {
+            .spirv        = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv,
+            .spirv_nwords = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords,
+        };
+        draw.stage[GPU_VULKAN_STAGE_FRAGMENT] = (gpu_vulkan_stage_desc_t) {
+            .spirv        = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv,
+            .spirv_nwords = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords,
+            .constants    = &xe2->generic_frag_consts,
+            .const_bytes  = sizeof(xe2->generic_frag_consts),
+        };
+        rvvm_info("%s: Submit guest-supplied Vulkan draw", __FUNCTION__);
     } else {
-        rvvm_warn("%s: VS/PS not both ready (vs=%d ps=%d), falling back to generic placeholder shaders", __FUNCTION__,
-                  vs_ready, ps_ready);
-        submitted = xe2_3dprimitive_bind_vertex_buffers(xe2, &d3d->vertex_input);
+        draw.stage[GPU_VULKAN_STAGE_VERTEX] = (gpu_vulkan_stage_desc_t) {
+            .spirv        = xe2->generic_vs_spirv,
+            .spirv_nwords = xe2->generic_vs_nwords,
+        };
+        draw.stage[GPU_VULKAN_STAGE_FRAGMENT] = (gpu_vulkan_stage_desc_t) {
+            .spirv        = xe2->generic_fs_spirv,
+            .spirv_nwords = xe2->generic_fs_nwords,
+            .constants    = &xe2->generic_frag_consts,
+            .const_bytes  = sizeof(xe2->generic_frag_consts),
+        };
+        // Fallback – force the hard-coded generic layout + generic shaders
+        rvvm_warn("%s: VS/PS not both ready (vs=%d ps=%d), falling back to generic", __FUNCTION__, vs_ready, ps_ready);
+    }
+    submitted = gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
+    if (!submitted) {
+        rvvm_warn("%s: gpu_vulkan_submit_draw failed", __FUNCTION__);
     }
 
     for (uint32_t s = 0; s < XE2_SHADER_STAGE_COUNT; ++s) {
