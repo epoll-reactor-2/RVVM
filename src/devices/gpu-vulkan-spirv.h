@@ -55,12 +55,15 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define SPIRV_OP_ACCESS_CHAIN                  65
 #define SPIRV_OP_DECORATE                      71
 #define SPIRV_OP_MEMBER_DECORATE               72
+#define SPIRV_OP_VECTOR_SHUFFLE                79
 #define SPIRV_OP_COMPOSITE_CONSTRUCT           80
 #define SPIRV_OP_COMPOSITE_EXTRACT             81
-#define SPIRV_OP_VECTOR_SHUFFLE                79
+#define SPIRV_OP_F2U                           109
 #define SPIRV_OP_CONVERT_FTOS                  110
 #define SPIRV_OP_CONVERT_STOF                  111
+#define SPIRV_OP_U2F                           112
 #define SPIRV_OP_BITCAST                       124
+#define SPIRV_OP_SNEG                          126
 #define SPIRV_OP_F_NEGATE                      127
 #define SPIRV_OP_I_ADD                         128
 #define SPIRV_OP_F_ADD                         129
@@ -68,21 +71,39 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define SPIRV_OP_F_SUB                         131
 #define SPIRV_OP_I_MUL                         132
 #define SPIRV_OP_F_MUL                         133
+#define SPIRV_OP_UDIV                          134
+#define SPIRV_OP_SDIV                          135
 #define SPIRV_OP_F_DIV                         136
+#define SPIRV_OP_UMOD                          137
+#define SPIRV_OP_SREM                          138
+#define SPIRV_OP_LOR                           166
+#define SPIRV_OP_AND                           167
+#define SPIRV_OP_LNOT                          168
+#define SPIRV_OP_SELECT                        169
+#define SPIRV_OP_I_EQUAL                       170
+#define SPIRV_OP_INE                           171
+#define SPIRV_OP_UGT                           172
+#define SPIRV_OP_SGT                           173
+#define SPIRV_OP_UGE                           174
+#define SPIRV_OP_SGE                           175
+#define SPIRV_OP_ULT                           176
+#define SPIRV_OP_SLT                           177
+#define SPIRV_OP_ULE                           178
+#define SPIRV_OP_SLE                           179
+#define SPIRV_OP_F_ORD_EQ                      180
+#define SPIRV_OP_F_ORD_NE                      182
+#define SPIRV_OP_F_UNE                         183
+#define SPIRV_OP_F_ORD_LT                      184
+#define SPIRV_OP_F_ORD_GT                      186
+#define SPIRV_OP_F_ORD_LE                      188
+#define SPIRV_OP_F_ORD_GE                      190
+#define SPIRV_OP_SHRL                          194
+#define SPIRV_OP_SHRA                          195
+#define SPIRV_OP_SHLL                          196
 #define SPIRV_OP_BIT_OR                        197
 #define SPIRV_OP_BIT_XOR                       198
 #define SPIRV_OP_BIT_AND                       199
-#define SPIRV_OP_SHRL                          194
-#define SPIRV_OP_SHLL                          196
-#define SPIRV_OP_AND                           167
-#define SPIRV_OP_SELECT                        169
-#define SPIRV_OP_I_EQUAL                       170
-#define SPIRV_OP_F_ORD_EQ                      180
-#define SPIRV_OP_F_ORD_GT                      186
-#define SPIRV_OP_F_ORD_GE                      188
-#define SPIRV_OP_F_ORD_LT                      184
-#define SPIRV_OP_F_ORD_LE                      190
-#define SPIRV_OP_F_ORD_NE                      182
+#define SPIRV_OP_NOT                           200
 #define SPIRV_OP_LABEL                         248
 #define SPIRV_OP_BRANCH                        249
 #define SPIRV_OP_RETURN                        253
@@ -110,15 +131,28 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define SPIRV_BUILTIN_VERTEX_INDEX             42
 #define SPIRV_BUILTIN_FRAG_COORD               15
 #define SPIRV_GLSL_STD450_ROUND                1
+#define SPIRV_GLSL_STD450_ROUND_EVEN           2
+#define SPIRV_GLSL_STD450_TRUNC                3
 #define SPIRV_GLSL_STD450_FABS                 4
+#define SPIRV_GLSL_STD450_SABS                 5
+#define SPIRV_GLSL_STD450_FSIGN                6
+#define SPIRV_GLSL_STD450_FLOOR                8
+#define SPIRV_GLSL_STD450_CEIL                 9
+#define SPIRV_GLSL_STD450_FRACT                10
 #define SPIRV_GLSL_STD450_SIN                  13
 #define SPIRV_GLSL_STD450_COS                  14
 #define SPIRV_GLSL_STD450_POW                  26
 #define SPIRV_GLSL_STD450_EXP                  27
 #define SPIRV_GLSL_STD450_LOG                  28
+#define SPIRV_GLSL_STD450_EXP2                 29
+#define SPIRV_GLSL_STD450_LOG2                 30
 #define SPIRV_GLSL_STD450_SQRT                 31
 #define SPIRV_GLSL_STD450_INVERSE_SQRT         32
 #define SPIRV_GLSL_STD450_FMIN                 37
+#define SPIRV_GLSL_STD450_UMIN                 38
+#define SPIRV_GLSL_STD450_SMIN                 39
+#define SPIRV_GLSL_STD450_UMAX                 41
+#define SPIRV_GLSL_STD450_SMAX                 42
 #define SPIRV_GLSL_STD450_FMAX                 40
 #define SPIRV_GLSL_STD450_FCLAMP               43
 
@@ -523,6 +557,21 @@ static forceinline uint32_t spirv_ext_inst2(spirv_module_t* module, uint32_t ty,
     return id;
 }
 
+static forceinline uint32_t spirv_ext_inst3(spirv_module_t* module, uint32_t ty, uint32_t instr, uint32_t a, uint32_t b,
+                                            uint32_t c)
+{
+    uint32_t id = spirv_seq_id(module);
+    spirv_push(module->func_body, SPIRV_OP_EXT_INST | (8 << 16));
+    spirv_push(module->func_body, ty);
+    spirv_push(module->func_body, id);
+    spirv_push(module->func_body, module->glsl_std_450);
+    spirv_push(module->func_body, instr);
+    spirv_push(module->func_body, a);
+    spirv_push(module->func_body, b);
+    spirv_push(module->func_body, c);
+    return id;
+}
+
 static forceinline uint32_t spirv_global_var(spirv_module_t* module, uint32_t ptr_ty, uint32_t storage)
 {
     uint32_t id = spirv_seq_id(module);
@@ -540,6 +589,41 @@ static forceinline uint32_t spirv_local_var(spirv_module_t* module, uint32_t ptr
     spirv_push(module->func_vars, ptr_ty);
     spirv_push(module->func_vars, id);
     spirv_push(module->func_vars, SPIRV_STORAGE_CLASS_FUNCTION);
+    return id;
+}
+
+static forceinline uint32_t spirv_type_const_bool(spirv_module_t* module, bool v)
+{
+    uint32_t ty = spirv_type_bool(module);
+    uint32_t id = spirv_seq_id(module);
+    spirv_push(module->globals, (v ? SPIRV_OP_CONSTANT_TRUE : SPIRV_OP_CONSTANT_FALSE) | (3 << 16));
+    spirv_push(module->globals, ty);
+    spirv_push(module->globals, id);
+    return id;
+}
+
+// Generic "OpXxx %ty %id operands..." in the function body.
+static forceinline uint32_t spirv_emit_op(spirv_module_t* module, uint32_t opcode, uint32_t ty, const uint32_t* ops,
+                                          uint32_t n)
+{
+    uint32_t id = spirv_seq_id(module);
+    spirv_push(module->func_body, opcode | ((3 + n) << 16));
+    spirv_push(module->func_body, ty);
+    spirv_push(module->func_body, id);
+    for (uint32_t i = 0; i < n; i++) {
+        spirv_push(module->func_body, ops[i]);
+    }
+    return id;
+}
+
+static forceinline uint32_t spirv_local_var_init(spirv_module_t* module, uint32_t ptr_ty, uint32_t init)
+{
+    uint32_t id = spirv_seq_id(module);
+    spirv_push(module->func_vars, SPIRV_OP_VARIABLE | (5 << 16));
+    spirv_push(module->func_vars, ptr_ty);
+    spirv_push(module->func_vars, id);
+    spirv_push(module->func_vars, SPIRV_STORAGE_CLASS_FUNCTION);
+    spirv_push(module->func_vars, init);
     return id;
 }
 

@@ -1251,10 +1251,26 @@ typedef enum {
 typedef struct {
     uint32_t*   spirv; // Owned, from spirv_module_finish().
     uint32_t    spirv_nwords;
-    rvvm_addr_t kernel_va;     // Kernel address the module was built from.
-    uint8_t     push_grf_base; // First GRF the module reads constants from.
-    bool        enabled;       // Stage enabled by its 3DSTATE_XS command.
-    bool        dirty;         // Kernel changed since the last draw.
+    rvvm_addr_t kernel_va;   // Kernel address to compile from.
+    rvvm_addr_t kernel_pdp4; // PPGTT root that address lives in.
+
+    // 3DSTATE_XS "Dispatch GRF Start Register", i.e. the first register the
+    // front end pushes this stage's constants into. 0 when the command has
+    // not been seen yet.
+    uint32_t dispatch_grf_start;
+
+    // What the cached module was built against. The kernel address alone is
+    // not enough of an identity: the same kernel dispatched with a
+    // different constant payload size or vertex layout needs a different
+    // module, because both move the payload windows it reads through.
+    rvvm_addr_t compiled_va;
+    uint32_t    compiled_grf_start;
+    uint32_t    compiled_const_bytes;
+    uint32_t    compiled_layout_sig;
+
+    uint8_t push_grf_base; // First GRF the module reads constants from.
+    bool    enabled;       // Stage enabled by its 3DSTATE_XS command.
+    bool    dirty;         // Kernel changed since the last draw.
 } xe2_shader_stage_t;
 
 // -----------------------------------------------------------
@@ -1738,6 +1754,32 @@ typedef struct {
     uint32_t dmc_base;
 } xe2_firmware_t;
 
+// Inter-stage varyings a cross-compiled pipeline carries. Both stages
+// declare exactly this many vec4s at Locations 0..N-1 whether or not the
+// kernel touches them: a fragment Input with no matching vertex Output is
+// an invalid pipeline, and the two stages are compiled independently, so
+// the only way to guarantee they line up is to make the set fixed.
+#define XE2_SHADER_MAX_VARYINGS 4
+
+// What the fixed-function front end hands a thread in its registers, and
+// where. Filled from the stage's 3DSTATE_XS dispatch fields plus the size
+// of the constant payload actually gathered for it, so a register read can
+// be classified without guessing - see xe2_spirv_classify_grf().
+typedef struct {
+    uint32_t push_grf_base;  // First GRF of the gathered constant payload.
+    uint32_t push_grf_count; // GRFs that payload occupies.
+    uint32_t attr_grf_base;  // First GRF of VF (VS) / SBE (PS) delivered data.
+    uint32_t attr_grf_count; // GRFs that data occupies.
+    uint32_t urb_handle_grf; // GRF holding the output URB handle (VS).
+} xe2_payload_layout_t;
+
+// How a register read resolves.
+typedef enum {
+    XE2_GRF_TEMP = 0, // The kernel's own value: a Function-local.
+    XE2_GRF_CONST,    // Pushed constant data: a uniform block load.
+    XE2_GRF_ATTR,     // Vertex attribute (VS) / interpolated varying (PS).
+} xe2_grf_class_t;
+
 typedef struct {
     spirv_module_t    mod;
     xe2_shader_kind_t stage;
@@ -1748,19 +1790,21 @@ typedef struct {
     uint32_t v4ty; // vec4 float
     uint32_t func;
 
-    uint32_t in_f_ptr;
-    uint32_t varying_in;
-    uint32_t varying_out;
+    xe2_payload_layout_t payload;
 
     // Register file. grf_var is filled lazily, grf_written tracks which
-    // registers the kernel has defined so far in program order.
+    // registers the kernel has defined so far in program order - a payload
+    // register the kernel has written is its own temporary from then on.
     uint32_t grf_var[XE2_SHADER_MAX_GRF][XE2_GRF_DWORDS];
     bool     grf_written[XE2_SHADER_MAX_GRF][XE2_GRF_DWORDS];
-    bool     pre_written[XE2_SHADER_MAX_GRF];
-    uint32_t const_grf_end;
-    uint32_t push_grf_base;
 
-    uint32_t urb_slot;
+    // Integer tracking for URB addresses. On Xe2 a URB write is an LSC
+    // store whose address is the thread's URB handle plus (VUE slot * 16)
+    // bytes, and that add happens in the kernel rather than in the message
+    // descriptor, so the destination slot is only recoverable by following
+    // the handle through the movs and adds that build the address.
+    bool     grf_urb_addr[XE2_SHADER_MAX_GRF];
+    uint32_t grf_urb_offset[XE2_SHADER_MAX_GRF]; // Bytes past the handle.
 
     // Pushed constants, bound as a uniform block (see gpu-vulkan.h for
     // the descriptor layout the backend builds to match).
@@ -1769,21 +1813,32 @@ typedef struct {
 
     uint32_t position_out; // BuiltIn Position (VS).
     uint32_t color_out;    // Location 0 (PS).
-    bool     wrote_output;
-    bool     wrote_varying;
+    bool     wrote_position;
+    bool     wrote_color;
 
-    // Vertex attribute inputs (VS only). Modelled as a "push" layout:
-    // one Input vec4 per element, read through the GRF range right
-    // after the constant window - see xe2_spirv_declare_attribs().
+    // Inter-stage varyings: Outputs for a VS, Inputs for a PS.
+    uint32_t varying[XE2_SHADER_MAX_VARYINGS];
+    bool     wrote_varying[XE2_SHADER_MAX_VARYINGS];
+    uint32_t varying_elem_ptr; // Pointer to one float inside a varying.
+
+    // Vertex attribute inputs (VS only), one vec4 Input per element.
     uint32_t attr_var[XE2_SHADER_MAX_BINDINGS];
     uint32_t attr_elem_ptr; // Pointer to one float inside an attr_var.
     uint32_t attr_count;
-    uint32_t attr_grf_base;
 
-    uint32_t entry_iface[XE2_SHADER_MAX_BINDINGS + 1];
+    uint32_t entry_iface[XE2_SHADER_MAX_BINDINGS + XE2_SHADER_MAX_VARYINGS + 2];
     size_t   entry_iface_n;
 
     bool saw_eot;
+
+    // Flags (f<r>.<s>, lane 0), if-conversion mask and opcode being emitted.
+    uint32_t flag[2][2]; // SSA bool, 0 = never written
+    uint32_t mask;       // current predicate mask (bool id, 0 = all on)
+    uint32_t mask_parent[16];
+    uint32_t mask_cond[16];
+    uint32_t mask_depth;
+    uint32_t cur_op;
+    bool     warned_cf;
 } xe2_spirv_ctx_t;
 
 typedef struct {
@@ -3010,6 +3065,16 @@ static void xe2_guc_g2h_event(xe2_dev_t* xe2, uint32_t action, const uint32_t* p
 #define XE2_BRW_MASK_CONTROL_BIT           31
 #define XE2_BRW_SATURATE_BIT               34
 #define XE2_BRW_DEBUG_CONTROL_BIT          30
+// Conditional modifier values (the field shared by cmp/sel/cond-mod and,
+// for MATH, by the function control - see xe2_brw_math_fc()).
+#define XE2_BRW_CONDITIONAL_NONE           0
+#define XE2_BRW_CONDITIONAL_Z              1
+#define XE2_BRW_CONDITIONAL_NZ             2
+#define XE2_BRW_CONDITIONAL_G              3
+#define XE2_BRW_CONDITIONAL_GE             4
+#define XE2_BRW_CONDITIONAL_L              5
+#define XE2_BRW_CONDITIONAL_LE             6
+
 #define XE2_BRW_COND_MODIFIER_HI           95
 #define XE2_BRW_COND_MODIFIER_LO           92
 #define XE2_BRW_SWSB_HI                    17
@@ -3120,8 +3185,15 @@ static void xe2_guc_g2h_event(xe2_dev_t* xe2, uint32_t action, const uint32_t* p
 // SEND/SENDC native instruction fields.
 #define XE2_BRW_SEND_SRC1_REG_NR_HI        111
 #define XE2_BRW_SEND_SRC1_REG_NR_LO        104
+// Extended descriptor bits [10:6]; the low four are the src1 payload length
+// in registers (Mesa's brw_message_ex_desc_ex_mlen()).
 #define XE2_BRW_SEND_SRC1_LEN_HI           103
 #define XE2_BRW_SEND_SRC1_LEN_LO           99
+// Message descriptor bits [28:25], the src0 payload length in registers.
+// The descriptor is scattered across the instruction on Gfx12+ (Mesa's
+// MD12() mapping), which is why these two are nowhere near the pair above.
+#define XE2_BRW_SEND_SRC0_LEN_HI           70
+#define XE2_BRW_SEND_SRC0_LEN_LO           67
 #define XE2_BRW_SEND_SRC1_REG_FILE_BIT     98
 #define XE2_BRW_SEND_SFID_HI               95
 #define XE2_BRW_SEND_SFID_LO               92
@@ -3133,7 +3205,10 @@ static void xe2_guc_g2h_event(xe2_dev_t* xe2, uint32_t action, const uint32_t* p
 #define XE2_BRW_SEND_DST_REG_FILE_BIT      50
 #define XE2_BRW_SEND_EOT_BIT               34
 
-// Compacted (8-byte) instructions
+// Compacted (8-byte) instruction fields, Gfx12+ layout (Mesa's
+// brw_compact_inst_* accessors). These are not the Gfx8 positions: every
+// field but the opcode moved, so a compacted instruction read with the older
+// layout decodes as a different instruction entirely.
 #define XE2_BRW_C_CONTROL_INDEX_HI         22
 #define XE2_BRW_C_CONTROL_INDEX_LO         18
 #define XE2_BRW_C_DATATYPE_LO_HI           28
@@ -3436,7 +3511,8 @@ static const uint16_t xe2_subreg_table[16] = {
     0b010010000000, // .0 .36
 };
 
-static const uint16_t xe2_src0_index_table[8] = {
+// Ported verbatim from Mesa's xehp_src0_index_table[] (12-bit packed fields).
+static const uint16_t xe2_src0_index_table[16] = {
     0b00100000000, //  r<1;1,0>
     0b00000000000, //  r<0;1,0>
     0b01000000000, //  r<2;1,0>
@@ -3447,6 +3523,7 @@ static const uint16_t xe2_src0_index_table[8] = {
     0b01001000000, //  r<2;4,0>
 };
 
+// Ported verbatim from Mesa's xehp_src1_index_table[] (12-bit packed fields).
 static const uint16_t xe2_src1_index_table[16] = {
     0b0000100000000000, //  r<1;1,0>.0
     0b0000000000000000, //  r<0;1,0>.0
@@ -3467,9 +3544,7 @@ static const uint16_t xe2_src1_index_table[16] = {
 };
 
 static const uint32_t xe2_brw_hstride_decode[4] = {0, 1, 2, 4};
-
-static const uint32_t xe2_brw_width_decode[8] = {1, 2, 4, 8, 16, 32, 0, 0};
-
+static const uint32_t xe2_brw_width_decode[8]   = {1, 2, 4, 8, 16, 32, 0, 0};
 static const uint32_t xe2_brw_vstride_decode[8] = {0, 1, 2, 4, 8, 16, 32, 64};
 
 // Decoded operand used by the emitter (register number + modifiers).
@@ -3484,6 +3559,7 @@ typedef struct {
     uint8_t  hstride;
     uint8_t  vstride;
     uint8_t  width;
+    uint8_t  hwtype; // (class<<2)|log2(bytes); class 0=U 1=S 2=F
 } xe2_brw_operand_t;
 
 static forceinline uint32_t xe2_brw_parse_dst(const xe2_qword_t* qw)
@@ -3491,34 +3567,37 @@ static forceinline uint32_t xe2_brw_parse_dst(const xe2_qword_t* qw)
     return xe2_brw_mask(qw, XE2_BRW_DST_REG_NR_LO, XE2_BRW_DST_REG_NR_HI);
 }
 
+// Channels the instruction executes, from its execution size field.
+static forceinline uint32_t xe2_brw_exec_size(const xe2_qword_t* qw)
+{
+    return 1u << xe2_brw_mask(qw, XE2_BRW_EXEC_SIZE_LO, XE2_BRW_EXEC_SIZE_HI);
+}
+
 // Module scaffolding for a guest kernel cross-compiled to SPIR-V: the
 // register file, the pushed constant block, the stage's inputs/outputs
-// and the entry point. The BRW instruction translation itself lives in
-// gpu-xe2.c and drives this through the load/store helpers below.
+// and the entry point. The BRW instruction translation itself drives this
+// through the load/store helpers below.
 //
-// Register model. A GRF is one Function-local float. That is a heavy
-// simplification of a 64-byte SIMD register, but it matches how the
-// instruction translation treats operands today, and it keeps the
-// constant binding below honest: what matters for constants is which
-// (register, subregister) pair a read names, and that is modelled
-// exactly.
+// Register model. A GRF is XE2_GRF_DWORDS independent floats, one per
+// subregister dword, and only lane 0 of each is modelled. That is a heavy
+// simplification of a 64-byte SIMD register, but a SPIR-V invocation *is*
+// one lane, so for straight-line arithmetic it is the right shape: what
+// matters is which (register, subregister) pair a read names, and that is
+// modelled exactly.
 //
-// Constant binding. Xe2 dispatches a thread with the gathered constant
-// buffers already resident in the GRFs that follow the fixed payload
-// registers (see xe2_push_const_grf_base). A kernel therefore reads its
-// uniforms as plain register reads. We recover that: a read of a
-// register at or above the stage's push constant base that the kernel
-// has not written yet is a read of pushed constant data, and compiles
-// into a load from the uniform block. Registers the kernel wrote first
-// are its own temporaries and stay Function-local, so scratch use of
-// high registers keeps working.
+// Payload binding. Xe2 dispatches a thread with the fixed-function front
+// end's data already resident in its registers: r0 is the dispatch header,
+// the stage's own payload registers follow, then the gathered constant
+// buffers, then the vertex data (VS) or attribute setup (PS). So a kernel
+// reads its uniforms and its inputs as plain register reads, and recovering
+// them is a matter of knowing where each window starts.
 //
-// Vertex attribute binding (VS only) reuses the same trick one GRF
-// window further out: xe2_spirv_declare_attribs() reserves the range
-// right after the constant window, and an unwritten read there loads
-// from a per-element Input variable instead of a Function-local. See
-// xe2_spirv_grf_is_attr().
-
+// Both boundaries come from state the device already sees rather than from
+// a guess: the first window's base is the stage's "Dispatch GRF Start
+// Register" field in 3DSTATE_VS/3DSTATE_PS, and its length is the size of
+// the payload 3DSTATE_CONSTANT_XS asked us to gather, so the second window
+// starts right after it. See xe2_payload_layout_for() and
+// xe2_spirv_classify_grf().
 
 // Descriptor set/binding the pushed constants of a stage are bound at.
 // One set, one binding per stage, so a pipeline can carry the constants
@@ -3526,88 +3605,19 @@ static forceinline uint32_t xe2_brw_parse_dst(const xe2_qword_t* qw)
 #define XE2_SHADER_CONST_SET           0
 #define XE2_SHADER_CONST_BINDING(kind) ((uint32_t)(kind))
 
-static forceinline void xe2_spirv_add_iface(xe2_spirv_ctx_t* ctx, uint32_t var)
-{
-    // SPIR-V 1.3 entry points list Input and Output variables only;
-    // globals in other storage classes joined the interface in 1.4.
-    if (ctx->entry_iface_n < STATIC_ARRAY_SIZE(ctx->entry_iface)) {
-        ctx->entry_iface[ctx->entry_iface_n++] = var;
-    }
-}
-
-// Declares the stage's outputs. Non-attribute inputs are still not
-// wired: a PS's interpolated varyings and a HS/DS/GS's inter-stage URB
-// reads have no consumer, so those resolve to undefined Function-locals.
-// A VS's vertex attributes are the one input this does model - see
-// xe2_spirv_declare_attribs(), called separately for that stage.
-static forceinline void xe2_spirv_declare_io(xe2_spirv_ctx_t* ctx)
-{
-    uint32_t out_v4 = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_OUTPUT, ctx->v4ty);
-    uint32_t in_v4  = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->v4ty);
-
-    if (ctx->stage == XE2_SHADER_PS) {
-        ctx->color_out = spirv_global_var(&ctx->mod, out_v4, SPIRV_STORAGE_CLASS_OUTPUT);
-        spirv_decorate_1(&ctx->mod, ctx->color_out, SPIRV_DECORATION_LOCATION, 0);
-        spirv_name(&ctx->mod, ctx->color_out, "out_color");
-        xe2_spirv_add_iface(ctx, ctx->color_out);
-
-        // Interpolated varying. Must match the VS varying_out type exactly
-        // (vec4 at Location 0) or the validation layers complain.
-        ctx->in_f_ptr   = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->fty);
-        ctx->varying_in = spirv_global_var(&ctx->mod, in_v4, SPIRV_STORAGE_CLASS_INPUT);
-        spirv_decorate_1(&ctx->mod, ctx->varying_in, SPIRV_DECORATION_LOCATION, 0);
-        spirv_name(&ctx->mod, ctx->varying_in, "in_varying0");
-        xe2_spirv_add_iface(ctx, ctx->varying_in);
-    } else {
-        ctx->position_out = spirv_global_var(&ctx->mod, out_v4, SPIRV_STORAGE_CLASS_OUTPUT);
-        spirv_decorate_1(&ctx->mod, ctx->position_out, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
-        spirv_name(&ctx->mod, ctx->position_out, "out_position");
-        xe2_spirv_add_iface(ctx, ctx->position_out);
-
-        ctx->varying_out = spirv_global_var(&ctx->mod, out_v4, SPIRV_STORAGE_CLASS_OUTPUT);
-        spirv_decorate_1(&ctx->mod, ctx->varying_out, SPIRV_DECORATION_LOCATION, 0);
-        spirv_name(&ctx->mod, ctx->varying_out, "out_varying0");
-        xe2_spirv_add_iface(ctx, ctx->varying_out);
-    }
-}
-
-// Declares one Input vec4 per vertex element, so a VS kernel's payload
-// reads (see xe2_spirv_grf_is_attr below) resolve to real per-vertex
-// data instead of an undefined Function-local. Modelled as a push
-// layout: attributes occupy the GRF range right after the reserved
-// constant window, one GRF-worth of vec4 per element - the same "4
-// consecutive scalar GRFs = 1 vec4" convention xe2_spirv_load_grf_vec4
-// already uses for outputs, just for inputs.
-static forceinline void xe2_spirv_declare_attribs(xe2_spirv_ctx_t* ctx, const xe2_vertex_input_t* vi)
-{
-    ctx->attr_grf_base = ctx->push_grf_base + XE2_CONST_MAX_DWORDS / XE2_GRF_DWORDS;
-    ctx->attr_count    = vi ? EVAL_MIN(vi->element_count, XE2_SHADER_MAX_BINDINGS) : 0;
-    if (!ctx->attr_count) {
-        return;
-    }
-    uint32_t in_v4     = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->v4ty);
-    ctx->attr_elem_ptr = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->fty);
-    for (uint32_t i = 0; i < ctx->attr_count; ++i) {
-        ctx->attr_var[i] = spirv_global_var(&ctx->mod, in_v4, SPIRV_STORAGE_CLASS_INPUT);
-        spirv_decorate_1(&ctx->mod, ctx->attr_var[i], SPIRV_DECORATION_LOCATION, vi->element[i].location);
-        spirv_name(&ctx->mod, ctx->attr_var[i], "in_attr");
-        xe2_spirv_add_iface(ctx, ctx->attr_var[i]);
-    }
-}
-
-// First GRF holding pushed constants, per stage. r0 is the dispatch
-// header; the stage-specific payload registers follow it, and the
-// gathered constants come after those. These are the defaults for a
-// plain SIMD dispatch - they are copied into xe2_shader_stage_t at
-// compile time so a stage can later derive its own base from the real
-// dispatch state (3DSTATE_VS/PS payload fields) without touching the
-// SPIR-V emitter.
+// First GRF holding pushed constants, per stage, when the dispatch state
+// has not been captured. r0 is the dispatch header; the stage-specific
+// payload registers follow it, and the gathered constants come after those:
 //
 //   VS  r0 header, r1 URB handles          -> r2
 //   HS  r0 header, r1 URB handles, r2 ids  -> r3
 //   DS  r0 header, r1 URB handles          -> r2
 //   GS  r0 header, r1 URB handles          -> r2
-//   PS  r0 header, r1 barycentric setup    -> r2
+//   PS  r0 header + pixel coords, r1.. barycentrics (only the ones
+//       3DSTATE_PS_EXTRA enables, so this one really does move)  -> r2
+//
+// These are only fallbacks. The real value is whatever the driver
+// programmed, which xe2_payload_layout_for() prefers when it is available.
 static inline uint32_t xe2_push_const_grf_base(xe2_shader_kind_t kind)
 {
     switch (kind) {
@@ -3641,16 +3651,130 @@ static inline const char* xe2_shader_kind_to_string(xe2_shader_kind_t kind)
     }
 }
 
+// GRFs per vertex attribute slot, VS. The vertex fetcher delivers one
+// register per component at the SIMD width the stage is dispatched at, so a
+// vec4 attribute is four consecutive registers (Mesa's
+// assign_vs_urb_setup(): "Each attribute is 4 regs").
+#define XE2_VS_ATTR_GRFS_PER_SLOT  4
+
+// Attribute setup components packed per GRF, PS, and the dword stride of
+// one component's plane parameters inside it. The setup block hands the
+// shader three plane parameters per input component - a0, a1-a0, a2-a0 -
+// packed into 12 bytes, five components to a 64-byte register (Mesa's
+// assign_urb_setup(): "Gfx20+ is able to pack 5 logical input components
+// per 64B register").
+#define XE2_PS_SETUP_COMPS_PER_GRF 5
+#define XE2_PS_SETUP_PARAM_DWORDS  3
+
+static forceinline void xe2_spirv_add_iface(xe2_spirv_ctx_t* ctx, uint32_t var)
+{
+    // SPIR-V 1.3 entry points list Input and Output variables only;
+    // globals in other storage classes joined the interface in 1.4.
+    if (ctx->entry_iface_n < STATIC_ARRAY_SIZE(ctx->entry_iface)) {
+        ctx->entry_iface[ctx->entry_iface_n++] = var;
+    }
+}
+
+// Declares the stage's outputs and the inter-stage varyings. A VS gets
+// BuiltIn Position plus XE2_SHADER_MAX_VARYINGS vec4 Outputs, a PS the
+// matching vec4 Inputs plus the colour attachment. The varying set is the
+// same on both sides on purpose, see XE2_SHADER_MAX_VARYINGS.
+static forceinline void xe2_spirv_declare_io(xe2_spirv_ctx_t* ctx)
+{
+    uint32_t out_v4 = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_OUTPUT, ctx->v4ty);
+    uint32_t in_v4  = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->v4ty);
+    bool     is_ps  = ctx->stage == XE2_SHADER_PS;
+
+    ctx->varying_elem_ptr
+        = spirv_type_ptr(&ctx->mod, is_ps ? SPIRV_STORAGE_CLASS_INPUT : SPIRV_STORAGE_CLASS_OUTPUT, ctx->fty);
+
+    if (is_ps) {
+        ctx->color_out = spirv_global_var(&ctx->mod, out_v4, SPIRV_STORAGE_CLASS_OUTPUT);
+        spirv_decorate_1(&ctx->mod, ctx->color_out, SPIRV_DECORATION_LOCATION, 0);
+        spirv_name(&ctx->mod, ctx->color_out, "out_color");
+        xe2_spirv_add_iface(ctx, ctx->color_out);
+    } else {
+        ctx->position_out = spirv_global_var(&ctx->mod, out_v4, SPIRV_STORAGE_CLASS_OUTPUT);
+        spirv_decorate_1(&ctx->mod, ctx->position_out, SPIRV_DECORATION_BUILTIN, SPIRV_BUILTIN_POSITION);
+        spirv_name(&ctx->mod, ctx->position_out, "out_position");
+        xe2_spirv_add_iface(ctx, ctx->position_out);
+    }
+
+    for (uint32_t i = 0; i < XE2_SHADER_MAX_VARYINGS; ++i) {
+        ctx->varying[i] = spirv_global_var(&ctx->mod, is_ps ? in_v4 : out_v4,
+                                           is_ps ? SPIRV_STORAGE_CLASS_INPUT : SPIRV_STORAGE_CLASS_OUTPUT);
+        spirv_decorate_1(&ctx->mod, ctx->varying[i], SPIRV_DECORATION_LOCATION, i);
+        spirv_name(&ctx->mod, ctx->varying[i], is_ps ? "in_varying" : "out_varying");
+        xe2_spirv_add_iface(ctx, ctx->varying[i]);
+    }
+}
+
+// Declares one Input vec4 per vertex element, so a VS kernel's payload
+// reads resolve to real per-vertex data instead of an undefined local.
+static forceinline void xe2_spirv_declare_attribs(xe2_spirv_ctx_t* ctx, const xe2_vertex_input_t* vi)
+{
+    ctx->attr_count = vi ? EVAL_MIN(vi->element_count, XE2_SHADER_MAX_BINDINGS) : 0;
+    if (!ctx->attr_count) {
+        return;
+    }
+    uint32_t in_v4     = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->v4ty);
+    ctx->attr_elem_ptr = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_INPUT, ctx->fty);
+    for (uint32_t i = 0; i < ctx->attr_count; ++i) {
+        ctx->attr_var[i] = spirv_global_var(&ctx->mod, in_v4, SPIRV_STORAGE_CLASS_INPUT);
+        spirv_decorate_1(&ctx->mod, ctx->attr_var[i], SPIRV_DECORATION_LOCATION, vi->element[i].location);
+        spirv_name(&ctx->mod, ctx->attr_var[i], "in_attr");
+        xe2_spirv_add_iface(ctx, ctx->attr_var[i]);
+    }
+}
+
+// Works out where the fixed-function front end put this stage's constant
+// payload and its input data. `dispatch_grf_start` is the stage's "Dispatch
+// GRF Start Register" field as the driver programmed it (0 when we never
+// saw the command), `const_bytes` the payload size 3DSTATE_CONSTANT_XS
+// asked for, and `attr_slots` the number of vertex elements (VS) or
+// varyings (PS) the data block covers.
+static inline xe2_payload_layout_t xe2_payload_layout_for(xe2_shader_kind_t kind, uint32_t dispatch_grf_start,
+                                                          uint32_t const_bytes, uint32_t attr_slots)
+{
+    xe2_payload_layout_t l = {0};
+
+    l.push_grf_base = dispatch_grf_start ? dispatch_grf_start : xe2_push_const_grf_base(kind);
+    if (l.push_grf_base >= XE2_SHADER_MAX_GRF) {
+        l.push_grf_base = xe2_push_const_grf_base(kind);
+    }
+    // The URB handles a vertex-pipeline thread writes its output through are
+    // delivered in r1, right after the dispatch header. That position is
+    // architectural, so it is not derived from push_grf_base: a stage that
+    // happened to push its constants further out would otherwise move the
+    // handle too, and the VUE slot of every URB write would come out wrong.
+    l.urb_handle_grf = 1;
+
+    if (const_bytes > XE2_CONST_MAX_BYTES) {
+        const_bytes = XE2_CONST_MAX_BYTES;
+    }
+    l.push_grf_count = (const_bytes + XE2_GRF_BYTES - 1) / XE2_GRF_BYTES;
+    l.attr_grf_base  = l.push_grf_base + l.push_grf_count;
+
+    if (kind == XE2_SHADER_PS) {
+        uint32_t comps   = attr_slots * 4;
+        l.attr_grf_count = (comps + XE2_PS_SETUP_COMPS_PER_GRF - 1) / XE2_PS_SETUP_COMPS_PER_GRF;
+    } else {
+        l.attr_grf_count = attr_slots * XE2_VS_ATTR_GRFS_PER_SLOT;
+    }
+
+    return l;
+}
+
 // Starts a module for one kernel. Everything the translation needs is
 // live once this returns: base types, the constant block, the stage
-// outputs and an open entry function. `vi` is the current vertex
+// inputs/outputs and an open entry function. `vi` is the current vertex
 // layout; only read for stage == XE2_SHADER_VS, ignored (may be NULL)
 // otherwise.
-static forceinline void xe2_spirv_begin(xe2_spirv_ctx_t* ctx, xe2_shader_kind_t stage, const xe2_vertex_input_t* vi)
+static forceinline void xe2_spirv_begin(xe2_spirv_ctx_t* ctx, xe2_shader_kind_t stage, const xe2_vertex_input_t* vi,
+                                        uint32_t dispatch_grf_start, uint32_t const_bytes)
 {
     memset(ctx, 0, sizeof(*ctx));
-    ctx->stage         = stage;
-    ctx->push_grf_base = xe2_push_const_grf_base(stage);
+    ctx->stage = stage;
 
     spirv_module_init(&ctx->mod);
     spirv_module_begin(&ctx->mod);
@@ -3669,6 +3793,17 @@ static forceinline void xe2_spirv_begin(xe2_spirv_ctx_t* ctx, xe2_shader_kind_t 
         xe2_spirv_declare_attribs(ctx, vi);
     }
 
+    uint32_t attr_slots = (stage == XE2_SHADER_PS) ? XE2_SHADER_MAX_VARYINGS : ctx->attr_count;
+    ctx->payload        = xe2_payload_layout_for(stage, dispatch_grf_start, const_bytes, attr_slots);
+
+    // Worth reading against a disassembly of the kernel: if the registers
+    // it actually reads its uniforms and inputs from fall outside these
+    // ranges, every such read compiles to an undefined value and the stage
+    // produces nothing useful.
+    rvvm_info("(kind: %s) payload: %u constant bytes in %u GRF(s) from r%u, %u input GRF(s) from r%u, URB handle r%u",
+              xe2_shader_kind_to_string(stage), const_bytes, ctx->payload.push_grf_count, ctx->payload.push_grf_base,
+              ctx->payload.attr_grf_count, ctx->payload.attr_grf_base, ctx->payload.urb_handle_grf);
+
     ctx->func = spirv_func_begin(&ctx->mod, ctx->void_ty, ctx->fn_ty);
 }
 
@@ -3680,16 +3815,16 @@ static forceinline uint32_t xe2_spirv_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, ui
     }
     sub &= XE2_GRF_DWORDS - 1;
     if (!ctx->grf_var[grf][sub]) {
-        uint32_t pty           = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_FUNCTION, ctx->fty);
-        ctx->grf_var[grf][sub] = spirv_local_var(&ctx->mod, pty);
+        uint32_t u32           = spirv_type_uint32(&ctx->mod);
+        uint32_t pty           = spirv_type_ptr(&ctx->mod, SPIRV_STORAGE_CLASS_FUNCTION, u32);
+        ctx->grf_var[grf][sub] = spirv_local_var_init(&ctx->mod, pty, spirv_type_const_uint32(&ctx->mod, 0));
     }
     return ctx->grf_var[grf][sub];
 }
 
 // Dword offset into the gathered payload that a (GRF, subregister) pair
-// addresses. Only meaningful for registers at or above the stage's push
-// constant base; the caller checks that and the XE2_CONST_MAX_DWORDS
-// bound before using the result.
+// addresses. The hardware pushes the payload as a flat byte image, so a
+// register step is one GRF's worth of dwords.
 static inline uint32_t xe2_const_dword_index(uint32_t grf, uint32_t subreg, uint32_t push_grf_base)
 {
     return (grf - push_grf_base) * XE2_GRF_DWORDS + subreg;
@@ -3700,19 +3835,34 @@ static forceinline bool xe2_spirv_is_written(const xe2_spirv_ctx_t* ctx, uint32_
     return grf < XE2_SHADER_MAX_GRF && ctx->grf_written[grf][sub & (XE2_GRF_DWORDS - 1)];
 }
 
-static forceinline bool xe2_spirv_grf_is_const(const xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg)
+// Decides what a read of (grf, subreg) names. A register the kernel has
+// already written is its own temporary even when it started out holding
+// payload data - the register allocator reuses payload registers once the
+// front end's data in them is dead.
+static forceinline xe2_grf_class_t xe2_spirv_classify_grf(const xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg)
 {
-    if (grf >= XE2_SHADER_MAX_GRF || grf < ctx->push_grf_base || xe2_spirv_is_written(ctx, grf, subreg)) {
-        return false;
+    const xe2_payload_layout_t* l = &ctx->payload;
+
+    if (grf >= XE2_SHADER_MAX_GRF || xe2_spirv_is_written(ctx, grf, subreg)) {
+        return XE2_GRF_TEMP;
     }
-    return xe2_const_dword_index(grf, subreg, ctx->push_grf_base) < XE2_CONST_MAX_DWORDS;
+    if (grf >= l->push_grf_base && grf < l->push_grf_base + l->push_grf_count) {
+        if (xe2_const_dword_index(grf, subreg, l->push_grf_base) < XE2_CONST_MAX_DWORDS) {
+            return XE2_GRF_CONST;
+        }
+        return XE2_GRF_TEMP;
+    }
+    if (l->attr_grf_count && grf >= l->attr_grf_base && grf < l->attr_grf_base + l->attr_grf_count) {
+        return XE2_GRF_ATTR;
+    }
+    return XE2_GRF_TEMP;
 }
 
 // Loads one dword of pushed constant data as a float. The block is a
 // vec4 array, so the dword index splits into (element, component).
 static forceinline uint32_t xe2_spirv_load_const(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg)
 {
-    uint32_t dword      = xe2_const_dword_index(grf, subreg, ctx->push_grf_base);
+    uint32_t dword      = xe2_const_dword_index(grf, subreg, ctx->payload.push_grf_base);
     uint32_t indices[3] = {
         spirv_type_const_uint32(&ctx->mod, 0), // Block member 0: the array.
         spirv_type_const_uint32(&ctx->mod, dword / 4),
@@ -3723,66 +3873,73 @@ static forceinline uint32_t xe2_spirv_load_const(xe2_spirv_ctx_t* ctx, uint32_t 
     return spirv_op_load(&ctx->mod, ctx->fty, ptr);
 }
 
-// True when a read of this register names fetched vertex-attribute data
-// (VS only) rather than a value the kernel produced. Same "kernel
-// hasn't overwritten it yet" rule as xe2_spirv_grf_is_const; the two
-// ranges are disjoint by construction (attr_grf_base sits right past
-// the constant window), so a register is never both.
-static forceinline bool xe2_spirv_grf_is_attr(const xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg,
-                                              uint32_t* attr_idx, uint32_t* component)
+// Loads one component (x/y/z/w) of a vec4 Input variable.
+static forceinline uint32_t xe2_spirv_load_vec4_component(xe2_spirv_ctx_t* ctx, uint32_t ptr_ty, uint32_t var,
+                                                          uint32_t component)
 {
-    if (!ctx->attr_count || grf < ctx->attr_grf_base || grf >= XE2_SHADER_MAX_GRF
-        || xe2_spirv_is_written(ctx, grf, subreg)) {
-        return false;
-    }
-    uint32_t rel = grf - ctx->attr_grf_base;
-    if (rel / 4 >= ctx->attr_count) {
-        return false;
-    }
-    *attr_idx  = rel / 4;
-    *component = rel % 4;
-    return true;
-}
-
-// Loads one component (x/y/z/w) of a vertex attribute Input variable.
-static forceinline uint32_t xe2_spirv_load_attr(xe2_spirv_ctx_t* ctx, uint32_t idx, uint32_t component)
-{
-    uint32_t comp = spirv_type_const_uint32(&ctx->mod, component);
-    uint32_t ptr  = spirv_access_chain(&ctx->mod, ctx->attr_elem_ptr, ctx->attr_var[idx], &comp, 1);
+    uint32_t comp = spirv_type_const_uint32(&ctx->mod, component & 3);
+    uint32_t ptr  = spirv_access_chain(&ctx->mod, ptr_ty, var, &comp, 1);
     return spirv_op_load(&ctx->mod, ctx->fty, ptr);
 }
 
-// PS payload r1 = "barycentric setup". Emulation model: 4 components x
-// 3 plane-equation dwords (A, B, C): value = A*x + B*y + C. We feed the
-// rasterizer-interpolated Location 0 input in as the C term and A = B = 0,
-// so any A*x+B*y+C math in the kernel collapses to the interpolated value.
-// Your trace reads r1.0, r1.3, r1.6, r1.9 -> components 0..3.
-static forceinline uint32_t xe2_spirv_load_ps_plane(xe2_spirv_ctx_t* ctx, uint32_t sub)
+// VS: a vertex attribute component. The vertex fetcher lays the slots out
+// as XE2_VS_ATTR_GRFS_PER_SLOT consecutive registers, one per component.
+static forceinline uint32_t xe2_spirv_load_vs_attr(xe2_spirv_ctx_t* ctx, uint32_t grf)
 {
-    uint32_t comp = sub / 3;
-    if (comp >= 4 || (sub % 3) != 0) {
+    uint32_t rel  = grf - ctx->payload.attr_grf_base;
+    uint32_t idx  = rel / XE2_VS_ATTR_GRFS_PER_SLOT;
+    uint32_t comp = rel % XE2_VS_ATTR_GRFS_PER_SLOT;
+
+    if (idx >= ctx->attr_count) {
+        return spirv_type_const_float32(&ctx->mod, comp == 3 ? 1.0f : 0.0f);
+    }
+    return xe2_spirv_load_vec4_component(ctx, ctx->attr_elem_ptr, ctx->attr_var[idx], comp);
+}
+
+// PS: one plane parameter of one interpolated input component. The setup
+// block holds three parameters per component - a0, a1-a0, a2-a0 - so the
+// shader can evaluate a0 + (a1-a0)*bary.x + (a2-a0)*bary.y itself, and
+// reads a0 alone for a flat input.
+//
+// We have no barycentrics to offer, but we do have the rasterizer: hand
+// back the interpolated varying as a0 and zero for both deltas. A flat
+// read then yields the interpolated value directly, and so does the full
+// interpolation, because the terms it adds are zero either way.
+static forceinline uint32_t xe2_spirv_load_ps_setup(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg)
+{
+    uint32_t rel   = grf - ctx->payload.attr_grf_base;
+    uint32_t comp  = subreg / XE2_PS_SETUP_PARAM_DWORDS;
+    uint32_t param = subreg % XE2_PS_SETUP_PARAM_DWORDS;
+
+    if (param != 0 || comp >= XE2_PS_SETUP_COMPS_PER_GRF) {
         return spirv_type_const_float32(&ctx->mod, 0.0f);
     }
-    uint32_t idx = spirv_type_const_uint32(&ctx->mod, comp);
-    uint32_t ptr = spirv_access_chain(&ctx->mod, ctx->in_f_ptr, ctx->varying_in, &idx, 1);
-    return spirv_op_load(&ctx->mod, ctx->fty, ptr);
+
+    uint32_t idx      = rel * XE2_PS_SETUP_COMPS_PER_GRF + comp;
+    uint32_t location = idx / 4;
+    if (location >= XE2_SHADER_MAX_VARYINGS) {
+        return spirv_type_const_float32(&ctx->mod, 0.0f);
+    }
+    return xe2_spirv_load_vec4_component(ctx, ctx->varying_elem_ptr, ctx->varying[location], idx % 4);
 }
 
-static forceinline uint32_t xe2_spirv_load_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg, bool scalar,
-                                               bool neg, bool abs)
+static forceinline uint32_t xe2_spirv_load_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t subreg, bool neg, bool abs)
 {
-    uint32_t attr_idx  = 0;
-    uint32_t attr_comp = 0;
-    uint32_t id        = 0;
+    uint32_t id = 0;
 
-    if (scalar && xe2_spirv_grf_is_const(ctx, grf, subreg)) {
-        id = xe2_spirv_load_const(ctx, grf, subreg);
-    } else if (!scalar && xe2_spirv_grf_is_attr(ctx, grf, subreg, &attr_idx, &attr_comp)) {
-        id = xe2_spirv_load_attr(ctx, attr_idx, attr_comp);
-    } else if (ctx->stage == XE2_SHADER_PS && grf == 1 && ctx->varying_in && !xe2_spirv_is_written(ctx, 1, subreg)) {
-        id = xe2_spirv_load_ps_plane(ctx, subreg);
-    } else {
-        id = spirv_op_load(&ctx->mod, ctx->fty, xe2_spirv_grf(ctx, grf, subreg));
+    switch (xe2_spirv_classify_grf(ctx, grf, subreg)) {
+        case XE2_GRF_CONST:
+            id = xe2_spirv_load_const(ctx, grf, subreg);
+            break;
+        case XE2_GRF_ATTR:
+            id = (ctx->stage == XE2_SHADER_PS) ? xe2_spirv_load_ps_setup(ctx, grf, subreg)
+                                               : xe2_spirv_load_vs_attr(ctx, grf);
+            break;
+        default:
+            id = spirv_op_bitcast(
+                &ctx->mod, ctx->fty,
+                spirv_op_load(&ctx->mod, spirv_type_uint32(&ctx->mod), xe2_spirv_grf(ctx, grf, subreg)));
+            break;
     }
     if (abs) {
         id = spirv_ext_inst1(&ctx->mod, ctx->fty, SPIRV_GLSL_STD450_FABS, id);
@@ -3795,54 +3952,52 @@ static forceinline uint32_t xe2_spirv_load_grf(xe2_spirv_ctx_t* ctx, uint32_t gr
 
 static forceinline void xe2_spirv_store_grf(xe2_spirv_ctx_t* ctx, uint32_t grf, uint32_t sub, uint32_t val)
 {
-    spirv_op_store(&ctx->mod, xe2_spirv_grf(ctx, grf, sub), val);
+    spirv_op_store(&ctx->mod, xe2_spirv_grf(ctx, grf, sub),
+                   spirv_op_bitcast(&ctx->mod, spirv_type_uint32(&ctx->mod), val));
     if (grf < XE2_SHADER_MAX_GRF) {
         ctx->grf_written[grf][sub & (XE2_GRF_DWORDS - 1)] = true;
     }
 }
 
-// Reads four consecutive registers as a vec4. Used for the message
-// payload a kernel hands to the URB write / render target write.
-static forceinline uint32_t xe2_spirv_load_grf_vec4(xe2_spirv_ctx_t* ctx, uint32_t base, bool w_is_one)
-{
-    uint32_t x = xe2_spirv_load_grf(ctx, base + 0, 0, false, false, false);
-    uint32_t y = xe2_spirv_load_grf(ctx, base + 1, 0, false, false, false);
-    uint32_t z = xe2_spirv_load_grf(ctx, base + 2, 0, false, false, false);
-    uint32_t w = w_is_one ? spirv_type_const_float32(&ctx->mod, 1.0f)
-                          : xe2_spirv_load_grf(ctx, base + 3, 0, false, false, false);
-    return spirv_composite_construct4(&ctx->mod, ctx->v4ty, x, y, z, w);
-}
-
-// Translates the kernel's output message into a store to the stage
-// output: a URB write becomes gl_Position, a render target write becomes
-// the colour attachment.
-static forceinline void xe2_spirv_emit_output(xe2_spirv_ctx_t* ctx, uint32_t payload_grf)
-{
-    if (ctx->stage == XE2_SHADER_PS && ctx->color_out) {
-        spirv_op_store(&ctx->mod, ctx->color_out, xe2_spirv_load_grf_vec4(ctx, payload_grf, false));
-        ctx->wrote_output = true;
-    } else if (ctx->stage != XE2_SHADER_PS && ctx->position_out) {
-        spirv_op_store(&ctx->mod, ctx->position_out, xe2_spirv_load_grf_vec4(ctx, payload_grf, true));
-        ctx->wrote_output = true;
-    }
-}
-
 // Closes the module and serializes it. A stage whose output message we
 // failed to recognise would otherwise leave gl_Position or the colour
-// attachment undefined, so give them a defined value instead - a black
-// pixel or a degenerate vertex is debuggable, garbage is not.
+// attachment undefined, and so would a varying the kernel never wrote, so
+// give them all a defined value instead - a black pixel or a degenerate
+// vertex is debuggable, garbage is not.
 static forceinline int xe2_spirv_finish(xe2_spirv_ctx_t* ctx, uint32_t** spirv, uint32_t* nwords)
 {
-    uint32_t zero = spirv_type_const_float32(&ctx->mod, 0.0f);
-    uint32_t one  = spirv_type_const_float32(&ctx->mod, 1.0f);
-    uint32_t def  = spirv_composite_construct4(&ctx->mod, ctx->v4ty, zero, zero, zero, one);
+    // Built on first use, so a stage that wrote everything carries no dead
+    // instruction for it.
+    uint32_t def = 0;
+#define XE2_SPIRV_DEFAULT_VEC4()                                                                                       \
+    (def ? def                                                                                                         \
+         : (def = spirv_composite_construct4(&ctx->mod, ctx->v4ty, spirv_type_const_float32(&ctx->mod, 0.0f),          \
+                                             spirv_type_const_float32(&ctx->mod, 0.0f),                                \
+                                             spirv_type_const_float32(&ctx->mod, 0.0f),                                \
+                                             spirv_type_const_float32(&ctx->mod, 1.0f))))
 
-    if (!ctx->wrote_output) {
-        spirv_op_store(&ctx->mod, ctx->stage == XE2_SHADER_PS ? ctx->color_out : ctx->position_out, def);
+    if (ctx->stage == XE2_SHADER_PS && !ctx->wrote_color) {
+        rvvm_warn("PS never wrote a colour: RT-write send not recognised");
     }
-    if (ctx->stage != XE2_SHADER_PS && !ctx->wrote_varying) {
-        spirv_op_store(&ctx->mod, ctx->varying_out, def); // never leave a varying undefined
+    if (ctx->stage != XE2_SHADER_PS && !ctx->wrote_position) {
+        rvvm_warn("VS never wrote gl_Position: URB write not recognised");
     }
+    if (ctx->stage == XE2_SHADER_PS) {
+        if (!ctx->wrote_color) {
+            spirv_op_store(&ctx->mod, ctx->color_out, XE2_SPIRV_DEFAULT_VEC4());
+        }
+    } else {
+        if (!ctx->wrote_position) {
+            spirv_op_store(&ctx->mod, ctx->position_out, XE2_SPIRV_DEFAULT_VEC4());
+        }
+        for (uint32_t i = 0; i < XE2_SHADER_MAX_VARYINGS; ++i) {
+            if (!ctx->wrote_varying[i]) {
+                spirv_op_store(&ctx->mod, ctx->varying[i], XE2_SPIRV_DEFAULT_VEC4());
+            }
+        }
+    }
+
+#undef XE2_SPIRV_DEFAULT_VEC4
 
     spirv_func_end(&ctx->mod);
 
@@ -3852,14 +4007,9 @@ static forceinline int xe2_spirv_finish(xe2_spirv_ctx_t* ctx, uint32_t** spirv, 
         spirv_exec_mode0(&ctx->mod, ctx->func, SPIRV_EXECUTION_MODE_ORIGIN_UPPER_LEFT);
     }
 
-    int rc = spirv_module_finish(&ctx->mod, nwords ? spirv : spirv, nwords);
+    int rc = spirv_module_finish(&ctx->mod, spirv, nwords);
     spirv_module_free(&ctx->mod);
     return rc;
-}
-
-static forceinline bool xe2_brw_operand_is_scalar(const xe2_brw_operand_t* op)
-{
-    return op->vstride == 0;
 }
 
 static forceinline uint32_t xe2_spirv_load_operand(xe2_spirv_ctx_t* ctx, const xe2_brw_operand_t* op)
@@ -3873,7 +4023,10 @@ static forceinline uint32_t xe2_spirv_load_operand(xe2_spirv_ctx_t* ctx, const x
         }
         return id;
     }
-    return xe2_spirv_load_grf(ctx, op->reg, op->subreg, xe2_brw_operand_is_scalar(op), op->neg, op->abs);
+    // The subregister matters here: it is what tells apart two uniforms
+    // gathered into the same register, and which plane parameter of which
+    // input a PS setup read names.
+    return xe2_spirv_load_grf(ctx, op->reg, op->subreg, op->neg, op->abs);
 }
 
 // No width field in align1 3-src. Width is architecturally fixed at 8;
@@ -3895,14 +4048,16 @@ static inline uint32_t xe2_brw_math_fc(const xe2_qword_t* qw)
     return fc;
 }
 
-// Builds a vec4 from up to 4 payload GRFs; missing components default to
-// 0, 0, 0, 1.
-static forceinline uint32_t xe2_spirv_vec4_from_regs(xe2_spirv_ctx_t* ctx, const uint32_t* regs, uint32_t n)
+// Builds a vec4 out of up to four consecutive payload registers, the shape
+// a kernel hands to a URB or render target write: one register per
+// component at the dispatch width, so component i is register base + i,
+// subregister 0. Missing components default to 0, 0, 0, 1.
+static forceinline uint32_t xe2_spirv_vec4_from_regs(xe2_spirv_ctx_t* ctx, uint32_t base, uint32_t n)
 {
     uint32_t c[4];
     for (uint32_t i = 0; i < 4; ++i) {
         if (i < n) {
-            c[i] = xe2_spirv_load_grf(ctx, regs[i], 0, false, false, false);
+            c[i] = xe2_spirv_load_grf(ctx, base + i, 0, false, false);
         } else {
             c[i] = spirv_type_const_float32(&ctx->mod, i == 3 ? 1.0f : 0.0f);
         }
@@ -3910,225 +4065,574 @@ static forceinline uint32_t xe2_spirv_vec4_from_regs(xe2_spirv_ctx_t* ctx, const
     return spirv_composite_construct4(&ctx->mod, ctx->v4ty, c[0], c[1], c[2], c[3]);
 }
 
-// PS: render target write. Payload = src0 regs followed by src1 regs, i.e.
-// in your trace [r127] + [r124 r125 r126] = R G B A.
-static forceinline void xe2_spirv_emit_rt_write(xe2_spirv_ctx_t* ctx, const uint32_t* regs, uint32_t n)
+// PS: the render target write. Its payload is a run of registers holding
+// R, G, B, A one component each; anything past those four is depth,
+// stencil or sample mask, which the colour attachment does not want.
+static forceinline void xe2_spirv_emit_rt_write(xe2_spirv_ctx_t* ctx, uint32_t base, uint32_t n)
 {
-    spirv_op_store(&ctx->mod, ctx->color_out, xe2_spirv_vec4_from_regs(ctx, regs, n));
-    ctx->wrote_output = true;
+    if (!ctx->color_out) {
+        return;
+    }
+    spirv_op_store(&ctx->mod, ctx->color_out, xe2_spirv_vec4_from_regs(ctx, base, EVAL_MIN(n, 4)));
+    ctx->wrote_color = true;
 }
 
-#define XE2_BRW_SFID_URB 6
-
-// VS: URB write. src0 is the header (handle/offset), the DATA is src1.
-// (The old code used src0 first, which wrote the header into gl_Position.)
-// Data is SoA, 4 consecutive GRFs per VUE slot:
-//   slot 0 = VUE header (skipped), slot 1 = position, slot 2 = varying 0.
-// `first_slot` = slot from the message offset if you can decode it,
-// UINT32_MAX = take the slots in message order.
-static forceinline void xe2_spirv_emit_urb_write(xe2_spirv_ctx_t* ctx, const uint32_t* regs, uint32_t n,
-                                                 uint32_t first_slot)
+// VS: a URB write. The payload is the vertex's data in VUE slot order,
+// four registers per slot, starting at `slot`:
+//
+//   slot 0  VUE header (point size, layer, viewport, shading rate)
+//   slot 1  gl_Position
+//   slot 2+ the user varyings
+//
+// A single message carries at most two slots, so a vertex with varyings
+// takes several, and Mesa skips the header slot outright when nothing in
+// it is written - which is why the starting slot has to be recovered from
+// the address rather than assumed to be 0.
+static forceinline void xe2_spirv_emit_urb_write(xe2_spirv_ctx_t* ctx, uint32_t base, uint32_t n, uint32_t slot)
 {
-    if (first_slot != UINT32_MAX) {
-        ctx->urb_slot = first_slot;
-    }
-    for (uint32_t i = 0; i < n; i += 4) {
-        uint32_t cnt  = (n - i) < 4 ? (n - i) : 4;
-        uint32_t slot = ctx->urb_slot++;
+    for (uint32_t i = 0; i < n; i += 4, ++slot) {
+        uint32_t cnt = EVAL_MIN(n - i, 4);
+
         if (slot == 0) {
-            continue; // VUE header: flags / point size / layer.
+            continue; // VUE header: nothing in it maps to a SPIR-V output.
         }
-        uint32_t v = xe2_spirv_vec4_from_regs(ctx, regs + i, cnt);
         if (slot == 1) {
-            spirv_op_store(&ctx->mod, ctx->position_out, v);
-            ctx->wrote_output = true;
-        } else if (slot == 2) {
-            spirv_op_store(&ctx->mod, ctx->varying_out, v);
-            ctx->wrote_varying = true;
+            if (ctx->position_out) {
+                spirv_op_store(&ctx->mod, ctx->position_out, xe2_spirv_vec4_from_regs(ctx, base + i, cnt));
+                ctx->wrote_position = true;
+            }
+            continue;
         }
-        // slots >= 3 would be Location 1.. : declare more outputs when needed.
+
+        uint32_t location = slot - 2;
+        if (location < XE2_SHADER_MAX_VARYINGS) {
+            spirv_op_store(&ctx->mod, ctx->varying[location], xe2_spirv_vec4_from_regs(ctx, base + i, cnt));
+            ctx->wrote_varying[location] = true;
+        } else {
+            rvvm_warn("VS writes VUE slot %u (Location %u), past the %u varyings the pipeline declares", slot, location,
+                      XE2_SHADER_MAX_VARYINGS);
+        }
     }
 }
+
+#define XE2_BRW_SFID_URB   6
+
+// VUE slots are 16 bytes, and that is the unit the kernel adds onto the
+// URB handle to pick one.
+#define XE2_VUE_SLOT_BYTES 16
 
 // A send carries the thread's output message: the URB write that hands a
 // vertex to the next stage, or the render target write that hands a
-// fragment to the framebuffer. Either way its payload register holds the
-// value we want.
+// fragment to the framebuffer.
 //
 // The fragment case keys off EOT rather than the SFID: a render target
 // write is always the message a fragment thread ends on, whereas the
 // dataport SFID it travels under has been renumbered across generations.
+//
+// `len0`/`len1` are the two payload lengths in registers, from the message
+// descriptors. Which one holds the data differs by message: a render
+// target write puts its whole payload in src0, while a URB write puts the
+// address in src0 and the vertex data in src1.
 static forceinline void xe2_brw_emit_send(xe2_spirv_ctx_t* ctx, uint32_t sfid, bool eot, const xe2_brw_operand_t* s0,
-                                          const xe2_brw_operand_t* s1, uint32_t len0, uint32_t len1, uint32_t urb_slot)
+                                          const xe2_brw_operand_t* s1, uint32_t len0, uint32_t len1)
 {
-    bool is_ps     = ctx->stage == XE2_SHADER_PS;
-    bool is_output = is_ps ? eot : (sfid == XE2_BRW_SFID_URB);
-    if (!is_output) {
-        return;
-    }
-
-    uint32_t regs[16];
-    uint32_t n = 0;
+    bool is_ps = ctx->stage == XE2_SHADER_PS;
 
     if (is_ps) {
-        len0 = len0 ? len0 : 1;
-        len1 = len1 ? len1 : 3;
-        for (uint32_t i = 0; i < len0 && n < 16; ++i) {
-            regs[n++] = s0->reg + i;
+        if (!eot) {
+            return;
         }
-        for (uint32_t i = 0; i < len1 && n < 16; ++i) {
-            regs[n++] = s1->reg + i;
+        uint32_t base = 0;
+        uint32_t n    = 0;
+        if (len0 >= 4) { // colour in src0, optionally behind a header
+            base = s0->reg + ((len0 > 4 && len0 <= 6) ? len0 - 4 : 0);
+            n    = 4;
+        } else if (len1) { // header in src0, colour in src1
+            base = s1->reg;
+            n    = EVAL_MIN(len1, 4);
+        } else {
+            base = s0->reg;
+            n    = 4;
         }
-        xe2_spirv_emit_rt_write(ctx, regs, n);
-    } else {
-        len1 = len1 ? len1 : 4;
-        for (uint32_t i = 0; i < len1 && n < 16; ++i) {
-            regs[n++] = s1->reg + i; // data lives in src1; src0 is the header
-        }
-        xe2_spirv_emit_urb_write(ctx, regs, n, urb_slot);
-    }
-}
-
-static forceinline void xe2_brw_store_dst(xe2_spirv_ctx_t* ctx, const xe2_brw_operand_t* dst, uint32_t v)
-{
-    xe2_spirv_store_grf(ctx, dst->reg, dst->subreg, v); // dst subreg was ignored before
-}
-
-static forceinline void xe2_brw_prescan_src(xe2_spirv_ctx_t* ctx, const xe2_brw_operand_t* op)
-{
-    if (!op || op->is_imm || op->reg >= XE2_SHADER_MAX_GRF) {
+        xe2_spirv_emit_rt_write(ctx, base, n);
         return;
     }
-    if (op->reg >= ctx->push_grf_base && !ctx->pre_written[op->reg] && xe2_brw_operand_is_scalar(op)) {
-        if (op->reg + 1 > ctx->const_grf_end) {
-            ctx->const_grf_end = op->reg + 1;
-        }
+
+    if (sfid != XE2_BRW_SFID_URB || !len1) {
+        return;
     }
+
+    // The address register carries the VUE slot as a byte offset past the
+    // thread's URB handle; using the handle unmodified means slot 0.
+    uint32_t slot = 0;
+    if (!s0->is_imm && s0->reg < XE2_SHADER_MAX_GRF && ctx->grf_urb_addr[s0->reg]) {
+        slot = ctx->grf_urb_offset[s0->reg] / XE2_VUE_SLOT_BYTES;
+    }
+    xe2_spirv_emit_urb_write(ctx, s1->reg, len1, slot);
 }
 
-static forceinline void xe2_brw_prescan(xe2_spirv_ctx_t* ctx, const xe2_brw_operand_t* dst, const xe2_brw_operand_t* s0,
-                                        const xe2_brw_operand_t* s1, const xe2_brw_operand_t* s2)
-{
-    xe2_brw_prescan_src(ctx, s0);
-    xe2_brw_prescan_src(ctx, s1);
-    xe2_brw_prescan_src(ctx, s2);
-    if (dst && dst->reg < XE2_SHADER_MAX_GRF) {
-        ctx->pre_written[dst->reg] = true;
-    }
-}
-
-static forceinline void xe2_spirv_prescan_done(xe2_spirv_ctx_t* ctx)
-{
-    if (ctx->stage == XE2_SHADER_VS && ctx->attr_count) {
-        uint32_t end       = ctx->const_grf_end > ctx->push_grf_base ? ctx->const_grf_end : ctx->push_grf_base;
-        ctx->attr_grf_base = end;
-    }
-}
-
-// BRW -> SPIR-V tie problem.
+// Marks every dword an instruction's destination region covers as the
+// kernel's own, without storing a value into any but the first.
 //
-// The main blocker is understanding which SPIR-V in/out variable should
-// be attached to which compiled SPIR-V variable that comes from BRW.
-static forceinline void xe2_brw_emit_spirv(xe2_spirv_ctx_t* ctx, const xe2_qword_t* qw, uint32_t op,
-                                           const xe2_brw_operand_t* dst, const xe2_brw_operand_t* s0,
-                                           const xe2_brw_operand_t* s1, const xe2_brw_operand_t* s2)
+// This is where the lane-0-only value model and the payload windows have to
+// be reconciled. A SIMD16 write to r3.0 lands in all sixteen of r3's dwords
+// on the hardware, so whatever pushed constants used to live in r3.4 or
+// r3.8 are gone - and if those dwords stayed marked unwritten, a later read
+// of them would compile into a uniform load of data the kernel has already
+// destroyed. Only lane 0 carries a modelled value; the rest are simply no
+// longer payload.
+static forceinline void xe2_brw_claim_dst_region(xe2_spirv_ctx_t* ctx, const xe2_qword_t* qw,
+                                                 const xe2_brw_operand_t* dst)
+{
+    uint32_t stride = dst->hstride ? dst->hstride : 1;
+    uint32_t dwords = xe2_brw_exec_size(qw) * stride;
+    uint32_t reg    = dst->reg;
+    uint32_t sub    = dst->subreg;
+
+    for (uint32_t i = 0; i < dwords; ++i, ++sub) {
+        // A wide write runs past the end of one register into the next.
+        while (sub >= XE2_GRF_DWORDS) {
+            sub -= XE2_GRF_DWORDS;
+            reg++;
+        }
+        if (reg >= XE2_SHADER_MAX_GRF) {
+            return;
+        }
+        ctx->grf_written[reg][sub] = true;
+    }
+}
+
+#define XE2_BRW_TYPE_UB          0b00000
+#define XE2_BRW_TYPE_UW          0b00001
+#define XE2_BRW_TYPE_UD          0b00010
+#define XE2_BRW_TYPE_UQ          0b00011
+/* Signed integer types: 8, 16, 32, and 64-bit @{ */
+#define XE2_BRW_TYPE_B           0b00100
+#define XE2_BRW_TYPE_W           0b00101
+#define XE2_BRW_TYPE_D           0b00110
+#define XE2_BRW_TYPE_Q           0b00111
+/** Floating point types: 8, 16 (half), 32, and 64-bit (double) @{ */
+#define XE2_BRW_TYPE_HF8         0b01000
+#define XE2_BRW_TYPE_HF          0b01001
+#define XE2_BRW_TYPE_F           0b01010
+#define XE2_BRW_TYPE_DF          0b01011
+/** Floating point types (bfloat variants): 8 and 16-bit @{ */
+#define XE2_BRW_TYPE_BF8         0b01100
+#define XE2_BRW_TYPE_BF          0b01101
+/** Vector immediate types */
+#define XE2_BRW_TYPE_UV          0b10001
+#define XE2_BRW_TYPE_V           0b10101
+#define XE2_BRW_TYPE_VF          0b11010
+#define XE2_BRW_TYPE_SIZE_MASK   0b00011
+#define XE2_BRW_TYPE_BASE_MASK   0b01100
+#define XE2_BRW_TYPE_BASE_UINT   0b00000
+#define XE2_BRW_TYPE_BASE_SINT   0b00100
+#define XE2_BRW_TYPE_BASE_FLOAT  0b01000
+#define XE2_BRW_TYPE_BASE_BFLOAT 0b01100
+#define XE2_BRW_TYPE_VECTOR      0b10000
+#define XE2_BRW_TYPE_INVALID     0b11111
+#define XE2_BRW_TYPE_LAST        XE2_BRW_TYPE_INVALID
+
+typedef enum { XE2_C_F, XE2_C_U, XE2_C_S } xe2_cls_t;
+
+static inline uint8_t xe2_cls(uint8_t t)
+{
+    return (t >> 2) == 2 ? XE2_C_F : (t >> 2) == 1 ? XE2_C_S : XE2_C_U;
+}
+
+static uint32_t xe2_op1(spirv_module_t* m, uint32_t opc, uint32_t ty, uint32_t a)
+{
+    return spirv_emit_op(m, opc, ty, &a, 1);
+}
+
+static uint32_t xe2_op2(spirv_module_t* m, uint32_t opc, uint32_t ty, uint32_t a, uint32_t b)
+{
+    uint32_t o[2] = {a, b};
+    return spirv_emit_op(m, opc, ty, o, 2);
+}
+
+static uint32_t xe2_op3(spirv_module_t* m, uint32_t opc, uint32_t ty, uint32_t a, uint32_t b, uint32_t c)
+{
+    uint32_t o[3] = {a, b, c};
+    return spirv_emit_op(m, opc, ty, o, 3);
+}
+
+// Typed source: F -> f32, U/S -> u32.
+static uint32_t xe2_ld(xe2_spirv_ctx_t* ctx, const xe2_brw_operand_t* op, xe2_cls_t cls)
 {
     spirv_module_t* m = &ctx->mod;
+    if (cls == XE2_C_F) {
+        return xe2_spirv_load_operand(ctx, op);
+    }
+    uint32_t u32 = spirv_type_uint32(m);
+    uint32_t v   = op->is_imm ? spirv_type_const_uint32(m, op->imm_u32)
+                              : spirv_op_bitcast(m, u32, xe2_spirv_load_grf(ctx, op->reg, op->subreg, false, false));
+    if (op->abs) {
+        v = spirv_ext_inst1(m, u32, SPIRV_GLSL_STD450_SABS, v);
+    }
+    if (op->neg) {
+        v = xe2_op1(m, SPIRV_OP_SNEG, u32, v);
+    }
+    return v;
+}
+
+static uint32_t xe2_cvt(xe2_spirv_ctx_t* ctx, uint32_t v, xe2_cls_t from, xe2_cls_t to)
+{
+    spirv_module_t* m   = &ctx->mod;
+    uint32_t        u32 = spirv_type_uint32(m);
+    if (from == to || (from != XE2_C_F && to != XE2_C_F)) {
+        return v;
+    }
+    if (from == XE2_C_F) {
+        return xe2_op1(m, to == XE2_C_S ? SPIRV_OP_CONVERT_FTOS : SPIRV_OP_F2U, u32, v);
+    }
+    return xe2_op1(m, from == XE2_C_S ? SPIRV_OP_CONVERT_STOF : SPIRV_OP_U2F, ctx->fty, v);
+}
+
+static uint32_t xe2_cmp(xe2_spirv_ctx_t* ctx, uint32_t cmod, uint32_t a, uint32_t b, xe2_cls_t cls)
+{
+    static const uint16_t f[7] = {
+        0,
+        SPIRV_OP_F_ORD_EQ,
+        SPIRV_OP_F_UNE,
+        SPIRV_OP_F_ORD_GT,
+        SPIRV_OP_F_ORD_GE,
+        SPIRV_OP_F_ORD_LT,
+        SPIRV_OP_F_ORD_LE,
+    };
+    static const uint16_t s[7]
+        = {0, SPIRV_OP_I_EQUAL, SPIRV_OP_INE, SPIRV_OP_SGT, SPIRV_OP_SGE, SPIRV_OP_SLT, SPIRV_OP_SLE};
+    static const uint16_t u[7]
+        = {0, SPIRV_OP_I_EQUAL, SPIRV_OP_INE, SPIRV_OP_UGT, SPIRV_OP_UGE, SPIRV_OP_ULT, SPIRV_OP_ULE};
+    spirv_module_t* m = &ctx->mod;
+    if (cmod < 1 || cmod > 6) {
+        return spirv_type_const_bool(m, false);
+    }
+    return xe2_op2(m, (cls == XE2_C_F ? f : cls == XE2_C_S ? s : u)[cmod], spirv_type_bool(m), a, b);
+}
+
+static uint32_t xe2_flag_get(xe2_spirv_ctx_t* ctx, uint32_t r, uint32_t s)
+{
+    return ctx->flag[r & 1][s & 1] ? ctx->flag[r & 1][s & 1] : spirv_type_const_bool(&ctx->mod, false);
+}
+
+static void xe2_brw_set_flag(xe2_spirv_ctx_t* ctx, const xe2_qword_t* qw, uint32_t b)
+{
+    uint32_t r = xe2_brw_mask(qw, XE2_BRW_FLAG_REG_LO, XE2_BRW_FLAG_REG_HI) & 1;
+    uint32_t s = xe2_brw_mask(qw, XE2_BRW_FLAG_SUBREG_BIT, XE2_BRW_FLAG_SUBREG_BIT);
+    if (ctx->mask) {
+        b = xe2_op3(&ctx->mod, SPIRV_OP_SELECT, spirv_type_bool(&ctx->mod), ctx->mask, b, xe2_flag_get(ctx, r, s));
+    }
+    ctx->flag[r][s] = b;
+}
+
+// Flag selected by the predicate bits (with inversion); 0 if unpredicated.
+static uint32_t xe2_brw_pred_flag(xe2_spirv_ctx_t* ctx, const xe2_qword_t* qw)
+{
+    if (!xe2_brw_mask(qw, XE2_BRW_PRED_CONTROL_LO, XE2_BRW_PRED_CONTROL_HI)) {
+        return 0;
+    }
+    uint32_t f = xe2_flag_get(ctx, xe2_brw_mask(qw, XE2_BRW_FLAG_REG_LO, XE2_BRW_FLAG_REG_HI),
+                              xe2_brw_mask(qw, XE2_BRW_FLAG_SUBREG_BIT, XE2_BRW_FLAG_SUBREG_BIT));
+    if (xe2_brw_mask(qw, XE2_BRW_PRED_INV_BIT, XE2_BRW_PRED_INV_BIT)) {
+        f = xe2_op1(&ctx->mod, SPIRV_OP_LNOT, spirv_type_bool(&ctx->mod), f);
+    }
+    return f;
+}
+
+static uint32_t xe2_and(xe2_spirv_ctx_t* ctx, uint32_t a, uint32_t b)
+{
+    return !a ? b : !b ? a : xe2_op2(&ctx->mod, SPIRV_OP_AND, spirv_type_bool(&ctx->mod), a, b);
+}
+
+static bool xe2_op_has_cmod(uint32_t op)
+{
     switch (op) {
         case XE2_BRW_OP_MOV:
-        case XE2_BRW_OP_MOVI:
-        case XE2_BRW_OP_SMOV:
-        case XE2_BRW_OP_SEL: // TODO: needs predicate / cond-mod: OpSelect
+        case XE2_BRW_OP_ADD:
+        case XE2_BRW_OP_MUL:
+        case XE2_BRW_OP_MAD:
+        case XE2_BRW_OP_AND:
+        case XE2_BRW_OP_OR:
+        case XE2_BRW_OP_XOR:
+        case XE2_BRW_OP_NOT:
+        case XE2_BRW_OP_SHL:
+        case XE2_BRW_OP_SHR:
+        case XE2_BRW_OP_ASR:
         case XE2_BRW_OP_FRC:
         case XE2_BRW_OP_RNDU:
         case XE2_BRW_OP_RNDD:
         case XE2_BRW_OP_RNDE:
         case XE2_BRW_OP_RNDZ:
-            xe2_brw_store_dst(ctx, dst, xe2_spirv_load_operand(ctx, s0));
+        case XE2_BRW_OP_AVG:
+        case XE2_BRW_OP_ADD3:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+// Stores a result: convert to dst type, saturate (float), cond-mod -> flag,
+// predicate / if-mask, then write. `cls` is the class of `v`.
+static forceinline void xe2_brw_store_dst(xe2_spirv_ctx_t* ctx, const xe2_qword_t* qw, const xe2_brw_operand_t* dst,
+                                          uint32_t v, xe2_cls_t cls)
+{
+    spirv_module_t* m  = &ctx->mod;
+    xe2_cls_t       dc = xe2_cls(dst->hwtype);
+
+    v = xe2_cvt(ctx, v, cls, dc);
+    if (dc == XE2_C_F && xe2_brw_mask(qw, XE2_BRW_SATURATE_BIT, XE2_BRW_SATURATE_BIT)) {
+        v = spirv_ext_inst3(m, ctx->fty, SPIRV_GLSL_STD450_FCLAMP, v, spirv_type_const_float32(m, 0.0f),
+                            spirv_type_const_float32(m, 1.0f));
+    }
+    uint32_t cmod = xe2_brw_mask(qw, XE2_BRW_COND_MODIFIER_LO, XE2_BRW_COND_MODIFIER_HI);
+    if (cmod && xe2_op_has_cmod(ctx->cur_op)) {
+        uint32_t zero = dc == XE2_C_F ? spirv_type_const_float32(m, 0.0f) : spirv_type_const_uint32(m, 0);
+        xe2_brw_set_flag(ctx, qw, xe2_cmp(ctx, cmod, v, zero, dc));
+    }
+    uint32_t bits = dc == XE2_C_F ? v : spirv_op_bitcast(m, ctx->fty, v);
+
+    bool     use_flag = ctx->cur_op != XE2_BRW_OP_SEL && ctx->cur_op != XE2_BRW_OP_CSEL;
+    uint32_t p        = xe2_and(ctx, ctx->mask, use_flag ? xe2_brw_pred_flag(ctx, qw) : 0);
+    if (p) {
+        uint32_t old = xe2_spirv_load_grf(ctx, dst->reg, dst->subreg, false, false); // before marked written
+        bits         = xe2_op3(m, SPIRV_OP_SELECT, ctx->fty, p, bits, old);
+    }
+    xe2_spirv_store_grf(ctx, dst->reg, dst->subreg, bits);
+    xe2_brw_claim_dst_region(ctx, qw, dst);
+}
+
+// True when this operand holds a URB write address - either the thread's
+// handle straight out of the payload, or something already derived from it.
+// `*offset` receives how many bytes past the handle it points.
+static forceinline bool xe2_brw_is_urb_addr(const xe2_spirv_ctx_t* ctx, const xe2_brw_operand_t* op, uint32_t* offset)
+{
+    if (!op || op->is_imm || op->reg >= XE2_SHADER_MAX_GRF) {
+        return 0;
+    }
+    if (op->reg == ctx->payload.urb_handle_grf) {
+        *offset = 0;
+        return 1;
+    }
+    if (ctx->grf_urb_addr[op->reg]) {
+        *offset = ctx->grf_urb_offset[op->reg];
+        return 1;
+    }
+    return 0;
+}
+
+// Follows the URB handle through the integer arithmetic that turns it into
+// a write address, so xe2_brw_emit_send() can tell which VUE slot a URB
+// write targets. Only the two forms Mesa emits are recognised - a move of
+// the handle and an add of an immediate byte offset - and any other result
+// written into a register drops it back out of the set.
+static forceinline void xe2_brw_track_urb_addr(xe2_spirv_ctx_t* ctx, const xe2_qword_t* qw, uint32_t op,
+                                               const xe2_brw_operand_t* dst, const xe2_brw_operand_t* s0,
+                                               const xe2_brw_operand_t* s1)
+{
+    if (ctx->stage == XE2_SHADER_PS || !dst || dst->reg >= XE2_SHADER_MAX_GRF) {
+        return;
+    }
+    // An instruction whose destination is not a GRF (a null or accumulator
+    // register, as sync and cmp use) overwrites nothing, so it must not
+    // retire somebody else's tracked address.
+    if (!xe2_brw_mask(qw, XE2_BRW_DST_REG_FILE_BIT, XE2_BRW_DST_REG_FILE_BIT)) {
+        return;
+    }
+
+    bool     tracked = false;
+    uint32_t offset  = 0;
+    uint32_t base    = 0;
+
+    if (op == XE2_BRW_OP_MOV) {
+        tracked = xe2_brw_is_urb_addr(ctx, s0, &offset);
+    } else if (op == XE2_BRW_OP_ADD) {
+        if (s1 && s1->is_imm && xe2_brw_is_urb_addr(ctx, s0, &base)) {
+            tracked = true;
+            offset  = base + s1->imm_u32;
+        } else if (s0 && s0->is_imm && xe2_brw_is_urb_addr(ctx, s1, &base)) {
+            tracked = true;
+            offset  = base + s0->imm_u32;
+        }
+    }
+
+    ctx->grf_urb_addr[dst->reg]   = tracked;
+    ctx->grf_urb_offset[dst->reg] = tracked ? offset : 0;
+}
+
+static forceinline void xe2_brw_emit_spirv(xe2_spirv_ctx_t* ctx, const xe2_qword_t* qw, uint32_t op,
+                                           const xe2_brw_operand_t* dst, const xe2_brw_operand_t* s0,
+                                           const xe2_brw_operand_t* s1, const xe2_brw_operand_t* s2)
+{
+    spirv_module_t* m       = &ctx->mod;
+    uint32_t        u32     = spirv_type_uint32(m);
+    xe2_cls_t       c       = xe2_cls(s0->hwtype);
+    bool            fl      = c == XE2_C_F;
+    bool            dst_grf = xe2_brw_mask(qw, XE2_BRW_DST_REG_FILE_BIT, XE2_BRW_DST_REG_FILE_BIT);
+    uint32_t        cmod    = xe2_brw_mask(qw, XE2_BRW_COND_MODIFIER_LO, XE2_BRW_COND_MODIFIER_HI);
+
+    ctx->cur_op = op;
+    xe2_brw_track_urb_addr(ctx, qw, op, dst, s0, s1);
+
+    switch (op) {
+        case XE2_BRW_OP_MOV:
+        case XE2_BRW_OP_MOVI:
+        case XE2_BRW_OP_SMOV:
+            xe2_brw_store_dst(ctx, qw, dst, xe2_ld(ctx, s0, c), c);
             break;
-        case XE2_BRW_OP_ADD:
-        case XE2_BRW_OP_AVG: {
-            uint32_t a = xe2_spirv_load_operand(ctx, s0);
-            uint32_t b = xe2_spirv_load_operand(ctx, s1);
-            xe2_brw_store_dst(ctx, dst, spirv_op_fadd(m, ctx->fty, a, b));
+
+        case XE2_BRW_OP_RNDU:
+        case XE2_BRW_OP_RNDD:
+        case XE2_BRW_OP_RNDE:
+        case XE2_BRW_OP_RNDZ:
+        case XE2_BRW_OP_FRC: {
+            uint32_t ext = op == XE2_BRW_OP_RNDU ? SPIRV_GLSL_STD450_CEIL
+                         : op == XE2_BRW_OP_RNDD ? SPIRV_GLSL_STD450_FLOOR
+                         : op == XE2_BRW_OP_RNDE ? SPIRV_GLSL_STD450_ROUND_EVEN
+                         : op == XE2_BRW_OP_RNDZ ? SPIRV_GLSL_STD450_TRUNC
+                                                 : SPIRV_GLSL_STD450_FRACT;
+
+            c = XE2_C_F;
+            xe2_brw_store_dst(ctx, qw, dst, spirv_ext_inst1(m, ctx->fty, ext, xe2_ld(ctx, s0, XE2_C_F)), c);
             break;
         }
-        case XE2_BRW_OP_MUL: {
-            uint32_t a = xe2_spirv_load_operand(ctx, s0);
-            uint32_t b = xe2_spirv_load_operand(ctx, s1);
-            xe2_brw_store_dst(ctx, dst, spirv_op_fmul(m, ctx->fty, a, b));
-            break;
-        }
-        case XE2_BRW_OP_MAD:
-        case XE2_BRW_OP_MAC:
-        case XE2_BRW_OP_ADD3: {
-            uint32_t a = xe2_spirv_load_operand(ctx, s0);
-            uint32_t b = xe2_spirv_load_operand(ctx, s1);
-            uint32_t c = xe2_spirv_load_operand(ctx, s2);
-            uint32_t r;
-            if (op == XE2_BRW_OP_ADD3) {
-                r = spirv_op_fadd(m, ctx->fty, spirv_op_fadd(m, ctx->fty, a, b), c);
+
+        case XE2_BRW_OP_SEL: {
+            uint32_t a  = xe2_ld(ctx, s0, c);
+            uint32_t b  = xe2_ld(ctx, s1, c);
+            uint32_t ty = fl ? ctx->fty : u32;
+            if (cmod == XE2_BRW_CONDITIONAL_GE || cmod == XE2_BRW_CONDITIONAL_L) {
+                bool     ge  = cmod == XE2_BRW_CONDITIONAL_GE;
+                uint32_t ext = fl           ? (ge ? SPIRV_GLSL_STD450_FMAX : SPIRV_GLSL_STD450_FMIN)
+                             : c == XE2_C_S ? (ge ? SPIRV_GLSL_STD450_SMAX : SPIRV_GLSL_STD450_SMIN)
+                                            : (ge ? SPIRV_GLSL_STD450_UMAX : SPIRV_GLSL_STD450_UMIN);
+                xe2_brw_store_dst(ctx, qw, dst, spirv_ext_inst2(m, ty, ext, a, b), c);
             } else {
-                // Intel MAD: dst = src0 + src1 * src2 (the addend is src0!).
-                // The old a*b + c was wrong. Check against your trace:
-                //   mad r22, r19, r8, r3.0 with r19 = r3.4*r9
-                //   -> r3.4*r9 + r8*r3.0 (matrix row), not r19*r8 + r3.0.
-                r = spirv_op_fadd(m, ctx->fty, a, spirv_op_fmul(m, ctx->fty, b, c));
+                uint32_t p = xe2_brw_pred_flag(ctx, qw);
+                xe2_brw_store_dst(ctx, qw, dst, p ? xe2_op3(m, SPIRV_OP_SELECT, ty, p, a, b) : a, c);
             }
-            xe2_brw_store_dst(ctx, dst, r);
             break;
         }
-        case XE2_BRW_OP_NOT: {
-            uint32_t u32 = spirv_type_uint32(m);
-            uint32_t ia  = spirv_op_bitcast(m, u32, xe2_spirv_load_operand(ctx, s0));
-            uint32_t r   = spirv_op_bit_xor(m, u32, ia, spirv_type_const_uint32(m, 0xFFFFFFFFu));
-            xe2_brw_store_dst(ctx, dst, spirv_op_bitcast(m, ctx->fty, r));
+
+        case XE2_BRW_OP_CSEL: { // dst = (src2 <cmod> 0) ? src0 : src1
+            xe2_cls_t c2   = xe2_cls(s2->hwtype);
+            uint32_t  zero = c2 == XE2_C_F ? spirv_type_const_float32(m, 0.0f) : spirv_type_const_uint32(m, 0);
+            uint32_t  cond = xe2_cmp(ctx, cmod, xe2_ld(ctx, s2, c2), zero, c2);
+            xe2_brw_store_dst(
+                ctx, qw, dst,
+                xe2_op3(m, SPIRV_OP_SELECT, fl ? ctx->fty : u32, cond, xe2_ld(ctx, s0, c), xe2_ld(ctx, s1, c)), c);
             break;
         }
+
+        case XE2_BRW_OP_CMP:
+        case XE2_BRW_OP_CMPN: {
+            uint32_t a = xe2_ld(ctx, s0, c);
+            uint32_t b = xe2_ld(ctx, s1, c);
+            uint32_t f = xe2_cmp(ctx, cmod, a, b, c);
+            xe2_brw_set_flag(ctx, qw, f);
+            if (dst_grf) {
+                uint32_t r = xe2_op3(m, SPIRV_OP_SELECT, u32, f, spirv_type_const_uint32(m, ~0u),
+                                     spirv_type_const_uint32(m, 0));
+                xe2_brw_store_dst(ctx, qw, dst, r, XE2_C_U);
+            }
+            break;
+        }
+
+        case XE2_BRW_OP_ADD:
+        case XE2_BRW_OP_MUL:
+        case XE2_BRW_OP_AVG: {
+            uint32_t a = xe2_ld(ctx, s0, c);
+            uint32_t b = xe2_ld(ctx, s1, c);
+            uint32_t r;
+            if (fl) {
+                r = op == XE2_BRW_OP_ADD ? spirv_op_fadd(m, ctx->fty, a, b)
+                  : op == XE2_BRW_OP_MUL
+                      ? spirv_op_fmul(m, ctx->fty, a, b)
+                      : spirv_op_fmul(m, ctx->fty, spirv_op_fadd(m, ctx->fty, a, b), spirv_type_const_float32(m, 0.5f));
+            } else if (op == XE2_BRW_OP_AVG) {
+                r = xe2_op2(m, SPIRV_OP_SHRL, u32,
+                            xe2_op2(m, SPIRV_OP_I_ADD, u32, xe2_op2(m, SPIRV_OP_I_ADD, u32, a, b),
+                                    spirv_type_const_uint32(m, 1)),
+                            spirv_type_const_uint32(m, 1));
+            } else {
+                r = xe2_op2(m, op == XE2_BRW_OP_ADD ? SPIRV_OP_I_ADD : SPIRV_OP_I_MUL, u32, a, b);
+            }
+            xe2_brw_store_dst(ctx, qw, dst, (r), c);
+            break;
+        }
+
+        case XE2_BRW_OP_MAD: { // dst = src0 + src1 * src2
+            uint32_t a = xe2_ld(ctx, s0, c);
+            uint32_t b = xe2_ld(ctx, s1, c);
+            uint32_t d = xe2_ld(ctx, s2, c);
+            xe2_brw_store_dst(ctx, qw, dst,
+                              (fl ? spirv_op_2(m, 129, ctx->fty, a, spirv_op_2(m, 133, ctx->fty, b, d))
+                                  : xe2_op2(m, 128, u32, a, xe2_op2(m, 132, u32, b, d))),
+                              c);
+            break;
+        }
+        case XE2_BRW_OP_ADD3: {
+            c = XE2_C_U;
+            xe2_brw_store_dst(ctx, qw, dst,
+                              (xe2_op2(m, 128, u32, xe2_op2(m, 128, u32, xe2_ld(ctx, s0, c), xe2_ld(ctx, s1, c)),
+                                       xe2_ld(ctx, s2, c))),
+                              c);
+            break;
+        }
+
+        case XE2_BRW_OP_NOT:
+            c = XE2_C_U;
+            xe2_brw_store_dst(ctx, qw, dst, (xe2_op1(m, 200, u32, xe2_ld(ctx, s0, c))), c);
+            break;
         case XE2_BRW_OP_AND:
         case XE2_BRW_OP_OR:
-        case XE2_BRW_OP_XOR:
-        case XE2_BRW_OP_SHR:
-        case XE2_BRW_OP_SHL: {
-            uint32_t u32 = spirv_type_uint32(m);
-            uint32_t ia  = spirv_op_bitcast(m, u32, xe2_spirv_load_operand(ctx, s0));
-            uint32_t ib  = spirv_op_bitcast(m, u32, xe2_spirv_load_operand(ctx, s1));
-            uint32_t r;
-            switch (op) {
-                case XE2_BRW_OP_AND:
-                    r = spirv_op_bit_and(m, u32, ia, ib);
-                    break;
-                case XE2_BRW_OP_OR:
-                    r = spirv_op_bit_or(m, u32, ia, ib);
-                    break;
-                case XE2_BRW_OP_XOR:
-                    r = spirv_op_bit_xor(m, u32, ia, ib);
-                    break;
-                case XE2_BRW_OP_SHR:
-                    r = spirv_op_shr(m, u32, ia, ib);
-                    break;
-                default:
-                    r = spirv_op_shl(m, u32, ia, ib);
-                    break;
-            }
-            xe2_brw_store_dst(ctx, dst, spirv_op_bitcast(m, ctx->fty, r));
+        case XE2_BRW_OP_XOR: {
+            c          = XE2_C_U;
+            uint32_t a = xe2_ld(ctx, s0, c);
+            uint32_t b = xe2_ld(ctx, s1, c);
+            xe2_brw_store_dst(ctx, qw, dst,
+                              (op == 101   ? spirv_op_2(m, 199, u32, a, b)
+                               : op == 102 ? spirv_op_2(m, 197, u32, a, b)
+                                           : spirv_op_2(m, 198, u32, a, b)),
+                              c);
             break;
         }
+        case XE2_BRW_OP_SHR:
+        case XE2_BRW_OP_SHL:
+        case XE2_BRW_OP_ASR: {
+            c          = fl ? XE2_C_U : c;
+            uint32_t a = xe2_ld(ctx, s0, c);
+            uint32_t n = spirv_op_bit_and(m, u32, xe2_ld(ctx, s1, XE2_C_U), spirv_type_const_uint32(m, 31));
+            xe2_brw_store_dst(ctx, qw, dst, (xe2_op2(m, op == 105 ? 196 : op == 108 ? 195 : 194, u32, a, n)), c);
+            break;
+        }
+
         case XE2_BRW_OP_MATH: {
-            uint32_t a = xe2_spirv_load_operand(ctx, s0);
-            uint32_t v = a;
-            // Intel MATH LOG is log2 and EXP is 2^x, not the natural versions.
-            // Names below are the GLSL.std.450 Log2 (30) / Exp2 (29) ops; add
-            // the defines if your header lacks them.
-            switch (xe2_brw_math_fc(qw)) {
+            uint32_t  fc = xe2_brw_mask(qw, 92, 95);
+            xe2_cls_t ic = xe2_cls(s0->hwtype);
+            c            = XE2_C_F;
+            uint32_t a = 0, v = 0;
+            if (fc == 12 || fc == 13) { // integer divide
+                c          = ic == XE2_C_F ? XE2_C_U : ic;
+                uint32_t x = xe2_ld(ctx, s0, c), y = xe2_ld(ctx, s1, c);
+                v = xe2_op2(m,
+                            fc == 12 ? (c == XE2_C_S ? SPIRV_OP_SDIV : SPIRV_OP_UDIV)
+                                     : (c == XE2_C_S ? SPIRV_OP_SREM : SPIRV_OP_UMOD),
+                            u32, x, y);
+                xe2_brw_store_dst(ctx, qw, dst, (v), c);
+                break;
+            }
+            a = xe2_ld(ctx, s0, XE2_C_F);
+            v = a;
+            switch (fc) {
                 case 1:
                     v = spirv_op_fdiv(m, ctx->fty, spirv_type_const_float32(m, 1.0f), a);
                     break;
                 case 2:
-                    v = spirv_ext_inst1(m, ctx->fty, SPIRV_GLSL_STD450_LOG, a);
+                    v = spirv_ext_inst1(m, ctx->fty, SPIRV_GLSL_STD450_LOG2, a);
                     break;
                 case 3:
-                    v = spirv_ext_inst1(m, ctx->fty, SPIRV_GLSL_STD450_EXP, a);
+                    v = spirv_ext_inst1(m, ctx->fty, SPIRV_GLSL_STD450_EXP2, a);
                     break;
                 case 4:
                     v = spirv_ext_inst1(m, ctx->fty, SPIRV_GLSL_STD450_SQRT, a);
@@ -4142,16 +4646,117 @@ static forceinline void xe2_brw_emit_spirv(xe2_spirv_ctx_t* ctx, const xe2_qword
                 case 7:
                     v = spirv_ext_inst1(m, ctx->fty, SPIRV_GLSL_STD450_COS, a);
                     break;
+                case 9:
+                    v = spirv_op_fdiv(m, ctx->fty, a, xe2_ld(ctx, s1, XE2_C_F));
+                    break;
+                case 10:
+                    v = spirv_ext_inst2(m, ctx->fty, SPIRV_GLSL_STD450_POW, a, xe2_ld(ctx, s1, XE2_C_F));
+                    break;
                 default:
+                    rvvm_warn("Unhandled MATH function control %u", fc);
                     break;
             }
-            xe2_brw_store_dst(ctx, dst, v);
+            xe2_brw_store_dst(ctx, qw, dst, (v), c);
             break;
         }
+
+        // Control flow by if-conversion: predicate instead of branching.
+        case XE2_BRW_OP_IF: {
+            uint32_t cond = xe2_brw_pred_flag(ctx, qw);
+            if (ctx->mask_depth < 16) {
+                ctx->mask_parent[ctx->mask_depth] = ctx->mask;
+                ctx->mask_cond[ctx->mask_depth++] = cond;
+            }
+            ctx->mask = xe2_and(ctx, ctx->mask, cond);
+            break;
+        }
+        case XE2_BRW_OP_ELSE:
+            if (ctx->mask_depth) {
+                uint32_t d = ctx->mask_depth - 1, cond = ctx->mask_cond[d];
+                uint32_t nc
+                    = cond ? xe2_op1(m, SPIRV_OP_LNOT, spirv_type_bool(m), cond) : spirv_type_const_bool(m, false);
+                ctx->mask = xe2_and(ctx, ctx->mask_parent[d], nc);
+            }
+            break;
+        case XE2_BRW_OP_ENDIF:
+            if (ctx->mask_depth) {
+                ctx->mask = ctx->mask_parent[--ctx->mask_depth];
+            }
+            break;
+
+        case XE2_BRW_OP_WHILE:
+        case XE2_BRW_OP_BREAK:
+        case XE2_BRW_OP_CONT:
+        case XE2_BRW_OP_HALT:
+        case XE2_BRW_OP_JMPI:
+        case XE2_BRW_OP_BRD:
+        case XE2_BRW_OP_BRC:
+        case XE2_BRW_OP_GOTO:
+        case XE2_BRW_OP_JOIN:
+        case XE2_BRW_OP_CALL:
+        case XE2_BRW_OP_CALLA:
+        case XE2_BRW_OP_RET:
+            if (!ctx->warned_cf) {
+                ctx->warned_cf = true;
+                rvvm_warn("Loop/jump opcode %s is not translated; real CFG emission is required", xe2_brw_op_name(op));
+            }
+            break;
+
         case XE2_BRW_OP_NOP:
         case XE2_BRW_OP_SYNC:
-        default:
             break;
+
+        default: // MAC, DP4A, BFE, ...: claim the destination so payload data isn't resurrected
+            if (xe2_brw_op_nsrc(op) > 0 && dst_grf) {
+                rvvm_warn("Untranslated opcode %s (0x%x) writes r%u.%u; it gets a zero", xe2_brw_op_name(op), op,
+                          dst->reg, dst->subreg);
+                c = XE2_C_F;
+                xe2_brw_store_dst(ctx, qw, dst, (spirv_type_const_float32(m, 0.0f)), c);
+            }
+            break;
+    }
+}
+
+static const char* xe2_brw_hw_type(uint8_t hw)
+{
+    switch (hw) {
+        case XE2_BRW_TYPE_UB:
+            return "ub";
+        case XE2_BRW_TYPE_UW:
+            return "uw";
+        case XE2_BRW_TYPE_UD:
+            return "ud";
+        case XE2_BRW_TYPE_UQ:
+            return "uq";
+        case XE2_BRW_TYPE_B:
+            return "b";
+        case XE2_BRW_TYPE_F:
+            return "f";
+        case XE2_BRW_TYPE_W:
+            return "w";
+        case XE2_BRW_TYPE_D:
+            return "d";
+        case XE2_BRW_TYPE_Q:
+            return "q";
+        case XE2_BRW_TYPE_HF:
+            return "hf";
+        case XE2_BRW_TYPE_HF8:
+            return "hf8";
+        case XE2_BRW_TYPE_DF:
+            return "df";
+        case XE2_BRW_TYPE_BF8:
+            return "bf8";
+        case XE2_BRW_TYPE_BF:
+            return "bf";
+        case XE2_BRW_TYPE_UV:
+            return "uv";
+        case XE2_BRW_TYPE_V:
+            return "v";
+        case XE2_BRW_TYPE_VF:
+            return "vf";
+        default:
+            rvvm_fatal("Unknown BRW data type: %u (0x%x)", hw, hw);
+            return NULL;
     }
 }
 
@@ -4162,7 +4767,8 @@ static void xe2_brw_print_op(const xe2_brw_operand_t* op, const xe2_qword_t* qw,
             uint64_t imm = xe2_brw_mask(qw, 96, 127);
             sprintf(out, "imm=%lu (0x%lx)", imm, imm);
         } else {
-            sprintf(out, "r%u.%u<%u:%u:%u>", op->reg, op->subreg, op->vstride, op->width, op->hstride);
+            sprintf(out, "r%u.%u<%u:%u:%u>:%s", op->reg, op->subreg, op->vstride, op->width, op->hstride,
+                    xe2_brw_hw_type(op->hwtype));
         }
     }
 }
@@ -4185,6 +4791,7 @@ static void xe2_brw_print(const xe2_qword_t* qw, uint32_t op, const xe2_brw_oper
 static forceinline xe2_brw_operand_t xe2_brw_parse_src0(const xe2_qword_t* qw)
 {
     xe2_brw_operand_t o = {0};
+    o.hwtype            = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
     if (xe2_brw_mask(qw, XE2_BRW_SRC0_IS_IMM_BIT, XE2_BRW_SRC0_IS_IMM_BIT)) {
         o.is_imm  = true;
         o.imm_u32 = xe2_brw_mask(qw, 96, 127);
@@ -4217,6 +4824,7 @@ static forceinline xe2_brw_operand_t xe2_brw_parse_src0(const xe2_qword_t* qw)
 static forceinline xe2_brw_operand_t xe2_brw_parse_src1(const xe2_qword_t* qw)
 {
     xe2_brw_operand_t o = {0};
+    o.hwtype            = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
     if (xe2_brw_mask(qw, XE2_BRW_SRC1_IS_IMM_BIT, XE2_BRW_SRC1_IS_IMM_BIT)) {
         o.is_imm  = true;
         o.imm_u32 = xe2_brw_mask(qw, 96, 127);
@@ -4308,7 +4916,13 @@ static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t
             xe2_brw_print(qw, op, &dst, &s0, &s1, NULL);
         }
     } else if (xe2_brw_op_send(op)) {
-        s0            = xe2_brw_parse_src0(qw);
+        s0 = xe2_brw_parse_src0(qw);
+        // Both payloads are plain registers, so the register numbers are
+        // read directly rather than through xe2_brw_parse_src0(): a send
+        // reuses the bits that would carry src0's regioning and "is
+        // immediate" flag for the extended descriptor, and parsing them as
+        // an operand can decide src0 is an immediate when it is not.
+        s0.reg        = xe2_brw_mask(qw, XE2_BRW_SRC0_REG_NR_LO, XE2_BRW_SRC0_REG_NR_HI);
         s1.reg        = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_REG_NR_LO, XE2_BRW_SEND_SRC1_REG_NR_HI);
         uint32_t sfid = xe2_brw_mask(qw, XE2_BRW_SEND_SFID_LO, XE2_BRW_SEND_SFID_HI);
         *eot          = xe2_brw_mask(qw, XE2_BRW_SEND_EOT_BIT, XE2_BRW_SEND_EOT_BIT);
@@ -4317,7 +4931,15 @@ static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t
         }
 
         // Payload starts at s0.reg (or s1 when src0 is not a register).
-        xe2_brw_emit_send(spirv_ctx, sfid, *eot, &s0, &s1, 4, 4, 0);
+        uint32_t len0 = 0;
+        uint32_t len1 = 0;
+        if (!xe2_brw_mask(qw, XE2_BRW_SEND_SEL_REG32_DESC_BIT, XE2_BRW_SEND_SEL_REG32_DESC_BIT)) {
+            len0 = xe2_brw_mask(qw, XE2_BRW_SEND_SRC0_LEN_LO, XE2_BRW_SEND_SRC0_LEN_HI);
+        }
+        if (!xe2_brw_mask(qw, XE2_BRW_SEND_SEL_REG32_EX_DESC_BIT, XE2_BRW_SEND_SEL_REG32_EX_DESC_BIT)) {
+            len1 = xe2_brw_mask(qw, XE2_BRW_SEND_SRC1_LEN_LO, XE2_BRW_SEND_SRC1_LEN_HI) & 0xF;
+        }
+        xe2_brw_emit_send(spirv_ctx, sfid, *eot, &s0, &s1, len0, len1);
         if (xe2_brw_op_nsrc(op) == 1) {
             xe2_brw_print(qw, op, &dst, &s0, NULL, NULL);
         } else {
@@ -4356,6 +4978,8 @@ static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t
         s2.abs              = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_ABS_BIT, XE2_BRW_A3_SRC2_ABS_BIT);
         s2.hstride          = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HSTRIDE_LO, XE2_BRW_A3_SRC2_HSTRIDE_HI);
         s2.vstride          = xe2_brw_3_src_vstride(s2.hstride);
+        dst.hwtype = s0.hwtype = s1.hwtype = s2.hwtype
+            = xe2_brw_mask(qw, XE2_BRW_A3_EXEC_TYPE_BIT, XE2_BRW_A3_EXEC_TYPE_BIT) ? 0xA : 0x2;
         xe2_brw_print(qw, op, &dst, &s0, &s1, &s2);
     } else {
         dst.reg = xe2_brw_parse_dst(qw);
@@ -4398,18 +5022,22 @@ static void xe2_write_spirv(const uint32_t* words, uint32_t n)
 
 // Cross-compile the BRW kernel at the given address into a SPIR-V module
 // for the stage. The module scaffolding (register file, pushed constant
-// block, stage outputs, entry point) is built by gpu-xe2-shader.h; this
-// walks the kernel and feeds its instructions through the translator.
-// `vi` is the current vertex layout, used to declare attribute Inputs
-// for a VS (NULL/ignored for every other stage).
+// block, stage outputs, entry point) is built above; this walks the kernel
+// and feeds its instructions through the translator.
+//
+// `vi` is the current vertex layout, used to declare attribute Inputs for a
+// VS (NULL/ignored for every other stage). `dispatch_grf_start` and
+// `const_bytes` are the stage's dispatch state; together they place the
+// payload windows a register read is classified against, so both have to be
+// current when this runs - see xe2_payload_layout_for().
 static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_t dma, const xe2_vertex_input_t* vi,
-                           uint32_t** spirv, uint32_t* spirv_nwords)
+                           uint32_t dispatch_grf_start, uint32_t const_bytes, uint32_t** spirv, uint32_t* spirv_nwords)
 {
     if (dma.addr == 0U) {
         return;
     }
 
-    xe2_spirv_begin(&xe2->spirv_ctx, kind, vi);
+    xe2_spirv_begin(&xe2->spirv_ctx, kind, vi, dispatch_grf_start, const_bytes);
 
     static const uint32_t limit = 4096;
     uint32_t              len   = 0U;
@@ -4436,8 +5064,11 @@ static void xe2_brw_decode(xe2_dev_t* xe2, xe2_shader_kind_t kind, xe2_dma_addr_
         }
     }
 
-    if (!xe2->spirv_ctx.wrote_output) {
-        rvvm_warn("(kind: %u) No output message recognised in kernel, shader writes a default", kind);
+    bool wrote_output = (kind == XE2_SHADER_PS) ? xe2->spirv_ctx.wrote_color : xe2->spirv_ctx.wrote_position;
+    if (!wrote_output) {
+        rvvm_warn("(kind: %s) No output message recognised in kernel; the shader will write a default %s",
+                  xe2_shader_kind_to_string(kind),
+                  kind == XE2_SHADER_PS ? "black pixel" : "degenerate position (nothing will be drawn)");
     }
 
     if (xe2_spirv_finish(&xe2->spirv_ctx, spirv, spirv_nwords) != 0) {
@@ -4509,11 +5140,11 @@ static inline void xe2_const_body_decode(const uint32_t* cmd, xe2_push_const_t* 
 static inline bool xe2_3dstate_dirty(const xe2_3dstate_t* d3d, const xe2_draw_params_t* draw)
 {
     if (!d3d->last_draw_valid || d3d->ff_dirty) {
-        return true;
+        return 1;
     }
     for (uint32_t i = 0; i < XE2_SHADER_STAGE_COUNT; ++i) {
         if (d3d->shader[i].dirty || d3d->consts[i].dirty) {
-            return true;
+            return 1;
         }
     }
     return memcmp(draw, &d3d->last_draw, sizeof(*draw)) != 0;
@@ -4665,7 +5296,7 @@ static void xe2_print_decompiled_shader(xe2_dev_t* xe2, xe2_dma_addr_t dma)
         return;
     }
 
-    static const uint32_t limit      = 4096;
+    static const uint32_t limit      = 8192;
     uint32_t              code[8192] = {0};
     uint32_t              len        = 0U;
     uint32_t              zeros      = 0U;
@@ -4704,44 +5335,96 @@ static void xe2_print_decompiled_shader(xe2_dev_t* xe2, xe2_dma_addr_t dma)
     }
 }
 
+// Records which kernel a stage is dispatching and how, without compiling
+// it. Compilation needs the constant payload size and (for a VS) the vertex
+// layout, and 3DSTATE_CONSTANT_XS / 3DSTATE_VERTEX_ELEMENTS can land either
+// side of 3DSTATE_XS in a batch, so it is deferred until the draw - see
+// xe2_shader_ensure_compiled().
 static void xe2_decode_shader(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, xe2_shader_kind_t kind, rvvm_addr_t pdp4,
-                              rvvm_addr_t addr_kernel, uint64_t addr_instr)
+                              rvvm_addr_t addr_kernel, uint64_t addr_instr, uint32_t dispatch_grf_start)
 {
+    (void)xe2;
+
     xe2_shader_stage_t* stage = &ctx->d3d.shader[kind];
     rvvm_addr_t         va    = addr_kernel + addr_instr;
 
-    // The driver re-emits 3DSTATE_XS on every batch even when nothing
-    // changed; recompiling the same kernel each time would be wasted
-    // work. This takes the kernel address as the kernel's identity,
-    // which holds as long as the driver allocates a new buffer for a new
-    // kernel rather than overwriting one in place. Known gap: this does
-    // not notice a VS kernel whose *vertex layout* changed (different
-    // 3DSTATE_VERTEX_ELEMENTS) while its address stayed the same - the
-    // cached SPIR-V would still declare the old attribute set.
-    if (stage->spirv && stage->kernel_va == va) {
-        stage->enabled = true;
-        return;
+    // A new kernel or a new dispatch layout has to count as a state change,
+    // or xe2_3dstate_dirty() would let a batch that changed nothing else
+    // skip the draw and the new shader would never be submitted.
+    if (stage->kernel_va != va || stage->dispatch_grf_start != dispatch_grf_start) {
+        stage->dirty = true;
     }
 
-    rvvm_info("(kind: %s) Kernel start address: 0x%lx", xe2_shader_kind_to_string(kind), addr_kernel);
-    xe2_dma_addr_t kernel_dma = xe2_ppgtt_translate(xe2, pdp4, va);
+    stage->kernel_va          = va;
+    stage->kernel_pdp4        = pdp4;
+    stage->dispatch_grf_start = dispatch_grf_start;
+    stage->enabled            = true;
+
+    rvvm_info("(kind: %s) Kernel start address: 0x%lx, dispatch GRF start: r%u", xe2_shader_kind_to_string(kind),
+              addr_kernel, dispatch_grf_start);
+}
+
+// A cheap identity for the vertex layout a VS module was compiled against,
+// so a layout change forces a recompile. Only the fields the module's
+// attribute declarations depend on go in.
+static uint32_t xe2_vertex_layout_sig(const xe2_vertex_input_t* vi)
+{
+    if (!vi) {
+        return 0;
+    }
+    uint32_t sig = vi->element_count * 2654435761u;
+    for (uint32_t i = 0; i < vi->element_count && i < XE2_SHADER_MAX_BINDINGS; ++i) {
+        sig = sig * 31 + vi->element[i].location;
+        sig = sig * 31 + vi->element[i].format;
+    }
+    return sig;
+}
+
+// Cross-compiles a stage's kernel if the cached module was not built for
+// the state this draw dispatches it with. Called once per stage per draw,
+// by which point the constant payload and vertex layout are both current.
+static bool xe2_shader_ensure_compiled(xe2_dev_t* xe2, xe2_3dstate_t* d3d, xe2_shader_kind_t kind)
+{
+    xe2_shader_stage_t* stage = &d3d->shader[kind];
+
+    if (!stage->enabled || !stage->kernel_va) {
+        return false;
+    }
+
+    const xe2_vertex_input_t* vi          = (kind == XE2_SHADER_VS) ? &d3d->vertex_input : NULL;
+    uint32_t                  const_bytes = d3d->consts[kind].nbytes;
+    uint32_t                  layout_sig  = xe2_vertex_layout_sig(vi);
+
+    if (stage->spirv && stage->compiled_va == stage->kernel_va && stage->compiled_grf_start == stage->dispatch_grf_start
+        && stage->compiled_const_bytes == const_bytes && stage->compiled_layout_sig == layout_sig) {
+        return true;
+    }
+
+    xe2_dma_addr_t kernel_dma = xe2_ppgtt_translate(xe2, stage->kernel_pdp4, stage->kernel_va);
+    if (!kernel_dma.addr) {
+        rvvm_warn("(kind: %s) Failed to translate kernel address 0x%" PRIx64, xe2_shader_kind_to_string(kind),
+                  stage->kernel_va);
+        return false;
+    }
     xe2_print_decompiled_shader(xe2, kernel_dma);
 
-    uint32_t*                 spirv        = NULL;
-    uint32_t                  spirv_nwords = 0;
-    const xe2_vertex_input_t* vi           = (kind == XE2_SHADER_VS) ? &ctx->d3d.vertex_input : NULL;
-    xe2_brw_decode(xe2, kind, kernel_dma, vi, &spirv, &spirv_nwords);
+    uint32_t* spirv        = NULL;
+    uint32_t  spirv_nwords = 0;
+    xe2_brw_decode(xe2, kind, kernel_dma, vi, stage->dispatch_grf_start, const_bytes, &spirv, &spirv_nwords);
     if (!spirv || !spirv_nwords) {
-        return;
+        return false;
     }
 
     free(stage->spirv);
-    stage->spirv         = spirv;
-    stage->spirv_nwords  = spirv_nwords;
-    stage->kernel_va     = va;
-    stage->push_grf_base = xe2_push_const_grf_base(kind);
-    stage->enabled       = true;
-    stage->dirty         = true;
+    stage->spirv                = spirv;
+    stage->spirv_nwords         = spirv_nwords;
+    stage->compiled_va          = stage->kernel_va;
+    stage->compiled_grf_start   = stage->dispatch_grf_start;
+    stage->compiled_const_bytes = const_bytes;
+    stage->compiled_layout_sig  = layout_sig;
+    stage->push_grf_base        = xe2_push_const_grf_base(kind);
+    stage->dirty                = true;
+    return true;
 }
 
 static xe2_shader_kind_t xe2_constant_cmd_to_stage(uint32_t cmd)
@@ -5198,20 +5881,26 @@ static inline void xe2_3dprimitive_print_readiness(const xe2_3dstate_t* d3d)
 // - 3DSTATE_INDEX_BUFFER, 3DSTATE_DRAWING_RECTANGLE(_FAST) are now decoded.
 // - 3DSTATE_VIEWPORT_STATE_POINTERS_CC / _PTR_SF_CLIP are now decoded.
 //
+// - Shader cross-compile reaches the stage outputs: a VS's URB write lands
+//   on gl_Position and the varyings, a PS's render target write on the
+//   colour attachment, and both stages read their pushed constants and
+//   inputs through payload windows placed from the real dispatch state.
+//   See the commentary above xe2_spirv_begin().
+// - Vertex buffers/elements/index buffer are read and handed to the Vulkan
+//   backend (xe2_3dprimitive_vertex_input()).
+//
 // Still open:
 // - 3DSTATE_WM_HZ_OP is not handled (HiZ ops - resolve/clear on the
 //   hierarchical depth surface). Not needed for a basic correct frame.
-// - PS shader compile: whatever made PS "broken" for this trace hasn't
-//   been root-caused. xe2_3dprimitive_print_readiness() below reports
-//   whether PS is actually usable on any given draw rather than
-//   assuming so.
-// - Vertex buffers/elements/index buffer are now read and handed to the
-//   Vulkan backend (xe2_3dprimitive_vertex_input()); the VS SPIR-V reads
-//   them through xe2_spirv_ctx_t's attribute GRF window (see
-//   xe2_spirv_begin()). Depth buffer, viewport, scissor and raster/blend
-//   state are still tracked here but not yet passed to
-//   gpu_vulkan_submit_draw() - same "needs gpu-vulkan.h to grow a field"
-//   story, just not done yet for those.
+// - Control flow. The translation walks the kernel linearly and stops at
+//   EOT, so if/else/loop opcodes are ignored rather than reconstructed;
+//   a kernel that branches compiles to the fall-through path only.
+// - Textures. Sampler messages are not translated, so a PS that samples
+//   gets undefined values where the texel should be - see the
+//   TODO(vulkan-textures) in xe2_3dprimitive().
+// - Depth buffer, viewport, scissor and raster/blend state are tracked
+//   here but not yet passed to gpu_vulkan_submit_draw() - the "needs
+//   gpu-vulkan.h to grow a field" story, not done yet for those.
 
 // Smokin' weed with you 'cause you've taught me to
 static inline void xe2_3dprimitive_print(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, const uint32_t* cmd)
@@ -5278,22 +5967,24 @@ static bool xe2_generic_shaders_ensure(xe2_dev_t* xe2)
     return true;
 }
 
-// Binds the guest's raw vertex buffers to a gpu_vulkan_draw_t and submits
-// a real draw through the generic placeholder shaders declared above,
-// instead of the real per-kernel cross-compiled VS/PS - useful whenever
-// those aren't ready (xe2_3dprimitive_print_readiness() reports which),
-// or just to sanity-check that 3DSTATE_VERTEX_BUFFERS is being decoded
-// correctly.
+// Rebuilds `draw`'s vertex input for the generic placeholder shaders
+// declared above, for when the per-kernel cross-compiled VS/PS are not both
+// usable. Also handy on its own to sanity-check that
+// 3DSTATE_VERTEX_BUFFERS is being decoded correctly.
+//
+// This *replaces* whatever vertex state the caller had built, because the
+// generic shaders have a layout of their own: they declare exactly two
+// inputs (inPosition at location 0, inColor at location 1), so at most the
+// first two valid buffers are bound, buffer 0 -> position, buffer 1 ->
+// color, and the draw becomes non-indexed with a vertex count derived from
+// the buffer itself (size / stride) rather than from 3DPRIMITIVE. That
+// makes it independent of 3DSTATE_VERTEX_ELEMENTS, and it is also why it
+// must not run on the cross-compiled path - a shader that declares the
+// guest's own attribute set would be drawn with this one instead.
 //
 // Buffer traversal is the same as xe2_3dprimitive_print_vertex_buffers()
 // above (same addr.addr < 0x1000 sanity check, same per-buffer DMA read
-// into xe2->vertex_scratch[i]), just binding instead of dumping. Vertex
-// count is derived from the buffer itself (size / stride) rather than
-// taken from the 3DPRIMITIVE command, so this works for any vertex_count/
-// buffer layout the guest sets up, independent of 3DSTATE_VERTEX_ELEMENTS
-// - the generic vertex shader only ever declares two inputs (inPosition
-// at location 0, inColor at location 1), so at most the first two valid
-// buffers are bound, buffer 0 -> position, buffer 1 -> color.
+// into xe2->vertex_scratch[i]), just binding instead of dumping.
 static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex_input_t* vi, gpu_vulkan_draw_t* draw)
 {
     if (!xe2->vulkan_ctx || !vi->buffer_count) {
@@ -5375,6 +6066,13 @@ static bool xe2_3dprimitive_bind_vertex_buffers(xe2_dev_t* xe2, const xe2_vertex
 
     draw->vertex.binding_count = bound;
     draw->vertex.attrib_count  = bound;
+
+    // vertex_count below counts vertices, not indices, so drop any index
+    // buffer the caller had already attached rather than leaving the two
+    // disagreeing.
+    draw->vertex.index_data    = NULL;
+    draw->vertex.index_size    = 0;
+    draw->vertex.vertex_offset = 0;
 
     draw->topology       = xe2_topology_to_vulkan(vi->topology);
     draw->vertex_count   = vertex_count;
@@ -5497,13 +6195,16 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
     }
 
     for (size_t i = 0; i < STATIC_ARRAY_SIZE(xe2_draw_stages); ++i) {
-        xe2_shader_kind_t         kind   = xe2_draw_stages[i].xe2;
-        const xe2_shader_stage_t* stage  = &d3d->shader[kind];
-        const xe2_push_const_t*   consts = &d3d->consts[kind];
+        xe2_shader_kind_t       kind   = xe2_draw_stages[i].xe2;
+        const xe2_push_const_t* consts = &d3d->consts[kind];
 
-        // rvvm_info("%s: Write stage (vertex? %d, kind: %s, spirv: %p, words: %u)", __FUNCTION__,
-        //           xe2_draw_stages[i].vk == GPU_VULKAN_STAGE_VERTEX,
-        //           gpu_vulkan_stage_to_string(xe2_draw_stages[i].vk), stage->spirv, stage->spirv_nwords);
+        // Cross-compile now rather than at 3DSTATE_XS time: the payload
+        // windows the kernel reads its constants and inputs through depend
+        // on the constant size and vertex layout, and both are only final
+        // once the whole batch has been parsed.
+        xe2_shader_ensure_compiled(xe2, d3d, kind);
+
+        const xe2_shader_stage_t* stage = &d3d->shader[kind];
         if (!stage->enabled || !stage->spirv || !stage->spirv_nwords) {
             rvvm_warn("%s: stage %s not ready (enabled=%d spirv=%p nwords=%u)", __FUNCTION__,
                       xe2_shader_kind_to_string(kind), stage->enabled, stage->spirv, stage->spirv_nwords);
@@ -5539,38 +6240,34 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
         // for filter/wrap modes and belongs in the same struct.
     }
 
-    // The real per-guest-kernel cross-compile path needs both VS and PS
-    // usable to put anything correct on screen (see
-    // xe2_3dprimitive_print_readiness() above). When either is missing -
-    // PS cross-compile is the one that's still unreliable, per the note
-    // above xe2_3dprimitive_print() - fall back to the generic
-    // placeholder pipeline so the guest's geometry still reaches the
-    // screen instead of freezing on the last good frame (or nothing at
-    // all) until PS decoding is fixed.
+    // Putting anything correct on screen needs both the VS and the PS: a
+    // pipeline cannot be built without a vertex shader, and a draw with no
+    // fragment shader writes no colour. When either is missing, fall back
+    // to the generic placeholder pipeline so the guest's geometry still
+    // reaches the screen instead of the window freezing on the last good
+    // frame.
+    //
+    // Note the two paths want *different* vertex input: the cross-compiled
+    // VS declares the guest's own attribute set (locations and formats from
+    // 3DSTATE_VERTEX_ELEMENTS, already in draw.vertex), while the generic
+    // one only ever reads two vec3s at locations 0 and 1. So the generic
+    // binding is built only when it is the one being used - it overwrites
+    // draw.vertex wholesale, which is exactly what made the cross-compiled
+    // path draw with a layout its shader never declared.
     bool vs_ready = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv && draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords;
     bool ps_ready = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv && draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords;
 
-    if (!xe2_3dprimitive_bind_vertex_buffers(xe2, &d3d->vertex_input, &draw)) {
-        rvvm_warn("Failed to submit vertex buffers");
-    }
-    // When this set, image is displayed.
     // vs_ready = 0;
     // ps_ready = 0;
 
-    bool submitted = 0;
-    if (vs_ready && ps_ready) {
-        draw.stage[GPU_VULKAN_STAGE_VERTEX] = (gpu_vulkan_stage_desc_t) {
-            .spirv        = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv,
-            .spirv_nwords = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords,
-        };
-        draw.stage[GPU_VULKAN_STAGE_FRAGMENT] = (gpu_vulkan_stage_desc_t) {
-            .spirv        = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv,
-            .spirv_nwords = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords,
-            .constants    = &xe2->generic_frag_consts,
-            .const_bytes  = sizeof(xe2->generic_frag_consts),
-        };
-        rvvm_info("%s: Submit guest-supplied Vulkan draw", __FUNCTION__);
-    } else {
+    if (!vs_ready || !ps_ready) {
+        rvvm_warn("%s: VS/PS not both ready (vs=%d ps=%d), falling back to the generic pipeline", __FUNCTION__,
+                  vs_ready, ps_ready);
+
+        if (!xe2_3dprimitive_bind_vertex_buffers(xe2, &d3d->vertex_input, &draw)) {
+            rvvm_warn("%s: no usable vertex buffer for the generic pipeline either", __FUNCTION__);
+            return;
+        }
         draw.stage[GPU_VULKAN_STAGE_VERTEX] = (gpu_vulkan_stage_desc_t) {
             .spirv        = xe2->generic_vs_spirv,
             .spirv_nwords = xe2->generic_vs_nwords,
@@ -5581,10 +6278,16 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
             .constants    = &xe2->generic_frag_consts,
             .const_bytes  = sizeof(xe2->generic_frag_consts),
         };
-        // Fallback – force the hard-coded generic layout + generic shaders
-        rvvm_warn("%s: VS/PS not both ready (vs=%d ps=%d), falling back to generic", __FUNCTION__, vs_ready, ps_ready);
+    } else {
+        rvvm_info("%s: Submit guest-supplied Vulkan draw", __FUNCTION__);
     }
-    submitted = gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
+    rvvm_info("Vertex shader info: %p, %u bytes", draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv,
+              draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords);
+    rvvm_info("Fragment shader info: %p, %u bytes", draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv,
+              draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords);
+
+    bool submitted = 0;
+    submitted      = gpu_vulkan_submit_draw(xe2->vulkan_ctx, &draw);
     if (!submitted) {
         rvvm_warn("%s: gpu_vulkan_submit_draw failed", __FUNCTION__);
     }
@@ -5632,11 +6335,15 @@ static inline void xe2_3dstate_ps_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
         cmd[1] & 1,
         cmd[8] & 1,
     };
+    // DW7[23:16]: "Dispatch GRF Start Register For Constant/Setup Data 0",
+    // the register the front end starts pushing this stage's constants into.
+    uint32_t grf_start = xe2_reg_field_get(xe2_reg_genmask(23, 16), cmd[7]);
+
     bool any = false;
     for (size_t i = 0; i < STATIC_ARRAY_SIZE(addr_kernel); ++i) {
         if (addr_kernel_enable[i]) {
             rvvm_info("(PS) kernel %zu: lx%0lx", i, addr_kernel[i]);
-            xe2_decode_shader(xe2, ctx, XE2_SHADER_PS, pdp4, addr_kernel[i], ctx->addr_instr);
+            xe2_decode_shader(xe2, ctx, XE2_SHADER_PS, pdp4, addr_kernel[i], ctx->addr_instr, grf_start);
             any = true;
         }
     }
@@ -5658,7 +6365,9 @@ static inline void xe2_3dstate_vs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
     if (enable) {
         rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
         rvvm_info("(VS) kernel: lx%0lx", addr_kernel);
-        xe2_decode_shader(xe2, ctx, XE2_SHADER_VS, pdp4, addr_kernel, ctx->addr_instr);
+        // DW6[24:20]: "Dispatch GRF Start Register For URB Data".
+        uint32_t grf_start = xe2_reg_field_get(xe2_reg_genmask(24, 20), cmd[6]);
+        xe2_decode_shader(xe2, ctx, XE2_SHADER_VS, pdp4, addr_kernel, ctx->addr_instr, grf_start);
     } else {
         ctx->d3d.shader[XE2_SHADER_VS].enabled = false;
     }
@@ -5677,7 +6386,9 @@ static inline void xe2_3dstate_gs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
     if (enable) {
         rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[1], cmd[2]);
         rvvm_info("(GS) kernel: lx%0lx", addr_kernel);
-        xe2_decode_shader(xe2, ctx, XE2_SHADER_GS, pdp4, addr_kernel, ctx->addr_instr);
+        // Dispatch GRF start is not decoded for this stage yet; 0 makes
+        // xe2_payload_layout_for() fall back to the architectural default.
+        xe2_decode_shader(xe2, ctx, XE2_SHADER_GS, pdp4, addr_kernel, ctx->addr_instr, 0);
     } else {
         ctx->d3d.shader[XE2_SHADER_GS].enabled = false;
     }
@@ -5696,7 +6407,9 @@ static inline void xe2_3dstate_hs_cmd(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, rvv
     if (enable) {
         rvvm_addr_t addr_kernel = xe2_addr_63_6_mask(cmd[3], cmd[4]);
         rvvm_info("(HS) kernel: lx%0lx", addr_kernel);
-        xe2_decode_shader(xe2, ctx, XE2_SHADER_HS, pdp4, addr_kernel, ctx->addr_instr);
+        // Dispatch GRF start is not decoded for this stage yet; 0 makes
+        // xe2_payload_layout_for() fall back to the architectural default.
+        xe2_decode_shader(xe2, ctx, XE2_SHADER_HS, pdp4, addr_kernel, ctx->addr_instr, 0);
     } else {
         ctx->d3d.shader[XE2_SHADER_HS].enabled = false;
     }
