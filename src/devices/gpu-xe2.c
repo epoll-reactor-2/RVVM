@@ -3495,6 +3495,7 @@ typedef struct {
     bool     neg;
     bool     abs;
     bool     is_imm;
+    bool     is_grf;
     bool     mode;
     uint32_t imm_u32;
     uint8_t  hstride;
@@ -3502,11 +3503,6 @@ typedef struct {
     uint8_t  width;
     uint8_t  hwtype; // (class<<2)|log2(bytes); class 0=U 1=S 2=F
 } xe2_brw_operand_t;
-
-static forceinline uint32_t xe2_brw_parse_dst(const xe2_qword_t* qw)
-{
-    return xe2_brw_mask(qw, XE2_BRW_DST_REG_NR_LO, XE2_BRW_DST_REG_NR_HI);
-}
 
 // Channels the instruction executes, from its execution size field.
 static forceinline uint32_t xe2_brw_exec_size(const xe2_qword_t* qw)
@@ -4289,24 +4285,24 @@ static uint32_t xe2_and(xe2_spirv_ctx_t* ctx, uint32_t a, uint32_t b)
 static bool xe2_op_has_cmod(uint32_t op)
 {
     switch (op) {
-        case XE2_BRW_OP_MOV:
-        case XE2_BRW_OP_ADD:
-        case XE2_BRW_OP_MUL:
-        case XE2_BRW_OP_MAD:
-        case XE2_BRW_OP_AND:
-        case XE2_BRW_OP_OR:
-        case XE2_BRW_OP_XOR:
-        case XE2_BRW_OP_NOT:
-        case XE2_BRW_OP_SHL:
-        case XE2_BRW_OP_SHR:
-        case XE2_BRW_OP_ASR:
-        case XE2_BRW_OP_FRC:
-        case XE2_BRW_OP_RNDU:
-        case XE2_BRW_OP_RNDD:
-        case XE2_BRW_OP_RNDE:
-        case XE2_BRW_OP_RNDZ:
-        case XE2_BRW_OP_AVG:
-        case XE2_BRW_OP_ADD3:
+        case XE2_BRW_OP_MOV:  // Προ Χριστού
+        case XE2_BRW_OP_ADD:  // Hades
+        case XE2_BRW_OP_MUL:  // Xibalba
+        case XE2_BRW_OP_MAD:  // Titan
+        case XE2_BRW_OP_AND:  // Prometheus
+        case XE2_BRW_OP_OR:   // Zeus
+        case XE2_BRW_OP_XOR:  // Shiva Mahadeva
+        case XE2_BRW_OP_NOT:  // Taran
+        case XE2_BRW_OP_SHL:  // Asmodeus
+        case XE2_BRW_OP_SHR:  // Hail
+        case XE2_BRW_OP_ASR:  // Ra
+        case XE2_BRW_OP_FRC:  // Hail
+        case XE2_BRW_OP_RNDU: // Baal
+        case XE2_BRW_OP_RNDD: // Hail
+        case XE2_BRW_OP_RNDE: // Nyx
+        case XE2_BRW_OP_RNDZ: // Hail
+        case XE2_BRW_OP_AVG:  // Tyr
+        case XE2_BRW_OP_ADD3: // Προ Χριστού
             return 1;
         default:
             return 0;
@@ -4714,8 +4710,8 @@ static void xe2_brw_print_op(const xe2_brw_operand_t* op, const xe2_qword_t* qw,
     }
 }
 
-static void xe2_brw_print(const xe2_qword_t* qw, uint32_t op, const xe2_brw_operand_t* dst, const xe2_brw_operand_t* s0,
-                          const xe2_brw_operand_t* s1, const xe2_brw_operand_t* s2)
+static void xe2_brw_print(const xe2_qword_t* qw, bool cmpt, uint32_t op, const xe2_brw_operand_t* dst,
+                          const xe2_brw_operand_t* s0, const xe2_brw_operand_t* s1, const xe2_brw_operand_t* s2)
 {
     char fmt_s0[128] = {0};
     char fmt_s1[128] = {0};
@@ -4725,8 +4721,8 @@ static void xe2_brw_print(const xe2_qword_t* qw, uint32_t op, const xe2_brw_oper
     xe2_brw_print_op(s1, qw, fmt_s1);
     xe2_brw_print_op(s2, qw, fmt_s2);
 
-    rvvm_info("op:    %s r%u.%u<%u>:%s %s %s %s", xe2_brw_op_name(op), dst->reg, dst->subreg, dst->hstride,
-              xe2_brw_hw_type(dst->hwtype), fmt_s0, fmt_s1, fmt_s2);
+    rvvm_info("op: %s %s r%u.%u<%u>:%s %s %s %s", cmpt ? "(c)" : "   ", xe2_brw_op_name(op), dst->reg, dst->subreg,
+              dst->hstride, xe2_brw_hw_type(dst->hwtype), fmt_s0, fmt_s1, fmt_s2);
 }
 
 // Instruction operand expansion tables. Compact
@@ -4903,6 +4899,19 @@ static forceinline xe2_brw_operand_t xe2_brw_parse_src1(const xe2_qword_t* qw)
     return o;
 }
 
+static forceinline uint32_t xe2_brw_3src_hwtype(uint32_t hw3, bool float_exec)
+{
+    static const uint8_t int_map[8] = {
+        XE2_BRW_TYPE_UB, XE2_BRW_TYPE_UW, XE2_BRW_TYPE_UD, XE2_BRW_TYPE_UQ,
+        XE2_BRW_TYPE_B,  XE2_BRW_TYPE_W,  XE2_BRW_TYPE_D,  XE2_BRW_TYPE_Q,
+    };
+    static const uint8_t float_map[8] = {
+        XE2_BRW_TYPE_UD, XE2_BRW_TYPE_HF, XE2_BRW_TYPE_F,  XE2_BRW_TYPE_DF,
+        XE2_BRW_TYPE_UD, XE2_BRW_TYPE_UD, XE2_BRW_TYPE_UD, XE2_BRW_TYPE_UD,
+    };
+    return float_exec ? float_map[hw3 & 7] : int_map[hw3 & 7];
+}
+
 static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t* qw, bool* eot)
 {
     bool     cmpt = (qw->lo >> XE2_BRW_CMPT_CONTROL_BIT) & 1;
@@ -4921,16 +4930,15 @@ static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t
             dst.hstride = 1 << xe2_brw_mask(qw, XE2_BRW_C_DST_HSTRIDE_LO, XE2_BRW_C_DST_HSTRIDE_HI);
             return size;
         }
-        dst.reg          = xe2_brw_mask(qw, XE2_BRW_C_DST_REG_NR_LO, XE2_BRW_C_DST_REG_NR_HI);
-        dst.subreg       = xe2_brw_mask(qw, XE2_BRW_DST_SUBREG_LO, XE2_BRW_DST_SUBREG_HI);
-        s0.reg           = xe2_brw_mask(qw, XE2_BRW_C_SRC0_REG_NR_LO, XE2_BRW_C_SRC0_REG_NR_HI);
-        s1.reg           = xe2_brw_mask(qw, XE2_BRW_C_SRC1_REG_NR_LO, XE2_BRW_C_SRC1_REG_NR_HI);
-        uint32_t dt_idx  = xe2_brw_mask(qw, XE2_BRW_C_DATATYPE_LO_LO, XE2_BRW_C_DATATYPE_LO_HI);
+        dst.reg         = xe2_brw_mask(qw, XE2_BRW_C_DST_REG_NR_LO, XE2_BRW_C_DST_REG_NR_HI);
+        dst.subreg      = xe2_brw_mask(qw, XE2_BRW_DST_SUBREG_LO, XE2_BRW_DST_SUBREG_HI);
+        s0.reg          = xe2_brw_mask(qw, XE2_BRW_C_SRC0_REG_NR_LO, XE2_BRW_C_SRC0_REG_NR_HI);
+        s1.reg          = xe2_brw_mask(qw, XE2_BRW_C_SRC1_REG_NR_LO, XE2_BRW_C_SRC1_REG_NR_HI);
+        uint32_t dt_idx = xe2_brw_mask(qw, XE2_BRW_C_DATATYPE_LO_LO, XE2_BRW_C_DATATYPE_LO_HI)
+                        | xe2_brw_mask(qw, XE2_BRW_C_DATATYPE_HI_LO, XE2_BRW_C_DATATYPE_HI_HI);
         uint32_t s0_idx  = xe2_brw_mask(qw, XE2_BRW_C_SRC0_INDEX_LO, XE2_BRW_C_SRC0_INDEX_HI);
         uint32_t s1_idx  = xe2_brw_mask(qw, XE2_BRW_C_SRC1_INDEX_LO, XE2_BRW_C_SRC1_INDEX_HI);
         uint32_t sub_idx = xe2_brw_mask(qw, XE2_BRW_C_SUBREG_INDEX_LO, XE2_BRW_C_SUBREG_INDEX_HI);
-        s0.hwtype        = xe2_brw_mask(qw, XE2_BRW_SRC0_HWTYPE_LO, XE2_BRW_SRC0_HWTYPE_HI);
-        s1.hwtype        = xe2_brw_mask(qw, XE2_BRW_SRC1_HWTYPE_LO, XE2_BRW_SRC1_HWTYPE_HI);
         uint16_t s0_desc = xe2_src0_index_table[s0_idx & 7];
         uint16_t s1_desc = xe2_src1_index_table[s1_idx & 15];
         s0.abs           = (s0_desc >> 0) & 1;
@@ -4965,9 +4973,9 @@ static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t
         s1.vstride = xe2_brw_vstride_decode[(src1_desc >> 8) & 0x7];
 
         if (xe2_brw_op_nsrc(op) == 1) {
-            xe2_brw_print(qw, op, &dst, &s0, NULL, NULL);
+            xe2_brw_print(qw, cmpt, op, &dst, &s0, NULL, NULL);
         } else {
-            xe2_brw_print(qw, op, &dst, &s0, &s1, NULL);
+            xe2_brw_print(qw, cmpt, op, &dst, &s0, &s1, NULL);
         }
     } else if (xe2_brw_op_send(op)) {
         s0 = xe2_brw_parse_src0(qw);
@@ -4995,55 +5003,75 @@ static uint32_t xe2_brw_decode_one(xe2_spirv_ctx_t* spirv_ctx, const xe2_qword_t
         }
         xe2_brw_emit_send(spirv_ctx, sfid, *eot, &s0, &s1, len0, len1);
         if (xe2_brw_op_nsrc(op) == 1) {
-            xe2_brw_print(qw, op, &dst, &s0, NULL, NULL);
+            xe2_brw_print(qw, cmpt, op, &dst, &s0, NULL, NULL);
         } else {
-            xe2_brw_print(qw, op, &dst, &s0, &s1, NULL);
+            xe2_brw_print(qw, cmpt, op, &dst, &s0, &s1, NULL);
         }
         return size;
     } else if (xe2_brw_op_3_src(op)) {
-        dst.reg                  = xe2_brw_mask(qw, XE2_BRW_A3_DST_REG_NR_LO, XE2_BRW_A3_DST_REG_NR_HI);
-        uint32_t dst_type        = xe2_brw_mask(qw, XE2_BRW_A3_DST_HWTYPE_LO, XE2_BRW_A3_DST_HWTYPE_HI);
-        uint32_t dst_subreg_idx  = xe2_brw_mask(qw, XE2_BRW_A3_DST_SUBREG_LO, XE2_BRW_A3_DST_SUBREG_HI);
-        uint32_t dst_hstride_bit = xe2_brw_mask(qw, XE2_BRW_A3_DST_HSTRIDE_BIT, XE2_BRW_A3_DST_HSTRIDE_BIT);
-        dst.subreg               = (dst_subreg_idx << 1) / xe2_brw_op_type_size(dst_type);
-        dst.hstride              = 1 << dst_hstride_bit;
+        bool fexec = xe2_brw_mask(qw, XE2_BRW_A3_EXEC_TYPE_BIT, XE2_BRW_A3_EXEC_TYPE_BIT);
 
-        uint32_t s0_sub_idx = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_SUBREG_LO, XE2_BRW_A3_SRC0_SUBREG_HI);
-        uint32_t s0_type    = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HWTYPE_LO, XE2_BRW_A3_SRC0_HWTYPE_HI);
-        s0.subreg           = (s0_sub_idx << 1) / xe2_brw_op_type_size(s0_type);
-        s0.reg              = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_REG_NR_LO, XE2_BRW_A3_SRC0_REG_NR_HI);
-        s0.neg              = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_NEGATE_BIT, XE2_BRW_A3_SRC0_NEGATE_BIT);
-        s0.abs              = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_ABS_BIT, XE2_BRW_A3_SRC0_ABS_BIT);
-        s0.hwtype           = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HWTYPE_LO, XE2_BRW_A3_SRC0_HWTYPE_HI);
-        s0.hstride          = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HSTRIDE_LO, XE2_BRW_A3_SRC0_HSTRIDE_HI);
-        s0.vstride          = xe2_brw_3_src_vstride(s0.hstride);
-        uint32_t s1_sub_idx = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_SUBREG_LO, XE2_BRW_A3_SRC1_SUBREG_HI);
-        uint32_t s1_type    = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HWTYPE_LO, XE2_BRW_A3_SRC1_HWTYPE_HI);
-        s1.subreg           = (s1_sub_idx << 1) / xe2_brw_op_type_size(s1_type);
-        s1.reg              = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_REG_NR_LO, XE2_BRW_A3_SRC1_REG_NR_HI);
-        s1.neg              = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_NEGATE_BIT, XE2_BRW_A3_SRC1_NEGATE_BIT);
-        s1.abs              = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_ABS_BIT, XE2_BRW_A3_SRC1_ABS_BIT);
-        s1.hwtype           = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HWTYPE_LO, XE2_BRW_A3_SRC1_HWTYPE_HI);
-        s1.hstride          = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HSTRIDE_LO, XE2_BRW_A3_SRC1_HSTRIDE_HI);
-        s1.vstride          = xe2_brw_3_src_vstride(s1.hstride);
-        uint32_t s2_sub_idx = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_SUBREG_LO, XE2_BRW_A3_SRC2_SUBREG_HI);
-        uint32_t s2_type    = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HWTYPE_LO, XE2_BRW_A3_SRC2_HWTYPE_HI);
-        s2.subreg           = (s2_sub_idx << 1) / xe2_brw_op_type_size(s2_type);
-        s2.reg              = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_REG_NR_LO, XE2_BRW_A3_SRC2_REG_NR_HI);
-        s2.neg              = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_NEGATE_BIT, XE2_BRW_A3_SRC2_NEGATE_BIT);
-        s2.abs              = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_ABS_BIT, XE2_BRW_A3_SRC2_ABS_BIT);
-        s2.hwtype           = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HWTYPE_LO, XE2_BRW_A3_SRC2_HWTYPE_HI);
-        s2.hstride          = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HSTRIDE_LO, XE2_BRW_A3_SRC2_HSTRIDE_HI);
-        s2.vstride          = xe2_brw_3_src_vstride(s2.hstride);
-        xe2_brw_print(qw, op, &dst, &s0, &s1, &s2);
+        dst.hwtype  = xe2_brw_3src_hwtype(xe2_brw_mask(qw, XE2_BRW_A3_DST_HWTYPE_LO, XE2_BRW_A3_DST_HWTYPE_HI), fexec);
+        dst.is_grf  = xe2_brw_mask(qw, XE2_BRW_A3_DST_REG_FILE_BIT, XE2_BRW_A3_DST_REG_FILE_BIT);
+        dst.reg     = xe2_brw_mask(qw, XE2_BRW_A3_DST_REG_NR_LO, XE2_BRW_A3_DST_REG_NR_HI);
+        dst.hstride = 1 << xe2_brw_mask(qw, XE2_BRW_A3_DST_HSTRIDE_BIT, XE2_BRW_A3_DST_HSTRIDE_BIT);
+        dst.subreg  = (xe2_brw_mask(qw, XE2_BRW_A3_DST_SUBREG_LO, XE2_BRW_A3_DST_SUBREG_HI) << 1)
+                   / xe2_brw_op_type_size(dst.hwtype);
+
+        uint32_t hs_raw = 0;
+
+        s0.hwtype  = xe2_brw_3src_hwtype(xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HWTYPE_LO, XE2_BRW_A3_SRC0_HWTYPE_HI), fexec);
+        s0.is_grf  = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_REG_FILE_BIT, XE2_BRW_A3_SRC0_REG_FILE_BIT);
+        s0.neg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_NEGATE_BIT, XE2_BRW_A3_SRC0_NEGATE_BIT);
+        s0.abs     = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_ABS_BIT, XE2_BRW_A3_SRC0_ABS_BIT);
+        s0.reg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_REG_NR_LO, XE2_BRW_A3_SRC0_REG_NR_HI);
+        hs_raw     = xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HSTRIDE_LO, XE2_BRW_A3_SRC0_HSTRIDE_HI);
+        s0.hstride = xe2_brw_hstride_decode[hs_raw];
+        s0.vstride = xe2_brw_3_src_vstride(hs_raw);
+        s0.subreg  = (xe2_brw_mask(qw, XE2_BRW_A3_SRC0_SUBREG_LO, XE2_BRW_A3_SRC0_SUBREG_HI) << 1)
+                  / xe2_brw_op_type_size(s0.hwtype);
+
+        s1.hwtype  = xe2_brw_3src_hwtype(xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HWTYPE_LO, XE2_BRW_A3_SRC1_HWTYPE_HI), fexec);
+        s1.is_grf  = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_REG_FILE_BIT, XE2_BRW_A3_SRC1_REG_FILE_BIT);
+        s1.neg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_NEGATE_BIT, XE2_BRW_A3_SRC1_NEGATE_BIT);
+        s1.abs     = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_ABS_BIT, XE2_BRW_A3_SRC1_ABS_BIT);
+        s1.reg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_REG_NR_LO, XE2_BRW_A3_SRC1_REG_NR_HI);
+        hs_raw     = xe2_brw_mask(qw, XE2_BRW_A3_SRC1_HSTRIDE_LO, XE2_BRW_A3_SRC1_HSTRIDE_HI);
+        s1.hstride = xe2_brw_hstride_decode[hs_raw];
+        s1.vstride = xe2_brw_3_src_vstride(hs_raw);
+        s1.subreg  = (xe2_brw_mask(qw, XE2_BRW_A3_SRC1_SUBREG_LO, XE2_BRW_A3_SRC1_SUBREG_HI) << 1)
+                  / xe2_brw_op_type_size(s1.hwtype);
+
+        s2.hwtype  = xe2_brw_3src_hwtype(xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HWTYPE_LO, XE2_BRW_A3_SRC2_HWTYPE_HI), fexec);
+        s2.is_grf  = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_REG_FILE_BIT, XE2_BRW_A3_SRC2_REG_FILE_BIT);
+        s2.neg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_NEGATE_BIT, XE2_BRW_A3_SRC2_NEGATE_BIT);
+        s2.abs     = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_ABS_BIT, XE2_BRW_A3_SRC2_ABS_BIT);
+        s2.reg     = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_REG_NR_LO, XE2_BRW_A3_SRC2_REG_NR_HI);
+        hs_raw     = xe2_brw_mask(qw, XE2_BRW_A3_SRC2_HSTRIDE_LO, XE2_BRW_A3_SRC2_HSTRIDE_HI);
+        s2.hstride = xe2_brw_hstride_decode[hs_raw];
+        s2.vstride = xe2_brw_3_src_vstride(hs_raw);
+        s2.subreg  = (xe2_brw_mask(qw, XE2_BRW_A3_SRC2_SUBREG_LO, XE2_BRW_A3_SRC2_SUBREG_HI) << 1)
+                  / xe2_brw_op_type_size(s2.hwtype);
+
+        // src0 (and src2) may be a 16-bit immediate that overlays the regioning/reg
+        // fields, so the register fields parsed above are garbage in that case.
+        if (xe2_brw_mask(qw, XE2_BRW_A3_SRC0_IS_IMM_BIT, XE2_BRW_A3_SRC0_IS_IMM_BIT)) {
+            s0        = (xe2_brw_operand_t) {0};
+            s0.is_imm = true;
+            s0.hwtype
+                = xe2_brw_3src_hwtype(xe2_brw_mask(qw, XE2_BRW_A3_SRC0_HWTYPE_LO, XE2_BRW_A3_SRC0_HWTYPE_HI), fexec);
+            s0.imm_u32 = xe2_brw_mask(qw, 64, 79); // verify: imm16 in bits 79:64
+        }
+
+        xe2_brw_print(qw, cmpt, op, &dst, &s0, &s1, &s2);
     } else {
-        dst.reg = xe2_brw_parse_dst(qw);
+        dst.reg = xe2_brw_mask(qw, XE2_BRW_DST_REG_NR_LO, XE2_BRW_DST_REG_NR_HI);
         s0      = xe2_brw_parse_src0(qw);
         s1      = xe2_brw_parse_src1(qw);
         if (xe2_brw_op_nsrc(op) == 1) {
-            xe2_brw_print(qw, op, &dst, &s0, NULL, NULL);
+            xe2_brw_print(qw, cmpt, op, &dst, &s0, NULL, NULL);
         } else {
-            xe2_brw_print(qw, op, &dst, &s0, &s1, NULL);
+            xe2_brw_print(qw, cmpt, op, &dst, &s0, &s1, NULL);
         }
     }
 
