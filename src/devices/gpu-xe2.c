@@ -6340,8 +6340,11 @@ static void xe2_3dprimitive(xe2_dev_t* xe2, xe2_submit_ctx_t* ctx, uint32_t* cmd
     bool vs_ready = draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv && draw.stage[GPU_VULKAN_STAGE_VERTEX].spirv_nwords;
     bool ps_ready = draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv && draw.stage[GPU_VULKAN_STAGE_FRAGMENT].spirv_nwords;
 
-    // vs_ready = 0;
-    // ps_ready = 0;
+    // Recommended to set this up until compiled SPIR-V will be fully
+    // compatible with data being fed to it. We use now working generic
+    // fragment/vertex shaders instead.
+    vs_ready = 0;
+    ps_ready = 0;
 
     if (!vs_ready || !ps_ready) {
         rvvm_warn("%s: VS/PS not both ready (vs=%d ps=%d), falling back to the generic pipeline", __FUNCTION__,
